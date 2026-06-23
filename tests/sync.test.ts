@@ -1,0 +1,513 @@
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
+import type { ExtractorProvider } from "../src/types.js";
+import { syncProjectMemory } from "../src/sync/service.js";
+import { openMemoryStore } from "../src/storage/store.js";
+import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
+
+describe("automatic sync", () => {
+  let tempDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of tempDirs) cleanupTempDir(dir);
+    tempDirs = [];
+  });
+
+  function git(repo: string, args: string[]): string {
+    return execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+  }
+
+  function createFixtureWorkspace(): {
+    rootDir: string;
+    repoDir: string;
+    codexDir: string;
+    claudeDir: string;
+  } {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const repoDir = join(rootDir, "repo");
+    const codexDir = join(rootDir, "codex", "archived_sessions");
+    const claudeDir = join(rootDir, "claude", "projects", "project-a");
+    mkdirSync(repoDir, { recursive: true });
+    mkdirSync(codexDir, { recursive: true });
+    mkdirSync(claudeDir, { recursive: true });
+
+    git(repoDir, ["init"]);
+    git(repoDir, ["config", "user.email", "test@example.com"]);
+    git(repoDir, ["config", "user.name", "Test User"]);
+    mkdirSync(join(repoDir, "src"), { recursive: true });
+    writeFileSync(join(repoDir, "src", "cache.ts"), "export const cache = true;\n");
+    git(repoDir, ["add", "src/cache.ts"]);
+    git(repoDir, ["commit", "-m", "Add cache module"]);
+
+    writeFileSync(
+      join(codexDir, "rollout-test.jsonl"),
+      [
+        JSON.stringify({
+          timestamp: "2026-06-01T10:00:00Z",
+          type: "session_meta",
+          payload: { id: "codex-session-1", cwd: repoDir }
+        }),
+        JSON.stringify({
+          timestamp: "2026-06-01T10:00:01Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Why did src/cache.ts change?" }]
+          }
+        }),
+        JSON.stringify({
+          timestamp: "2026-06-01T10:00:02Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "It changed to fix stale cache reads." }]
+          }
+        })
+      ].join("\n")
+    );
+
+    writeFileSync(
+      join(claudeDir, "claude-session-1.jsonl"),
+      [
+        JSON.stringify({
+          type: "user",
+          timestamp: "2026-06-01T10:05:00Z",
+          sessionId: "claude-session-1",
+          cwd: repoDir,
+          message: { role: "user", content: "The stale cache bug is reproducible." }
+        }),
+        JSON.stringify({
+          type: "assistant",
+          timestamp: "2026-06-01T10:05:05Z",
+          sessionId: "claude-session-1",
+          cwd: repoDir,
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Invalidate after writes to close the stale-read window." }]
+          }
+        })
+      ].join("\n")
+    );
+
+    ensureProjectConfig(rootDir);
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.json"),
+      JSON.stringify(
+        {
+          sources: {
+            git: { enabled: true, repoPath: "./repo", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
+            codex: { enabled: true, roots: ["./codex/archived_sessions"], includeDefaultRoots: false },
+            claude: { enabled: true, roots: ["./claude/projects"] }
+          },
+          extractor: {
+            provider: "openai-compatible",
+            baseUrl: "https://example.test/v1",
+            model: "gpt-test",
+            apiKeyEnv: "TEST_API_KEY"
+          },
+          promotion: {
+            confidenceThreshold: 0.85,
+            requireCommitAndConversation: true,
+            minSourceCategories: 2
+          },
+          sync: {
+            autoSyncOnServerStart: true
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    return { rootDir, repoDir, codexDir, claudeDir };
+  }
+
+  it("incrementally syncs git and conversation logs without duplicates", async () => {
+    const { rootDir, repoDir, codexDir, claudeDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const provider: ExtractorProvider = {
+      async extract(context) {
+        return [
+          {
+            type: "bug_fix",
+            title: "Fix stale cache reads",
+            summary: "Write invalidation was added after stale cache reads were discussed.",
+            reason: "TTL-only behavior left stale reads after mutation.",
+            confidence: 0.91,
+            dedupeKey: "cache-stale-reads",
+            relatedFiles: ["src/cache.ts"],
+            evidence: [
+              { sourceType: "commit", sourceId: context.commits[0]!.hash },
+              { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
+            ]
+          }
+        ];
+      }
+    };
+
+    const first = await syncProjectMemory(store, config, { extractorProvider: provider });
+    expect(first.sources.git.imported).toBe(1);
+    expect(first.sources.codex.imported).toBe(1);
+    expect(first.sources.claude.imported).toBe(1);
+    expect(first.memories.promoted).toBe(1);
+    expect(store.listMemories({ status: "promoted" })).toHaveLength(1);
+
+    const second = await syncProjectMemory(store, config, { extractorProvider: provider });
+    expect(second.sources.git.imported).toBe(0);
+    expect(second.sources.codex.imported).toBe(0);
+    expect(second.sources.claude.imported).toBe(0);
+    expect(store.listMemories({ status: "promoted" })).toHaveLength(1);
+
+    writeFileSync(join(repoDir, "src", "cache.ts"), "export function invalidateAfterWrite() { return true; }\n");
+    git(repoDir, ["add", "src/cache.ts"]);
+    git(repoDir, ["commit", "-m", "Invalidate cache after writes"]);
+    writeFileSync(
+      join(codexDir, "rollout-test.jsonl"),
+      readFileSync(join(codexDir, "rollout-test.jsonl"), "utf8") +
+        "\n" +
+        JSON.stringify({
+          timestamp: "2026-06-01T10:10:00Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "The root cause was stale cache invalidation after writes." }]
+          }
+        })
+    );
+    writeFileSync(
+      join(claudeDir, "claude-session-1.jsonl"),
+      readFileSync(join(claudeDir, "claude-session-1.jsonl"), "utf8") +
+        "\n" +
+        JSON.stringify({
+          type: "assistant",
+          timestamp: "2026-06-01T10:10:05Z",
+          sessionId: "claude-session-1",
+          cwd: repoDir,
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "This should be stored as a durable bug-fix memory." }]
+          }
+        })
+    );
+
+    const third = await syncProjectMemory(store, config, { extractorProvider: provider });
+    expect(third.sources.git.imported).toBe(1);
+    expect(third.sources.codex.imported).toBe(1);
+    expect(third.sources.claude.imported).toBe(1);
+    expect(store.listMemoryCandidates()).toHaveLength(1);
+    expect(store.getSyncStatus("git")?.lastSyncAt).toBeTruthy();
+
+    store.close();
+  });
+
+  it("filters conversation logs to the current project by default", async () => {
+    const { rootDir, repoDir, claudeDir } = createFixtureWorkspace();
+    const encodedProjectDir = join(rootDir, "claude", "projects", repoDir.replace(/^\/+/, "").replaceAll("/", "-"));
+    const unrelatedDir = join(rootDir, "claude", "projects", "-Users-spiel-Documents-other");
+    mkdirSync(encodedProjectDir, { recursive: true });
+    mkdirSync(unrelatedDir, { recursive: true });
+    writeFileSync(
+      join(encodedProjectDir, "encoded-match.jsonl"),
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-06-01T12:00:00Z",
+        sessionId: "encoded-match",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "This belongs to the encoded project path." }]
+        }
+      })
+    );
+    writeFileSync(
+      join(unrelatedDir, "unrelated.jsonl"),
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-06-01T12:01:00Z",
+        sessionId: "unrelated",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "This belongs to a different project." }]
+        }
+      })
+    );
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    const result = await syncProjectMemory(store, config, { source: "claude" });
+
+    expect(result.sources.claude.imported).toBe(2);
+    expect(store.readSource("claude:claude-session-1")?.origin).toContain("claude-session-1.jsonl");
+    expect(store.readSource("claude:encoded-match")?.origin).toContain("encoded-match.jsonl");
+    expect(store.readSource("claude:unrelated")).toBeUndefined();
+    expect(repoDir).toBeTruthy();
+    store.close();
+  });
+
+  it("imports all configured conversation logs when project-only filtering is disabled", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const unrelatedDir = join(rootDir, "claude", "projects", "-Users-spiel-Documents-other");
+    mkdirSync(unrelatedDir, { recursive: true });
+    writeFileSync(
+      join(unrelatedDir, "unrelated.jsonl"),
+      JSON.stringify({
+        type: "assistant",
+        timestamp: "2026-06-01T12:01:00Z",
+        sessionId: "unrelated",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "This global memory should import when project filtering is disabled." }]
+        }
+      })
+    );
+    const configPath = join(rootDir, ".code-butler", "config.json");
+    const rawConfig = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    const sources = rawConfig.sources as Record<string, Record<string, unknown>>;
+    sources.claude = { ...sources.claude, projectOnly: false };
+    writeFileSync(configPath, JSON.stringify(rawConfig, null, 2));
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    const result = await syncProjectMemory(store, config, { source: "claude" });
+
+    expect(result.sources.claude.imported).toBe(2);
+    expect(store.readSource("claude:unrelated")?.origin).toContain("unrelated.jsonl");
+    store.close();
+  });
+
+  it("keeps low-confidence memories as candidates", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const provider: ExtractorProvider = {
+      async extract(context) {
+        return [
+          {
+            type: "constraint",
+            title: "Cache invalidation follow-up",
+            summary: "A follow-up constraint was noted.",
+            reason: "Need to avoid stale reads.",
+            confidence: 0.4,
+            dedupeKey: "cache-follow-up",
+            relatedFiles: ["src/cache.ts"],
+            evidence: [
+              { sourceType: "commit", sourceId: context.commits[0]!.hash },
+              { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
+            ]
+          }
+        ];
+      }
+    };
+
+    const result = await syncProjectMemory(store, config, { extractorProvider: provider });
+    expect(result.memories.promoted).toBe(0);
+    expect(store.listMemoryCandidates()).toHaveLength(1);
+    expect(store.listMemories({ status: "promoted" })).toHaveLength(0);
+    store.close();
+  });
+
+  it("promotes typed Codex remember directives without an extractor provider", async () => {
+    const { rootDir, repoDir, codexDir } = createFixtureWorkspace();
+    writeFileSync(
+      join(codexDir, "directive.jsonl"),
+      [
+        JSON.stringify({
+          timestamp: "2026-06-01T11:00:00Z",
+          type: "session_meta",
+          payload: { id: "codex-directive", cwd: repoDir }
+        }),
+        JSON.stringify({
+          timestamp: "2026-06-01T11:00:01Z",
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "remember this decision: Use SQLite for project memory." }]
+          }
+        })
+      ].join("\n")
+    );
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    const result = await syncProjectMemory(store, config, { source: "codex" });
+
+    expect(result.memories.promoted).toBe(1);
+    expect(store.listMemories({ status: "promoted" })[0]).toMatchObject({
+      type: "decision",
+      summary: "Use SQLite for project memory.",
+      confidence: 1,
+      evidence: [
+        { sourceType: "conversation", sourceId: "codex:codex-directive", locator: "codex:codex-directive:chunk:0" }
+      ]
+    });
+    store.close();
+  });
+
+  it("keeps generic Claude remember directives as idempotent candidates", async () => {
+    const { rootDir, repoDir, claudeDir } = createFixtureWorkspace();
+    writeFileSync(
+      join(claudeDir, "directive.jsonl"),
+      JSON.stringify({
+        type: "user",
+        timestamp: "2026-06-01T11:00:00Z",
+        sessionId: "claude-directive",
+        cwd: repoDir,
+        message: {
+          role: "user",
+          content: "remember this: Low-confidence memories should stay candidates."
+        }
+      })
+    );
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    await syncProjectMemory(store, config, { source: "claude" });
+    await syncProjectMemory(store, config, { source: "claude" });
+
+    expect(store.listMemoryCandidates()).toHaveLength(1);
+    expect(store.listMemoryCandidates()[0]).toMatchObject({
+      type: "constraint",
+      summary: "Low-confidence memories should stay candidates.",
+      confidence: 0.75,
+      promotionState: "candidate"
+    });
+    expect(store.listMemories({ status: "promoted" })).toHaveLength(0);
+    store.close();
+  });
+
+  it("creates temporary working context from recent Codex task logs", async () => {
+    const { rootDir, repoDir, codexDir } = createFixtureWorkspace();
+    const recentTimestamp = new Date().toISOString();
+    writeFileSync(
+      join(codexDir, "temporary-task.jsonl"),
+      [
+        JSON.stringify({
+          timestamp: recentTimestamp,
+          type: "session_meta",
+          payload: { id: "codex-temp-task", cwd: repoDir }
+        }),
+        JSON.stringify({
+          timestamp: recentTimestamp,
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: "For this task: continue wiring temporary memory before durable memory in src/mcp/tools.ts."
+              }
+            ]
+          }
+        })
+      ].join("\n")
+    );
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    const result = await syncProjectMemory(store, config, { source: "codex" });
+    const temporary = store.searchTemporaryMemory({
+      query: "temporary memory durable memory",
+      sessionId: "codex-temp-task",
+      now: new Date().toISOString()
+    });
+
+    expect(result.temporary.upserted).toBeGreaterThan(0);
+    expect(temporary[0]).toMatchObject({
+      kind: "user_instruction",
+      sessionId: "codex-temp-task",
+      relatedFiles: ["src/mcp/tools.ts"],
+      evidence: [{ sourceType: "conversation", sourceId: "codex:codex-temp-task" }]
+    });
+    expect(store.listMemories()).not.toContainEqual(expect.objectContaining({ summary: expect.stringContaining("temporary memory") }));
+    store.close();
+  });
+
+  it("does not create unexpired temporary context from old conversation logs", async () => {
+    const { rootDir, repoDir, codexDir } = createFixtureWorkspace();
+    const oldTimestamp = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    writeFileSync(
+      join(codexDir, "temporary-old.jsonl"),
+      [
+        JSON.stringify({
+          timestamp: oldTimestamp,
+          type: "session_meta",
+          payload: { id: "codex-old-task", cwd: repoDir }
+        }),
+        JSON.stringify({
+          timestamp: oldTimestamp,
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "For this task: continue old temporary memory work." }]
+          }
+        })
+      ].join("\n")
+    );
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    const result = await syncProjectMemory(store, config, { source: "codex" });
+
+    expect(result.temporary.upserted).toBe(0);
+    expect(
+      store.searchTemporaryMemory({
+        query: "old temporary memory",
+        sessionId: "codex-old-task",
+        now: new Date().toISOString()
+      })
+    ).toEqual([]);
+    store.close();
+  });
+
+  it("creates structural candidates from changed test files during git sync", async () => {
+    const { rootDir, repoDir } = createFixtureWorkspace();
+    mkdirSync(join(repoDir, "tests"), { recursive: true });
+    writeFileSync(
+      join(repoDir, "tests", "memory.test.ts"),
+      'it("keeps low-confidence memories as candidates", async () => {});\n'
+    );
+    git(repoDir, ["add", "tests/memory.test.ts"]);
+    git(repoDir, ["commit", "-m", "update tests"]);
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    const result = await syncProjectMemory(store, config, { source: "git" });
+
+    expect(result.memories.candidates).toBe(1);
+    expect(result.memories.promoted).toBe(0);
+    expect(store.listMemoryCandidates()[0]).toMatchObject({
+      type: "constraint",
+      title: "Keeps low-confidence memories as candidates",
+      relatedFiles: ["tests/memory.test.ts"],
+      promotionState: "candidate"
+    });
+    store.close();
+  });
+});
