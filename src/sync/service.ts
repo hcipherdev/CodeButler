@@ -2,6 +2,7 @@ import { createAnthropicAwsExtractor } from "../extract/anthropic-aws.js";
 import { createOpenAICompatibleExtractor } from "../extract/openai.js";
 import { extractDeterministicMemories } from "../deterministic/triggers.js";
 import { extractTemporaryMemories } from "../deterministic/temporary.js";
+import { assessMemoryQuality } from "../memory/quality.js";
 import type { MemoryStore } from "../storage/store.js";
 import { syncClaudeSource, syncCodexSource } from "../sources/codex.js";
 import { syncGitSource } from "../sources/git.js";
@@ -23,6 +24,7 @@ export interface SyncSourceResult {
 export interface SyncMemoryResult {
   candidates: number;
   promoted: number;
+  rejected: number;
   skipped: boolean;
   reason?: string;
   error?: string;
@@ -62,6 +64,7 @@ export async function syncProjectMemory(
     memories: {
       candidates: 0,
       promoted: 0,
+      rejected: 0,
       skipped: false
     },
     temporary: {
@@ -168,11 +171,13 @@ export async function syncProjectMemory(
         ? {
             candidates: deterministicProcessed.candidates,
             promoted: deterministicProcessed.promoted,
+            rejected: deterministicProcessed.rejected,
             skipped: false
           }
         : {
             candidates: 0,
             promoted: 0,
+            rejected: deterministicProcessed.rejected,
             skipped: true,
             reason: "Extractor not configured"
           };
@@ -184,6 +189,7 @@ export async function syncProjectMemory(
     result.memories = {
       candidates: 0,
       promoted: 0,
+      rejected: deterministicProcessed.rejected,
       skipped: true,
       reason: "No new evidence"
     };
@@ -196,10 +202,11 @@ export async function syncProjectMemory(
       conversations: importedConversations,
       commits: importedCommits
     });
-    const processed = processExtractedMemories(store, config, extracted);
+    const processed = processExtractedMemories(store, config, extracted.memories);
     result.memories = {
       candidates: deterministicProcessed.candidates + processed.candidates,
       promoted: deterministicProcessed.promoted + processed.promoted,
+      rejected: deterministicProcessed.rejected + processed.rejected + extracted.rejected.length,
       skipped: false
     };
   } catch (error) {
@@ -208,12 +215,14 @@ export async function syncProjectMemory(
         ? {
             candidates: deterministicProcessed.candidates,
             promoted: deterministicProcessed.promoted,
+            rejected: deterministicProcessed.rejected,
             skipped: false,
             error: error instanceof Error ? error.message : String(error)
           }
         : {
             candidates: 0,
             promoted: 0,
+            rejected: deterministicProcessed.rejected,
             skipped: true,
             error: error instanceof Error ? error.message : String(error)
           };
@@ -228,19 +237,32 @@ const SOURCE_NAMES: SyncSourceName[] = ["git", "codex", "claude"];
 function processDeterministicMemories(
   store: MemoryStore,
   extraction: { memories: ExtractedMemory[]; promoteDedupeKeys: string[] }
-): { candidates: number; promoted: number } {
+): { candidates: number; promoted: number; rejected: number } {
   const promoteDedupeKeys = new Set(extraction.promoteDedupeKeys);
   let promoted = 0;
+  let candidates = 0;
+  let rejected = 0;
   for (const memory of extraction.memories) {
-    const candidate = store.upsertMemoryCandidate(memory);
-    if (promoteDedupeKeys.has(memory.dedupeKey)) {
+    const assessment = assessMemoryQuality(store, memory);
+    if (assessment.rejected) {
+      rejected += 1;
+      continue;
+    }
+    const candidate = store.upsertMemoryCandidate(memory, {
+      qualityStatus: assessment.status,
+      qualityReasons: assessment.reasons,
+      lastVerifiedAt: assessment.lastVerifiedAt
+    });
+    candidates += 1;
+    if (assessment.status === "active" && promoteDedupeKeys.has(memory.dedupeKey)) {
       store.promoteMemoryCandidate(candidate.id);
       promoted += 1;
     }
   }
   return {
-    candidates: extraction.memories.length,
-    promoted
+    candidates,
+    promoted,
+    rejected
   };
 }
 
@@ -255,18 +277,31 @@ function processExtractedMemories(
   store: MemoryStore,
   config: ProjectConfig,
   memories: ExtractedMemory[]
-): { candidates: number; promoted: number } {
+): { candidates: number; promoted: number; rejected: number } {
   let promoted = 0;
+  let candidates = 0;
+  let rejected = 0;
   for (const memory of memories) {
-    const candidate = store.upsertMemoryCandidate(memory);
-    if (shouldPromote(memory, config)) {
+    const assessment = assessMemoryQuality(store, memory);
+    if (assessment.rejected) {
+      rejected += 1;
+      continue;
+    }
+    const candidate = store.upsertMemoryCandidate(memory, {
+      qualityStatus: assessment.status,
+      qualityReasons: assessment.reasons,
+      lastVerifiedAt: assessment.lastVerifiedAt
+    });
+    candidates += 1;
+    if (assessment.status === "active" && shouldPromote(memory, config)) {
       store.promoteMemoryCandidate(candidate.id);
       promoted += 1;
     }
   }
   return {
-    candidates: memories.length,
-    promoted
+    candidates,
+    promoted,
+    rejected
   };
 }
 

@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
 import type {
   CommitRecord,
   DecisionRecord,
@@ -14,6 +15,7 @@ import type {
   MemoryCandidate,
   MemoryChunk,
   MemoryPromotionState,
+  MemoryQualityStatus,
   MemorySearchResult,
   MemorySource,
   MemoryType,
@@ -44,9 +46,16 @@ export interface ProjectSummary {
   candidateMemories: number;
   promotedMemories: number;
   temporaryMemories?: number;
+  memoryHealth?: {
+    active: number;
+    needsReview: number;
+    quarantined: number;
+  };
   lastSyncAt?: string;
   syncSources: Partial<Record<SyncSourceName, SyncStatus>>;
 }
+
+export type MemoryQualityStatusFilter = MemoryQualityStatus | "all";
 
 export interface MemoryStore {
   init(): void;
@@ -69,22 +78,38 @@ export interface MemoryStore {
   listSyncStatuses(): SyncStatus[];
   upsertMemoryCandidate(
     memory: ExtractedMemory,
-    options?: { promotionState?: MemoryPromotionState }
+    options?: {
+      promotionState?: MemoryPromotionState;
+      qualityStatus?: MemoryQualityStatus;
+      qualityReasons?: string[];
+      lastVerifiedAt?: string | undefined;
+    }
   ): MemoryCandidate;
   promoteMemoryCandidate(candidateId: string, source?: DurableMemory["source"]): DurableMemory;
   upsertManualDecisionMemory(decision: DecisionRecord): DurableMemory;
   listMemoryCandidates(input?: {
     type?: MemoryType;
     promotionState?: MemoryPromotionState;
+    qualityStatus?: MemoryQualityStatusFilter;
     query?: string;
     limit?: number;
   }): MemoryCandidate[];
   listMemories(input?: {
     type?: MemoryType;
     status?: "promoted" | "candidate";
+    qualityStatus?: MemoryQualityStatusFilter;
     query?: string;
     limit?: number;
   }): DurableMemory[];
+  updateMemoryQuality(
+    kind: "candidate" | "promoted",
+    id: string,
+    quality: {
+      qualityStatus: MemoryQualityStatus;
+      qualityReasons: string[];
+      lastVerifiedAt?: string | undefined;
+    }
+  ): void;
   upsertTemporaryMemory(input: TemporaryMemoryUpsertInput): TemporaryMemory;
   searchTemporaryMemory(input: {
     query: string;
@@ -105,6 +130,7 @@ export interface MemoryStore {
     query?: string;
     type?: MemoryType;
     status?: "promoted" | "candidate";
+    qualityStatus?: MemoryQualityStatusFilter;
     limit?: number;
   }): MemorySearchResult[];
   getProjectSummary(): ProjectSummary;
@@ -182,6 +208,9 @@ interface MemoryCandidateRow {
   related_files_json: string;
   dedupe_key: string;
   promotion_state: MemoryPromotionState;
+  quality_status: MemoryQualityStatus;
+  quality_reasons_json: string;
+  last_verified_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -197,6 +226,9 @@ interface MemoryRow {
   related_files_json: string;
   dedupe_key: string;
   source: DurableMemory["source"];
+  quality_status: MemoryQualityStatus;
+  quality_reasons_json: string;
+  last_verified_at: string | null;
   created_at: string;
   promoted_at: string;
 }
@@ -615,33 +647,13 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .filter((memory) =>
           memory.evidence.some((evidence) => evidence.sourceType === sourceType && evidence.sourceId === sourceId)
         )
-        .map<MemorySearchResult>((memory) => ({
-          kind: "promoted",
-          id: memory.id,
-          type: memory.type,
-          title: memory.title,
-          summary: memory.summary,
-          reason: memory.reason,
-          confidence: memory.confidence,
-          evidence: memory.evidence,
-          relatedFiles: memory.relatedFiles
-        }));
+        .map<MemorySearchResult>((memory) => memorySearchResult(store, "promoted", memory));
       const candidates = store
         .listMemoryCandidates({ limit: normalizedLimit * 2 })
         .filter((memory) =>
           memory.evidence.some((evidence) => evidence.sourceType === sourceType && evidence.sourceId === sourceId)
         )
-        .map<MemorySearchResult>((memory) => ({
-          kind: "candidate",
-          id: memory.id,
-          type: memory.type,
-          title: memory.title,
-          summary: memory.summary,
-          reason: memory.reason,
-          confidence: memory.confidence,
-          evidence: memory.evidence,
-          relatedFiles: memory.relatedFiles
-        }));
+        .map<MemorySearchResult>((memory) => memorySearchResult(store, "candidate", memory));
       return [...promoted, ...candidates].slice(0, normalizedLimit);
     },
     setSyncCursor(source, cursorKey, cursorValue) {
@@ -713,18 +725,23 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       const existing = db
         .prepare(
           `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, created_at, updated_at
+                  dedupe_key, promotion_state, quality_status, quality_reasons_json, last_verified_at,
+                  created_at, updated_at
            from memory_candidates
            where dedupe_key = ?`
         )
         .get(memory.dedupeKey) as MemoryCandidateRow | undefined;
       const candidateId = existing?.id ?? `candidate-${randomUUID()}`;
       const promotionState = options?.promotionState ?? existing?.promotion_state ?? "candidate";
+      const qualityStatus = options?.qualityStatus ?? existing?.quality_status ?? "active";
+      const qualityReasons = options?.qualityReasons ?? parseJsonArray(existing?.quality_reasons_json ?? "[]");
+      const lastVerifiedAt = options?.lastVerifiedAt ?? existing?.last_verified_at ?? null;
       db.prepare(
         `insert into memory_candidates
            (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-            dedupe_key, promotion_state, evidence_signature, created_at, updated_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            dedupe_key, promotion_state, evidence_signature, quality_status, quality_reasons_json,
+            last_verified_at, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          on conflict(dedupe_key) do update set
            type = excluded.type,
            title = excluded.title,
@@ -735,6 +752,9 @@ export function openMemoryStore(rootDir: string): MemoryStore {
            related_files_json = excluded.related_files_json,
            promotion_state = excluded.promotion_state,
            evidence_signature = excluded.evidence_signature,
+           quality_status = excluded.quality_status,
+           quality_reasons_json = excluded.quality_reasons_json,
+           last_verified_at = excluded.last_verified_at,
            updated_at = excluded.updated_at`
       ).run(
         candidateId,
@@ -748,6 +768,9 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         memory.dedupeKey,
         promotionState,
         normalizeEvidenceSignature(memory.evidence),
+        qualityStatus,
+        JSON.stringify(qualityReasons),
+        lastVerifiedAt,
         existing?.created_at ?? now,
         now
       );
@@ -755,7 +778,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       const row = db
         .prepare(
           `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, created_at, updated_at
+                  dedupe_key, promotion_state, quality_status, quality_reasons_json, last_verified_at,
+                  created_at, updated_at
            from memory_candidates
            where id = ?`
         )
@@ -766,7 +790,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       const candidate = db
         .prepare(
           `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, created_at, updated_at
+                  dedupe_key, promotion_state, quality_status, quality_reasons_json, last_verified_at,
+                  created_at, updated_at
            from memory_candidates
            where id = ?`
         )
@@ -784,6 +809,9 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         relatedFiles: parseJsonArray(candidate.related_files_json),
         dedupeKey: candidate.dedupe_key,
         source,
+        qualityStatus: candidate.quality_status,
+        qualityReasons: parseJsonArray(candidate.quality_reasons_json),
+        lastVerifiedAt: candidate.last_verified_at ?? undefined,
         createdAt: candidate.created_at
       });
       db.prepare(
@@ -805,6 +833,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         relatedFiles: [],
         dedupeKey: `manual-decision:${decision.id}`,
         source: "manual",
+        qualityStatus: "active",
+        qualityReasons: [],
         createdAt: decision.createdAt
       });
     },
@@ -812,7 +842,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       const rows = db
         .prepare(
           `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, created_at, updated_at
+                  dedupe_key, promotion_state, quality_status, quality_reasons_json, last_verified_at,
+                  created_at, updated_at
            from memory_candidates
            order by updated_at desc, created_at desc`
         )
@@ -822,6 +853,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .filter((candidate) => {
           if (input.type && candidate.type !== input.type) return false;
           if (input.promotionState && candidate.promotionState !== input.promotionState) return false;
+          if (!matchesQualityStatus(candidate.qualityStatus, input.qualityStatus)) return false;
           return matchesMemoryQuery(candidate, input.query);
         })
         .slice(0, normalizeLimit(input.limit));
@@ -831,7 +863,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       const rows = db
         .prepare(
           `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, source, created_at, promoted_at
+                  dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+                  created_at, promoted_at
            from memories
            order by promoted_at desc, created_at desc`
         )
@@ -840,9 +873,23 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .map(memoryFromRow)
         .filter((memory) => {
           if (input.type && memory.type !== input.type) return false;
+          if (!matchesQualityStatus(memory.qualityStatus, input.qualityStatus)) return false;
           return matchesMemoryQuery(memory, input.query);
         })
         .slice(0, normalizeLimit(input.limit));
+    },
+    updateMemoryQuality(kind, id, quality) {
+      const table = kind === "candidate" ? "memory_candidates" : "memories";
+      db.prepare(
+        `update ${table}
+         set quality_status = ?, quality_reasons_json = ?, last_verified_at = ?
+         where id = ?`
+      ).run(
+        quality.qualityStatus,
+        JSON.stringify(quality.qualityReasons),
+        quality.lastVerifiedAt ?? null,
+        id
+      );
     },
     upsertTemporaryMemory(input) {
       const now = input.updatedAt ?? new Date().toISOString();
@@ -1011,6 +1058,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       };
       if (input.type !== undefined) promotedInput.type = input.type;
       if (input.query !== undefined) promotedInput.query = input.query;
+      if (input.qualityStatus !== undefined) promotedInput.qualityStatus = input.qualityStatus;
       const promoted =
         input.status === "candidate"
           ? []
@@ -1018,34 +1066,15 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       const candidateInput: Parameters<typeof store.listMemoryCandidates>[0] = { limit };
       if (input.type !== undefined) candidateInput.type = input.type;
       if (input.query !== undefined) candidateInput.query = input.query;
+      if (input.qualityStatus !== undefined) candidateInput.qualityStatus = input.qualityStatus;
       const candidates =
         input.status === "promoted"
           ? []
           : store.listMemoryCandidates(candidateInput);
 
       return [
-        ...promoted.map<MemorySearchResult>((memory) => ({
-          kind: "promoted",
-          id: memory.id,
-          type: memory.type,
-          title: memory.title,
-          summary: memory.summary,
-          reason: memory.reason,
-          confidence: memory.confidence,
-          evidence: memory.evidence,
-          relatedFiles: memory.relatedFiles
-        })),
-        ...candidates.map<MemorySearchResult>((candidate) => ({
-          kind: "candidate",
-          id: candidate.id,
-          type: candidate.type,
-          title: candidate.title,
-          summary: candidate.summary,
-          reason: candidate.reason,
-          confidence: candidate.confidence,
-          evidence: candidate.evidence,
-          relatedFiles: candidate.relatedFiles
-        }))
+        ...promoted.map<MemorySearchResult>((memory) => memorySearchResult(store, "promoted", memory)),
+        ...candidates.map<MemorySearchResult>((candidate) => memorySearchResult(store, "candidate", candidate))
       ].slice(0, limit);
     },
     getProjectSummary() {
@@ -1069,6 +1098,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         candidateMemories: countRows(db, "memory_candidates"),
         promotedMemories: countRows(db, "memories"),
         temporaryMemories: countRows(db, "temporary_memories"),
+        memoryHealth: countMemoryHealth(db),
         syncSources
       };
       if (lastSyncAt !== undefined) summary.lastSyncAt = lastSyncAt;
@@ -1166,6 +1196,9 @@ function runMigrations(db: DatabaseSync): void {
       dedupe_key text not null unique,
       promotion_state text not null check (promotion_state in ('candidate', 'promoted')),
       evidence_signature text not null,
+      quality_status text not null default 'active' check (quality_status in ('active', 'needs_review', 'quarantined')),
+      quality_reasons_json text not null default '[]',
+      last_verified_at text,
       created_at text not null,
       updated_at text not null
     );
@@ -1182,6 +1215,9 @@ function runMigrations(db: DatabaseSync): void {
       dedupe_key text not null,
       evidence_signature text not null,
       source text not null check (source in ('auto', 'manual')),
+      quality_status text not null default 'active' check (quality_status in ('active', 'needs_review', 'quarantined')),
+      quality_reasons_json text not null default '[]',
+      last_verified_at text,
       created_at text not null,
       promoted_at text not null,
       unique (dedupe_key, evidence_signature, source)
@@ -1242,6 +1278,18 @@ function runMigrations(db: DatabaseSync): void {
       details
     );
   `);
+  ensureColumn(db, "memory_candidates", "quality_status", "text not null default 'active'");
+  ensureColumn(db, "memory_candidates", "quality_reasons_json", "text not null default '[]'");
+  ensureColumn(db, "memory_candidates", "last_verified_at", "text");
+  ensureColumn(db, "memories", "quality_status", "text not null default 'active'");
+  ensureColumn(db, "memories", "quality_reasons_json", "text not null default '[]'");
+  ensureColumn(db, "memories", "last_verified_at", "text");
+}
+
+function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  const columns = db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
+  if (columns.some((row) => row.name === column)) return;
+  db.prepare(`alter table ${table} add column ${column} ${definition}`).run();
 }
 
 function upsertMemoryRow(
@@ -1257,6 +1305,9 @@ function upsertMemoryRow(
     relatedFiles: string[];
     dedupeKey: string;
     source: DurableMemory["source"];
+    qualityStatus: MemoryQualityStatus;
+    qualityReasons: string[];
+    lastVerifiedAt?: string | undefined;
     createdAt: string;
   }
 ): DurableMemory {
@@ -1264,7 +1315,8 @@ function upsertMemoryRow(
   const existing = db
     .prepare(
       `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-              dedupe_key, source, created_at, promoted_at
+              dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+              created_at, promoted_at
        from memories
        where dedupe_key = ? and evidence_signature = ? and source = ?`
     )
@@ -1274,15 +1326,19 @@ function upsertMemoryRow(
   db.prepare(
     `insert into memories
        (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-        dedupe_key, evidence_signature, source, created_at, promoted_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        dedupe_key, evidence_signature, source, quality_status, quality_reasons_json,
+        last_verified_at, created_at, promoted_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      on conflict(dedupe_key, evidence_signature, source) do update set
        title = excluded.title,
        summary = excluded.summary,
        reason = excluded.reason,
        confidence = excluded.confidence,
        evidence_json = excluded.evidence_json,
-       related_files_json = excluded.related_files_json`
+       related_files_json = excluded.related_files_json,
+       quality_status = excluded.quality_status,
+       quality_reasons_json = excluded.quality_reasons_json,
+       last_verified_at = excluded.last_verified_at`
   ).run(
     id,
     input.type,
@@ -1295,6 +1351,9 @@ function upsertMemoryRow(
     input.dedupeKey,
     evidenceSignature,
     input.source,
+    input.qualityStatus,
+    JSON.stringify(input.qualityReasons),
+    input.lastVerifiedAt ?? null,
     input.createdAt,
     promotedAt
   );
@@ -1302,7 +1361,8 @@ function upsertMemoryRow(
   const row = db
     .prepare(
       `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-              dedupe_key, source, created_at, promoted_at
+              dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+              created_at, promoted_at
        from memories
        where id = ?`
     )
@@ -1442,6 +1502,18 @@ function countRows(db: DatabaseSync, table: string): number {
   return row.count;
 }
 
+function countMemoryHealth(db: DatabaseSync): { active: number; needsReview: number; quarantined: number } {
+  const rows = [
+    ...db.prepare("select quality_status as status from memory_candidates where promotion_state = 'candidate'").all(),
+    ...db.prepare("select quality_status as status from memories").all()
+  ] as Array<{ status: string }>;
+  return {
+    active: rows.filter((row) => normalizeQualityStatus(row.status) === "active").length,
+    needsReview: rows.filter((row) => normalizeQualityStatus(row.status) === "needs_review").length,
+    quarantined: rows.filter((row) => normalizeQualityStatus(row.status) === "quarantined").length
+  };
+}
+
 function normalizeLimit(limit: number | undefined): number {
   if (!limit || !Number.isFinite(limit)) return 10;
   return Math.max(1, Math.min(Math.floor(limit), 100));
@@ -1539,6 +1611,9 @@ function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
     relatedFiles: parseJsonArray(row.related_files_json),
     dedupeKey: row.dedupe_key,
     promotionState: row.promotion_state,
+    qualityStatus: normalizeQualityStatus(row.quality_status),
+    qualityReasons: parseJsonArray(row.quality_reasons_json),
+    lastVerifiedAt: row.last_verified_at ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -1556,8 +1631,46 @@ function memoryFromRow(row: MemoryRow): DurableMemory {
     relatedFiles: parseJsonArray(row.related_files_json),
     dedupeKey: row.dedupe_key,
     source: row.source,
+    qualityStatus: normalizeQualityStatus(row.quality_status),
+    qualityReasons: parseJsonArray(row.quality_reasons_json),
+    lastVerifiedAt: row.last_verified_at ?? undefined,
     createdAt: row.created_at,
     promotedAt: row.promoted_at
+  };
+}
+
+function memorySearchResult(
+  store: MemoryStore,
+  kind: MemorySearchResult["kind"],
+  memory: MemoryCandidate | DurableMemory
+): MemorySearchResult {
+  const citations = resolveEvidenceCitations(store, {
+    evidence: memory.evidence,
+    relatedFiles: memory.relatedFiles
+  });
+  return {
+    kind,
+    id: memory.id,
+    type: memory.type,
+    title: memory.title,
+    summary: memory.summary,
+    reason: memory.reason,
+    confidence: memory.confidence,
+    evidence: memory.evidence,
+    relatedFiles: memory.relatedFiles,
+    dedupeKey: memory.dedupeKey,
+    qualityStatus: memory.qualityStatus,
+    qualityReasons: memory.qualityReasons,
+    lastVerifiedAt: memory.lastVerifiedAt,
+    citations,
+    trust: buildTrustSummary({
+      status: memory.qualityStatus,
+      confidence: memory.confidence,
+      evidence: memory.evidence,
+      citations,
+      reasons: memory.qualityReasons,
+      lastVerifiedAt: memory.lastVerifiedAt
+    })
   };
 }
 
@@ -1598,6 +1711,19 @@ function normalizeEvidenceSignature(evidence: EvidenceRef[]): string {
     .map((item) => `${item.sourceType}:${item.sourceId}:${item.locator ?? ""}`)
     .sort()
     .join("|");
+}
+
+function normalizeQualityStatus(status: string | undefined): MemoryQualityStatus {
+  if (status === "needs_review" || status === "quarantined") return status;
+  return "active";
+}
+
+function matchesQualityStatus(
+  status: MemoryQualityStatus,
+  filter: MemoryQualityStatusFilter | undefined
+): boolean {
+  if (filter === "all") return true;
+  return status === (filter ?? "active");
 }
 
 function relationToEntityLink(

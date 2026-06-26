@@ -136,21 +136,24 @@ describe("automatic sync", () => {
     const config = loadProjectConfig(rootDir);
     const provider: ExtractorProvider = {
       async extract(context) {
-        return [
-          {
-            type: "bug_fix",
-            title: "Fix stale cache reads",
-            summary: "Write invalidation was added after stale cache reads were discussed.",
-            reason: "TTL-only behavior left stale reads after mutation.",
-            confidence: 0.91,
-            dedupeKey: "cache-stale-reads",
-            relatedFiles: ["src/cache.ts"],
-            evidence: [
-              { sourceType: "commit", sourceId: context.commits[0]!.hash },
-              { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
-            ]
-          }
-        ];
+        return {
+          memories: [
+            {
+              type: "bug_fix",
+              title: "Fix stale cache reads",
+              summary: "Write invalidation was added after stale cache reads were discussed.",
+              reason: "TTL-only behavior left stale reads after mutation.",
+              confidence: 0.91,
+              dedupeKey: "cache-stale-reads",
+              relatedFiles: ["src/cache.ts"],
+              evidence: [
+                { sourceType: "commit", sourceId: context.commits[0]!.hash },
+                { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
+              ]
+            }
+          ],
+          rejected: []
+        };
       }
     };
 
@@ -295,28 +298,93 @@ describe("automatic sync", () => {
     const config = loadProjectConfig(rootDir);
     const provider: ExtractorProvider = {
       async extract(context) {
-        return [
-          {
-            type: "constraint",
-            title: "Cache invalidation follow-up",
-            summary: "A follow-up constraint was noted.",
-            reason: "Need to avoid stale reads.",
-            confidence: 0.4,
-            dedupeKey: "cache-follow-up",
-            relatedFiles: ["src/cache.ts"],
-            evidence: [
-              { sourceType: "commit", sourceId: context.commits[0]!.hash },
-              { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
-            ]
-          }
-        ];
+        return {
+          memories: [
+            {
+              type: "constraint",
+              title: "Cache invalidation follow-up",
+              summary: "A follow-up constraint was noted.",
+              reason: "Need to avoid stale reads.",
+              confidence: 0.4,
+              dedupeKey: "cache-follow-up",
+              relatedFiles: ["src/cache.ts"],
+              evidence: [
+                { sourceType: "commit", sourceId: context.commits[0]!.hash },
+                { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
+              ]
+            }
+          ],
+          rejected: []
+        };
       }
     };
 
     const result = await syncProjectMemory(store, config, { extractorProvider: provider });
     expect(result.memories.promoted).toBe(0);
-    expect(store.listMemoryCandidates()).toHaveLength(1);
+    expect(store.listMemoryCandidates({ qualityStatus: "all" })).toHaveLength(1);
+    expect(store.listMemoryCandidates({ qualityStatus: "all" })[0]).toMatchObject({
+      qualityStatus: "needs_review",
+      qualityReasons: expect.arrayContaining(["low_confidence"])
+    });
     expect(store.listMemories({ status: "promoted" })).toHaveLength(0);
+    store.close();
+  });
+
+  it("persists valid extracted memories and reports rejected noisy memories", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const provider: ExtractorProvider = {
+      async extract(context) {
+        return {
+          memories: [
+            {
+              type: "bug_fix",
+              title: "Fix stale cache reads",
+              summary: "Write invalidation was added after stale cache reads were discussed.",
+              reason: "TTL-only behavior left stale reads after mutation.",
+              confidence: 0.91,
+              dedupeKey: "valid-cache-fix",
+              relatedFiles: ["src/cache.ts"],
+              evidence: [
+                { sourceType: "commit", sourceId: context.commits[0]!.hash },
+                { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
+              ]
+            },
+            {
+              type: "constraint",
+              title: "Bad HTML",
+              summary: "</code></td><td>architecture.html</td>",
+              reason: "Noisy extractor output.",
+              confidence: 0.9,
+              dedupeKey: "bad-html",
+              relatedFiles: [],
+              evidence: [{ sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }]
+            }
+          ],
+          rejected: [{ index: 2, reason: "invalid_memory_record" }]
+        };
+      }
+    };
+
+    const result = await syncProjectMemory(store, config, { extractorProvider: provider });
+
+    expect(result.memories).toMatchObject({
+      candidates: 1,
+      promoted: 1,
+      rejected: 2,
+      skipped: false
+    });
+    expect(store.listMemories({ status: "promoted" })).toEqual([
+      expect.objectContaining({
+        title: "Fix stale cache reads",
+        qualityStatus: "active"
+      })
+    ]);
+    expect(store.listMemoryCandidates({ qualityStatus: "all" })).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ dedupeKey: "bad-html" })])
+    );
     store.close();
   });
 

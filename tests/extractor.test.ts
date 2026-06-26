@@ -52,7 +52,7 @@ describe("OpenAI-compatible extractor", () => {
       fetchMock as typeof fetch
     );
 
-    const memories = await extractor.extract({
+    const result = await extractor.extract({
       conversations: [{ sourceId: "codex:session-1", title: "session", rawContent: "cache stale read" }],
       commits: [
         {
@@ -67,8 +67,9 @@ describe("OpenAI-compatible extractor", () => {
       ]
     });
 
-    expect(memories).toHaveLength(1);
-    expect(memories[0]).toMatchObject({
+    expect(result.rejected).toEqual([]);
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0]).toMatchObject({
       type: "bug_fix",
       title: "Fix stale cache reads",
       confidence: 0.92,
@@ -76,7 +77,7 @@ describe("OpenAI-compatible extractor", () => {
     });
   });
 
-  it("rejects invalid extractor output", async () => {
+  it("skips invalid individual memories and reports rejection reasons", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
@@ -94,11 +95,30 @@ describe("OpenAI-compatible extractor", () => {
       fetchMock as typeof fetch
     );
 
-    await expect(
-      extractor.extract({
-        conversations: [],
-        commits: []
+    await expect(extractor.extract({ conversations: [], commits: [] })).resolves.toEqual({
+      memories: [],
+      rejected: [{ index: 0, reason: "invalid_memory_record" }]
+    });
+  });
+
+  it("still rejects invalid top-level extractor output", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "{\"items\":[]}" } }]
       })
-    ).rejects.toThrow("Invalid extractor response");
+    });
+
+    const extractor = createOpenAICompatibleExtractor(
+      {
+        provider: "openai-compatible",
+        baseUrl: "https://example.test/v1",
+        model: "gpt-test",
+        apiKeyEnv: "TEST_API_KEY"
+      },
+      fetchMock as typeof fetch
+    );
+
+    await expect(extractor.extract({ conversations: [], commits: [] })).rejects.toThrow("Invalid extractor response");
   });
 });

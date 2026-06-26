@@ -149,7 +149,7 @@ describe("AnthropicAWS provider", () => {
       }),
       httpMock
     );
-    const memories = await extractor.extract({
+    const result = await extractor.extract({
       conversations: [],
       commits: [
         {
@@ -164,8 +164,9 @@ describe("AnthropicAWS provider", () => {
       ]
     });
 
-    expect(memories).toHaveLength(1);
-    expect(memories[0]?.title).toBe("Use Claude Platform on AWS");
+    expect(result.rejected).toEqual([]);
+    expect(result.memories).toHaveLength(1);
+    expect(result.memories[0]?.title).toBe("Use Claude Platform on AWS");
     const [, init] = httpMock.mock.calls[0] as [string, { method: string; headers: Record<string, string>; body: string }];
     const body = JSON.parse(init.body as string);
     expect(body.system).toContain("Extract durable project memories");
@@ -217,7 +218,10 @@ describe("AnthropicAWS provider", () => {
       httpMock
     );
 
-    await expect(extractor.extract({ conversations: [], commits: [] })).resolves.toHaveLength(1);
+    await expect(extractor.extract({ conversations: [], commits: [] })).resolves.toMatchObject({
+      memories: [expect.objectContaining({ title: "Use fenced JSON parser" })],
+      rejected: []
+    });
   });
 
   it("maps investigator requests to Anthropic Messages and parses planner JSON", async () => {

@@ -8,7 +8,10 @@ export type TemporaryMemoryKind =
   | "file_context"
   | "user_instruction";
 export type MemoryPromotionState = "candidate" | "promoted";
+export type MemoryQualityStatus = "active" | "needs_review" | "quarantined";
 export type SyncSourceName = "git" | "codex" | "claude";
+export type DoctorStatus = "ok" | "warning" | "error";
+export type DoctorCheckCategory = "project" | "storage" | "sources" | "sync" | "summary" | "extractor" | "memory";
 export type InvestigationMode = "native-rlm" | "heuristic-fallback";
 export type InvestigationStatus = "complete" | "partial" | "failed";
 export type InvestigationStepStatus = "completed" | "failed" | "skipped";
@@ -34,6 +37,29 @@ export interface EvidenceRef {
   sourceType: SourceType;
   sourceId: string;
   locator?: string | undefined;
+}
+
+export type EvidenceCitationKind = SourceType | "file" | "project_summary" | "missing";
+
+export interface EvidenceCitation {
+  kind: EvidenceCitationKind;
+  sourceId: string;
+  label: string;
+  summary: string;
+  resolved: boolean;
+  locator?: string | undefined;
+  metadata?: Record<string, unknown> | undefined;
+}
+
+export interface TrustSummary {
+  status: MemoryQualityStatus;
+  confidence?: number | undefined;
+  evidenceCount: number;
+  resolvedEvidenceCount: number;
+  unresolvedEvidenceCount: number;
+  sourceTypes: string[];
+  reasons: string[];
+  lastVerifiedAt?: string | undefined;
 }
 
 export interface MemorySource {
@@ -63,6 +89,8 @@ export interface SearchResult {
   score: number;
   metadata: Record<string, unknown>;
   evidence: EvidenceRef;
+  citations?: EvidenceCitation[] | undefined;
+  trust?: TrustSummary | undefined;
 }
 
 export interface CommitRecord {
@@ -99,6 +127,9 @@ export interface ExtractedMemory {
 export interface MemoryCandidate extends ExtractedMemory {
   id: string;
   promotionState: MemoryPromotionState;
+  qualityStatus: MemoryQualityStatus;
+  qualityReasons: string[];
+  lastVerifiedAt?: string | undefined;
   createdAt: string;
   updatedAt: string;
 }
@@ -108,6 +139,9 @@ export interface DurableMemory extends ExtractedMemory {
   createdAt: string;
   promotedAt: string;
   source: "auto" | "manual";
+  qualityStatus: MemoryQualityStatus;
+  qualityReasons: string[];
+  lastVerifiedAt?: string | undefined;
 }
 
 export interface MemorySearchResult {
@@ -120,6 +154,12 @@ export interface MemorySearchResult {
   confidence: number;
   evidence: EvidenceRef[];
   relatedFiles: string[];
+  dedupeKey: string;
+  qualityStatus: MemoryQualityStatus;
+  qualityReasons: string[];
+  lastVerifiedAt?: string | undefined;
+  citations?: EvidenceCitation[] | undefined;
+  trust?: TrustSummary | undefined;
 }
 
 export interface TemporaryMemory {
@@ -135,6 +175,8 @@ export interface TemporaryMemory {
   relatedFiles: string[];
   evidence: EvidenceRef[];
   confidence: number;
+  citations?: EvidenceCitation[] | undefined;
+  trust?: TrustSummary | undefined;
   createdAt: string;
   updatedAt: string;
   expiresAt: string;
@@ -179,6 +221,29 @@ export interface SyncStatus {
   metadata?: Record<string, unknown>;
 }
 
+export interface DoctorCheck {
+  id: string;
+  category: DoctorCheckCategory;
+  status: DoctorStatus;
+  title: string;
+  detail: string;
+  metadata?: Record<string, unknown> | undefined;
+}
+
+export interface DoctorNextAction {
+  priority: "high" | "medium" | "low";
+  command: string;
+  reason: string;
+}
+
+export interface DoctorReport {
+  status: DoctorStatus;
+  generatedAt: string;
+  projectRoot: string;
+  checks: DoctorCheck[];
+  nextActions: DoctorNextAction[];
+}
+
 export interface ExtractorConversationInput {
   sourceId: string;
   title: string;
@@ -192,8 +257,18 @@ export interface ExtractorContext {
   commits: CommitRecord[];
 }
 
+export interface RejectedMemory {
+  index: number;
+  reason: string;
+}
+
+export interface ExtractorResult {
+  memories: ExtractedMemory[];
+  rejected: RejectedMemory[];
+}
+
 export interface ExtractorProvider {
-  extract(context: ExtractorContext): Promise<ExtractedMemory[]>;
+  extract(context: ExtractorContext): Promise<ExtractorResult>;
 }
 
 export interface GitSourceConfig {
@@ -448,6 +523,8 @@ export interface InvestigationRunOptions {
 export interface InvestigationResult {
   answer: string;
   evidence: EvidenceRef[];
+  citations: EvidenceCitation[];
+  trust: TrustSummary;
   searchResults: SearchResult[];
   relatedCommits: CommitRecord[];
   relatedDecisions: DecisionRecord[];

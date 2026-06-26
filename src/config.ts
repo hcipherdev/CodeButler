@@ -32,6 +32,18 @@ export function ensureProjectConfig(rootDir: string): string {
 
 export function loadProjectConfig(rootDir: string): ProjectConfig {
   const configPath = ensureProjectConfig(rootDir);
+  return readProjectConfig(rootDir, configPath);
+}
+
+export function loadExistingProjectConfig(rootDir: string): ProjectConfig {
+  const configPath = join(rootDir, ".code-butler", "config.json");
+  if (!existsSync(configPath)) {
+    throw new Error(`Project config not found at ${configPath}`);
+  }
+  return readProjectConfig(rootDir, configPath);
+}
+
+function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
   loadProjectEnv(rootDir);
   const raw = readFileSync(configPath, "utf8");
   const parsed = raw.trim().length > 0 ? (JSON.parse(raw) as ProjectConfigFile) : {};

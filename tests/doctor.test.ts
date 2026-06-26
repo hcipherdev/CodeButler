@@ -1,0 +1,209 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { runDoctor } from "../src/doctor/service.js";
+import { openMemoryStore } from "../src/storage/store.js";
+import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
+
+describe("doctor service", () => {
+  let tempDirs: string[] = [];
+
+  afterEach(() => {
+    for (const dir of tempDirs) cleanupTempDir(dir);
+    tempDirs = [];
+    delete process.env.TEST_CODE_BUTLER_API_KEY;
+  });
+
+  function writeConfig(rootDir: string, overrides: Record<string, unknown> = {}): void {
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.json"),
+      JSON.stringify(
+        {
+          sources: {
+            git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
+            codex: { enabled: false, roots: [], includeDefaultRoots: false, projectOnly: true },
+            claude: { enabled: false, roots: [], projectOnly: true }
+          },
+          extractor: {
+            provider: "openai-compatible",
+            baseUrl: "https://example.test/v1",
+            model: "gpt-test",
+            apiKeyEnv: "TEST_CODE_BUTLER_API_KEY"
+          },
+          investigator: {
+            enabled: true,
+            mode: "native-rlm",
+            provider: "openai-compatible",
+            baseUrl: "https://example.test/v1",
+            model: "gpt-test",
+            apiKeyEnv: "TEST_CODE_BUTLER_API_KEY"
+          },
+          ...overrides
+        },
+        null,
+        2
+      )
+    );
+  }
+
+  function writeFreshSummary(rootDir: string): void {
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Summary\n");
+    writeFileSync(
+      join(rootDir, ".code-butler", "project-summary.meta.json"),
+      JSON.stringify(
+        {
+          version: 1,
+          summaryPath: join(rootDir, ".code-butler", "project-summary.md"),
+          fingerprint: "test",
+          lastGeneratedAt: "2026-06-24T10:00:00.000Z",
+          lastCheckedAt: "2026-06-24T10:00:00.000Z"
+        },
+        null,
+        2
+      )
+    );
+  }
+
+  it("reports an initialized healthy project as ok", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir);
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+
+    expect(report.status).toBe("ok");
+    expect(report.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "config:load", status: "ok" }),
+        expect.objectContaining({ id: "storage:sqlite", status: "ok" }),
+        expect.objectContaining({ id: "summary:freshness", status: "ok" }),
+        expect.objectContaining({ id: "extractor:credentials", status: "ok" })
+      ])
+    );
+    expect(report.nextActions).toEqual([]);
+  });
+
+  it("reports missing and invalid config as errors without throwing", () => {
+    const missingRoot = makeTempDir();
+    const invalidRoot = makeTempDir();
+    tempDirs.push(missingRoot, invalidRoot);
+    mkdirSync(join(invalidRoot, ".code-butler"), { recursive: true });
+    writeFileSync(join(invalidRoot, ".code-butler", "config.json"), "{not json");
+
+    expect(runDoctor(missingRoot).checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "config:exists", status: "error" })
+      ])
+    );
+    expect(runDoctor(missingRoot).status).toBe("error");
+    expect(runDoctor(invalidRoot).checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "config:load", status: "error" })
+      ])
+    );
+  });
+
+  it("warns about missing source roots and missing extractor credentials", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeConfig(rootDir, {
+      sources: {
+        git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
+        codex: { enabled: true, roots: ["./missing-codex"], includeDefaultRoots: false, projectOnly: true },
+        claude: { enabled: true, roots: ["./missing-claude"], projectOnly: true }
+      }
+    });
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+
+    expect(report.status).toBe("warning");
+    expect(report.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "sources:codex", status: "warning" }),
+        expect.objectContaining({ id: "sources:claude", status: "warning" }),
+        expect.objectContaining({ id: "extractor:credentials", status: "warning" })
+      ])
+    );
+    expect(report.nextActions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ command: "code-butler sources status" })
+      ])
+    );
+  });
+
+  it("reports sync errors, stale sync, missing summary, and memory health actions", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.recordSyncStatus({
+      source: "git",
+      enabled: true,
+      lastSyncAt: "2026-06-20T10:00:00.000Z",
+      lastSuccessAt: "2026-06-20T10:00:00.000Z"
+    });
+    store.recordSyncStatus({
+      source: "codex",
+      enabled: true,
+      lastSyncAt: "2026-06-24T10:00:00.000Z",
+      lastError: "failed to parse"
+    });
+    store.addSourceWithChunks({
+      source: {
+        id: "conv-1",
+        type: "conversation",
+        title: "session.md",
+        origin: "manual",
+        rawContent: "Use SQLite."
+      },
+      chunks: [{ text: "Use SQLite." }]
+    });
+    store.upsertMemoryCandidate(
+      {
+        type: "constraint",
+        title: "Needs review",
+        summary: "This memory needs review.",
+        reason: "Test setup.",
+        confidence: 0.8,
+        evidence: [{ sourceType: "conversation", sourceId: "conv-1" }],
+        relatedFiles: [],
+        dedupeKey: "needs-review"
+      },
+      { qualityStatus: "needs_review", qualityReasons: ["low_confidence"] }
+    );
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+
+    expect(report.status).toBe("error");
+    expect(report.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "sync:git", status: "warning" }),
+        expect.objectContaining({ id: "sync:codex", status: "error" }),
+        expect.objectContaining({ id: "summary:freshness", status: "warning" }),
+        expect.objectContaining({ id: "memory:quality", status: "warning" })
+      ])
+    );
+    expect(report.nextActions.map((action) => action.command)).toEqual(
+      expect.arrayContaining([
+        "code-butler sync",
+        "code-butler project-summary refresh",
+        "code-butler memory audit --fix"
+      ])
+    );
+  });
+});

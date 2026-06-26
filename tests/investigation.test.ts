@@ -61,6 +61,18 @@ describe("project history investigation", () => {
     expect(explanation.evidence.map((item) => item.sourceType)).toEqual(
       expect.arrayContaining(["commit", "conversation", "decision"])
     );
+    expect(explanation.citations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "commit", sourceId: "abc123", resolved: true }),
+        expect.objectContaining({ kind: "conversation", resolved: true }),
+        expect.objectContaining({ kind: "decision", resolved: true })
+      ])
+    );
+    expect(explanation.trust).toMatchObject({
+      status: "active",
+      resolvedEvidenceCount: expect.any(Number),
+      unresolvedEvidenceCount: 0
+    });
     expect(explanation.relatedCommits[0]?.hash).toBe("abc123");
   });
 
@@ -93,6 +105,8 @@ describe("project history investigation", () => {
     expect(result.mode).toBe("heuristic-fallback");
     expect(result.searchResults[0]?.title).toBe("cache-discussion.md");
     expect(result.evidence[0]).toMatchObject({ sourceType: "conversation" });
+    expect(result.citations[0]).toMatchObject({ kind: "conversation", resolved: true });
+    expect(result.trust).toMatchObject({ status: "active", resolvedEvidenceCount: 1 });
 
     store.close();
   });
