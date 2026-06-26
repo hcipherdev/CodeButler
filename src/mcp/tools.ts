@@ -4,7 +4,10 @@ import { z } from "zod";
 
 import { loadProjectConfig } from "../config.js";
 import { findDecisions } from "../decisions/store.js";
+import { runDoctor } from "../doctor/service.js";
+import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
 import { explainCodeChange, investigateProjectHistory } from "../investigate/history.js";
+import { summarizeMemoryHealth } from "../memory/quality.js";
 import {
   readProjectBrief,
   refreshProjectSummary,
@@ -15,7 +18,16 @@ import {
 } from "../project-summary/service.js";
 import type { MemoryStore, ProjectSummary } from "../storage/store.js";
 import { syncProjectMemory } from "../sync/service.js";
-import type { MemoryType, SourceType, SyncSourceName, TemporaryMemory, TemporaryMemoryKind } from "../types.js";
+import type {
+  MemoryQualityStatus,
+  MemoryType,
+  SearchResult,
+  SourceType,
+  SyncSourceName,
+  TemporaryMemory,
+  TemporaryMemoryKind
+} from "../types.js";
+import type { DoctorReport } from "../types.js";
 
 export interface RecentActivitySummary {
   window: {
@@ -109,6 +121,7 @@ export interface ProjectMemoryToolHandlers {
     query?: string;
     type?: MemoryType;
     status?: "promoted" | "candidate";
+    qualityStatus?: MemoryQualityStatus | "all";
     limit?: number;
   }): {
     results: ReturnType<MemoryStore["searchMemoryLayer"]>;
@@ -157,12 +170,15 @@ export interface ProjectMemoryToolHandlers {
     source?: SyncSourceName | "all";
   }): ReturnType<typeof syncProjectMemory>;
   summarize_project_state(): ProjectSummary;
+  summarize_memory_health(): ReturnType<typeof summarizeMemoryHealth>;
+  run_doctor(): DoctorReport;
   summarize_project_brief(): ProjectBrief;
   refresh_project_summary(input: { force?: boolean }): Promise<ProjectSummaryRefreshResult>;
 }
 
 const sourceTypeSchema = z.enum(["conversation", "commit", "decision"]);
 const memoryTypeSchema = z.enum(["decision", "bug_fix", "constraint", "rejected_approach"]);
+const memoryQualityStatusSchema = z.enum(["active", "needs_review", "quarantined", "all"]);
 const syncSourceSchema = z.enum(["git", "codex", "claude", "all"]);
 export function createProjectMemoryToolHandlers(
   store: MemoryStore,
@@ -191,7 +207,7 @@ export function createProjectMemoryToolHandlers(
     search_project_memory(input) {
       return {
         memories: store.searchMemoryLayer(normalizeMemorySearchInput({ query: input.query, limit: input.limit })),
-        results: store.search(normalizeSearchInput(input))
+        results: store.search(normalizeSearchInput(input)).map((result) => decorateSearchResult(store, result))
       };
     },
     read_memory_source(input) {
@@ -243,6 +259,12 @@ export function createProjectMemoryToolHandlers(
     },
     summarize_project_state() {
       return store.getProjectSummary();
+    },
+    summarize_memory_health() {
+      return summarizeMemoryHealth(store);
+    },
+    run_doctor() {
+      return runDoctor(rootDir, options.now === undefined ? {} : { now: options.now });
     },
     summarize_project_brief() {
       return readProjectBrief(rootDir);
@@ -310,6 +332,7 @@ export function registerProjectMemoryTools(
         query: z.string().optional(),
         type: memoryTypeSchema.optional(),
         status: z.enum(["promoted", "candidate"]).optional(),
+        qualityStatus: memoryQualityStatusSchema.optional(),
         limit: z.number().int().positive().max(100).optional()
       }
     },
@@ -442,6 +465,24 @@ export function registerProjectMemoryTools(
   );
 
   server.registerTool(
+    "summarize_memory_health",
+    {
+      description: "Summarize durable memory quality status and top quality-review reasons.",
+      inputSchema: {}
+    },
+    async () => asJsonContent(handlers.summarize_memory_health())
+  );
+
+  server.registerTool(
+    "run_doctor",
+    {
+      description: "Run a read-only Code Butler health check for the current project.",
+      inputSchema: {}
+    },
+    async () => asJsonContent(handlers.run_doctor())
+  );
+
+  server.registerTool(
     "summarize_project_brief",
     {
       description: "Read the local project narrative summary and freshness metadata without mutating files.",
@@ -489,17 +530,26 @@ function normalizeMemorySearchInput(input: {
   query?: string | undefined;
   type?: MemoryType | undefined;
   status?: "promoted" | "candidate" | undefined;
+  qualityStatus?: MemoryQualityStatus | "all" | undefined;
   limit?: number | undefined;
-}): { query?: string; type?: MemoryType; status?: "promoted" | "candidate"; limit?: number } {
+}): {
+  query?: string;
+  type?: MemoryType;
+  status?: "promoted" | "candidate";
+  qualityStatus?: MemoryQualityStatus | "all";
+  limit?: number;
+} {
   const normalized: {
     query?: string;
     type?: MemoryType;
     status?: "promoted" | "candidate";
+    qualityStatus?: MemoryQualityStatus | "all";
     limit?: number;
   } = {};
   if (input.query !== undefined) normalized.query = input.query;
   if (input.type !== undefined) normalized.type = input.type;
   if (input.status !== undefined) normalized.status = input.status;
+  if (input.qualityStatus !== undefined) normalized.qualityStatus = input.qualityStatus;
   if (input.limit !== undefined) normalized.limit = input.limit;
   return normalized;
 }
@@ -897,6 +947,22 @@ function normalizeProjectSummaryRefreshInput(input: { force?: boolean | undefine
   const normalized: { force?: boolean } = {};
   if (input.force !== undefined) normalized.force = input.force;
   return normalized;
+}
+
+function decorateSearchResult(store: MemoryStore, result: SearchResult): SearchResult {
+  const citations = resolveEvidenceCitations(store, {
+    evidence: [result.evidence]
+  });
+  return {
+    ...result,
+    citations,
+    trust: buildTrustSummary({
+      status: "active",
+      evidence: [result.evidence],
+      citations,
+      reasons: []
+    })
+  };
 }
 
 function asJsonContent(value: unknown): { content: Array<{ type: "text"; text: string }> } {

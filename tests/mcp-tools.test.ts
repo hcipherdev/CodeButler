@@ -84,6 +84,87 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
+  it("returns citation and trust fields and exposes memory health", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({
+      source: {
+        id: "conv-1",
+        type: "conversation",
+        title: "cache.md",
+        origin: "manual-import",
+        rawContent: "Use SQLite for local project memory."
+      },
+      chunks: [{ text: "Use SQLite for local project memory." }]
+    });
+    const active = store.upsertMemoryCandidate(
+      {
+        type: "decision",
+        title: "Use SQLite",
+        summary: "Use SQLite for local project memory.",
+        reason: "Local-first memory needs durable embedded storage.",
+        confidence: 0.91,
+        evidence: [{ sourceType: "conversation", sourceId: "conv-1", locator: "conv-1:chunk:0" }],
+        relatedFiles: ["src/storage/store.ts"],
+        dedupeKey: "sqlite-memory"
+      },
+      { qualityStatus: "active", qualityReasons: [], lastVerifiedAt: "2026-06-01T10:00:00Z" }
+    );
+    store.promoteMemoryCandidate(active.id);
+    store.upsertMemoryCandidate(
+      {
+        type: "constraint",
+        title: "Bad HTML",
+        summary: "</code></td><td>architecture.html</td>",
+        reason: "Noisy import.",
+        confidence: 0.8,
+        evidence: [{ sourceType: "conversation", sourceId: "conv-1" }],
+        relatedFiles: [],
+        dedupeKey: "bad-html"
+      },
+      { qualityStatus: "quarantined", qualityReasons: ["html_or_markup_content"] }
+    );
+
+    const handlers = createProjectMemoryToolHandlers(store, { rootDir });
+    const found = handlers.find_memories({ query: "SQLite", status: "promoted", limit: 5 });
+    const all = handlers.find_memories({ qualityStatus: "all", limit: 10 });
+    const state = handlers.summarize_project_state();
+    const health = handlers.summarize_memory_health();
+
+    expect(found.results[0]).toMatchObject({
+      title: "Use SQLite",
+      qualityStatus: "active",
+      citations: expect.arrayContaining([
+        expect.objectContaining({ kind: "conversation", sourceId: "conv-1", resolved: true })
+      ]),
+      trust: expect.objectContaining({
+        status: "active",
+        confidence: 0.91,
+        resolvedEvidenceCount: 1,
+        unresolvedEvidenceCount: 0
+      })
+    });
+    expect(all.results).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          title: "Bad HTML",
+          qualityStatus: "quarantined",
+          trust: expect.objectContaining({ status: "quarantined" })
+        })
+      ])
+    );
+    expect(state.memoryHealth).toMatchObject({
+      active: 1,
+      quarantined: 1,
+      needsReview: 0
+    });
+    expect(health.topReasons).toEqual([{ reason: "html_or_markup_content", count: 1 }]);
+
+    store.close();
+  });
+
   it("exposes project brief handlers without rewriting agent files", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);

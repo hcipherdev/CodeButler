@@ -11,6 +11,7 @@ import type {
   ExtractorConfig,
   ExtractorContext,
   ExtractorProvider,
+  ExtractorResult,
   MemoryType
 } from "../types.js";
 
@@ -24,7 +25,7 @@ export function createAnthropicAwsExtractor(
   httpClient?: AnthropicAwsHttpClient
 ): ExtractorProvider {
   return {
-    async extract(context: ExtractorContext): Promise<ExtractedMemory[]> {
+    async extract(context: ExtractorContext): Promise<ExtractorResult> {
       const requestConfig = anthropicAwsRequestConfig(config);
       const payload = await runAnthropicAwsMessage(
         {
@@ -35,7 +36,7 @@ export function createAnthropicAwsExtractor(
             {
               role: "user",
               content: JSON.stringify({
-                conversations: context.conversations,
+                conversations: sanitizeConversations(context.conversations),
                 commits: context.commits
               })
             }
@@ -44,23 +45,28 @@ export function createAnthropicAwsExtractor(
         httpClient
       );
       const parsed = parseJsonFromModelText(readAnthropicAwsText(payload));
-      const memories = readMemories(parsed);
-      return memories;
+      return readMemories(parsed);
     }
   };
 }
 
-function readMemories(payload: unknown): ExtractedMemory[] {
+function readMemories(payload: unknown): ExtractorResult {
   const record = asRecord(payload);
   const memories = record?.memories;
   if (!Array.isArray(memories)) {
     throw new Error("Invalid extractor response");
   }
-  const extracted = memories.map(parseMemory);
-  if (extracted.some((memory) => !memory)) {
-    throw new Error("Invalid extractor response");
+  const extracted: ExtractedMemory[] = [];
+  const rejected: ExtractorResult["rejected"] = [];
+  for (const [index, value] of memories.entries()) {
+    const memory = parseMemory(value);
+    if (!memory) {
+      rejected.push({ index, reason: "invalid_memory_record" });
+      continue;
+    }
+    extracted.push(memory);
   }
-  return extracted as ExtractedMemory[];
+  return { memories: extracted, rejected };
 }
 
 function parseMemory(value: unknown): ExtractedMemory | undefined {
@@ -116,4 +122,27 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function sanitizeConversations(context: ExtractorContext["conversations"]): ExtractorContext["conversations"] {
+  return context.map((conversation) => {
+    const chunks = conversation.chunks?.filter((chunk) => !isLowSignalText(chunk.text));
+    const sanitized: ExtractorContext["conversations"][number] = {
+      ...conversation,
+      rawContent: isLowSignalText(conversation.rawContent) ? "" : conversation.rawContent
+    };
+    if (chunks !== undefined) sanitized.chunks = chunks;
+    return sanitized;
+  });
+}
+
+function isLowSignalText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return true;
+  const tagMatches = trimmed.match(/<\/?[a-z][^>]*>/gi) ?? [];
+  if (tagMatches.length >= 4) return true;
+  if (/^```/.test(trimmed)) return true;
+  if (/^\{[\s\S]*"[^"]+"\s*:/.test(trimmed)) return true;
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  return lines.filter((line) => /^[+-]\s*\S/.test(line)).length >= 4;
 }

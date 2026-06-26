@@ -1,4 +1,5 @@
 import { findDecisions } from "../decisions/store.js";
+import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
 import type { MemoryStore } from "../storage/store.js";
 import { investigationActionSchema } from "./actions.js";
 import { createAnthropicAwsInvestigator } from "./anthropic-aws.js";
@@ -785,12 +786,20 @@ function buildHeuristicFallback(
     ]
   };
 
+  const citations = resolveEvidenceCitations(store, { evidence });
   return {
     answer: input.filePath
       ? buildFileAnswer(input.filePath, temporaryMemories, relatedMemories, relatedCommits, searchResults, relatedDecisions)
       : buildQuestionAnswer(input.question, temporaryMemories, relatedMemories, searchResults, relatedCommits, relatedDecisions),
     evidence,
-    searchResults,
+    citations,
+    trust: buildTrustSummary({
+      status: "active",
+      evidence,
+      citations,
+      reasons: []
+    }),
+    searchResults: searchResults.map((result) => decorateSearchResult(store, result)),
     relatedCommits,
     relatedDecisions,
     temporaryMemories,
@@ -827,6 +836,7 @@ function finalizeResult(
   const searchResults = [...shared.searchResults.values()];
   const relatedDecisions = [...shared.relatedDecisions.values()];
   const evidence = [...shared.evidence.values()];
+  const citations = resolveEvidenceCitations(store, { evidence });
 
   return {
     answer:
@@ -835,7 +845,14 @@ function finalizeResult(
         ? buildFileAnswer(filePath, temporaryMemories, relatedMemories, relatedCommits, searchResults, relatedDecisions)
         : buildQuestionAnswer(question, temporaryMemories, relatedMemories, searchResults, relatedCommits, relatedDecisions)),
     evidence,
-    searchResults,
+    citations,
+    trust: buildTrustSummary({
+      status: "active",
+      evidence,
+      citations,
+      reasons: []
+    }),
+    searchResults: searchResults.map((result) => decorateSearchResult(store, result)),
     relatedCommits,
     relatedDecisions,
     temporaryMemories,
@@ -849,6 +866,20 @@ function finalizeResult(
     terminationReason: shared.terminationReason ?? "finalize_answer",
     evidenceScore,
     visitedEntities: [...shared.visitedEntities]
+  };
+}
+
+function decorateSearchResult(store: MemoryStore, result: SearchResult): SearchResult {
+  const citations = resolveEvidenceCitations(store, { evidence: [result.evidence] });
+  return {
+    ...result,
+    citations,
+    trust: buildTrustSummary({
+      status: "active",
+      evidence: [result.evidence],
+      citations,
+      reasons: []
+    })
   };
 }
 

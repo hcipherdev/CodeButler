@@ -5,8 +5,10 @@ import { pathToFileURL } from "node:url";
 
 import { ensureProjectConfig, loadProjectConfig } from "./config.js";
 import { addDecision, importDecisionMarkdown } from "./decisions/store.js";
+import { runDoctor } from "./doctor/service.js";
 import { parseConversationFile } from "./ingest/conversation.js";
 import { ingestGitRepository } from "./ingest/git.js";
+import { auditMemoryQuality } from "./memory/quality.js";
 import {
   getProjectSummaryStatus,
   installProjectSummary,
@@ -21,7 +23,7 @@ import { startServer as startProjectMemoryServer, type ProjectMemoryServerOption
 import { getClaudeSourceStatus, getCodexSourceStatus } from "./sources/codex.js";
 import { openMemoryStore } from "./storage/store.js";
 import { syncProjectMemory } from "./sync/service.js";
-import type { EvidenceRef, SyncSourceName } from "./types.js";
+import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, SyncSourceName } from "./types.js";
 
 type ServerStarter = (options: ProjectMemoryServerOptions) => Promise<unknown>;
 
@@ -68,6 +70,14 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
 
     if (command === "decision") {
       return runDecision(rest, cwd, stdout);
+    }
+
+    if (command === "memory") {
+      return runMemory(rest, cwd, stdout);
+    }
+
+    if (command === "doctor") {
+      return runDoctorCli(rest, cwd, stdout, { now: options.now });
     }
 
     if (command === "sync") {
@@ -240,6 +250,56 @@ async function runDecision(args: string[], cwd: string, stdout: (line: string) =
   } finally {
     store.close();
   }
+}
+
+async function runMemory(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
+  const [subcommand, ...rest] = args;
+  if (subcommand !== "audit") {
+    throw new Error("Usage: code-butler memory audit [--fix] [--json]");
+  }
+  const fix = rest.includes("--fix");
+  const json = rest.includes("--json");
+  const unknownFlag = rest.find((arg) => arg.startsWith("--") && arg !== "--fix" && arg !== "--json");
+  if (unknownFlag) throw new Error(`Unknown memory audit option: ${unknownFlag}`);
+
+  const store = openMemoryStore(cwd);
+  store.init();
+  try {
+    const result = auditMemoryQuality(store, { fix });
+    if (json) {
+      stdout(JSON.stringify(result, null, 2));
+      return 0;
+    }
+    stdout("Memory Audit");
+    stdout(`scanned=${result.scanned} active=${result.active} needs_review=${result.needsReview} quarantined=${result.quarantined} updated=${result.updated}`);
+    for (const reason of result.topReasons) {
+      stdout(`reason ${reason.reason}=${reason.count}`);
+    }
+    return 0;
+  } finally {
+    store.close();
+  }
+}
+
+function runDoctorCli(
+  args: string[],
+  cwd: string,
+  stdout: (line: string) => void,
+  options: Pick<CliOptions, "now"> = {}
+): number {
+  const json = args.includes("--json");
+  const strict = args.includes("--strict");
+  const unknownFlag = args.find((arg) => arg.startsWith("--") && arg !== "--json" && arg !== "--strict");
+  if (unknownFlag) throw new Error(`Unknown doctor option: ${unknownFlag}\nUsage: code-butler doctor [--json] [--strict]`);
+
+  const doctorOptions = options.now === undefined ? {} : { now: options.now };
+  const report = runDoctor(cwd, doctorOptions);
+  if (json) {
+    stdout(JSON.stringify(report, null, 2));
+  } else {
+    printDoctorReport(report, stdout);
+  }
+  return report.status === "error" || (strict && report.status === "warning") ? 1 : 0;
 }
 
 async function runSync(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
@@ -529,6 +589,39 @@ function formatRootStatus(root: {
   return `  root=${root.root} exists=${root.exists} found=${root.found} indexed=${root.indexed} pending=${root.pending} ignored=${root.ignored} parseFailures=${root.parseFailures}${latest}`;
 }
 
+function printDoctorReport(report: DoctorReport, stdout: (line: string) => void): void {
+  stdout("Code Butler Doctor");
+  stdout(`Project: ${report.projectRoot}`);
+  stdout(`Generated: ${report.generatedAt}`);
+  stdout(`Overall: ${report.status}`);
+
+  const categories: DoctorCheckCategory[] = ["project", "storage", "sources", "sync", "summary", "extractor", "memory"];
+  for (const category of categories) {
+    const checks = report.checks.filter((check) => check.category === category);
+    if (checks.length === 0) continue;
+    stdout("");
+    stdout(category);
+    for (const check of checks) {
+      stdout(`  ${doctorMarker(check.status)} ${check.title}: ${check.detail}`);
+    }
+  }
+
+  stdout("");
+  stdout("Next actions:");
+  if (report.nextActions.length === 0) {
+    stdout("  none");
+    return;
+  }
+  for (const [index, action] of report.nextActions.entries()) {
+    stdout(`  ${index + 1}. [${action.priority}] ${action.command} - ${action.reason}`);
+  }
+}
+
+function doctorMarker(status: DoctorStatus): string {
+  if (status === "warning") return "[warn]";
+  return `[${status}]`;
+}
+
 function parseEvidenceFlags(args: string[]): EvidenceRef[] {
   const evidence: EvidenceRef[] = [];
   for (let index = 0; index < args.length; index += 1) {
@@ -560,6 +653,8 @@ function usage(): string {
     "  code-butler ingest git <repo> [--max-commits <n>]",
     "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",
     "  code-butler decision import <markdown-file>",
+    "  code-butler memory audit [--fix] [--json]",
+    "  code-butler doctor [--json] [--strict]",
     "  code-butler sync [--source <git|codex|claude|all>]",
     "  code-butler sources status",
     "  code-butler watch [--interval <seconds>] [--source <git|codex|claude|all>]",

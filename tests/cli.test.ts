@@ -15,6 +15,7 @@ describe("CLI", () => {
     vi.useRealTimers();
     for (const dir of tempDirs) cleanupTempDir(dir);
     tempDirs = [];
+    delete process.env.TEST_CODE_BUTLER_API_KEY;
   });
 
   function createConversationProject(): { rootDir: string; claudeDir: string } {
@@ -57,6 +58,53 @@ describe("CLI", () => {
       )
     );
     return { rootDir, claudeDir };
+  }
+
+  function writeDoctorConfig(rootDir: string): void {
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.json"),
+      JSON.stringify(
+        {
+          sources: {
+            git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
+            codex: { enabled: false, roots: [], includeDefaultRoots: false, projectOnly: true },
+            claude: { enabled: false, roots: [], projectOnly: true }
+          },
+          extractor: {
+            provider: "openai-compatible",
+            baseUrl: "https://example.test/v1",
+            model: "gpt-test",
+            apiKeyEnv: "TEST_CODE_BUTLER_API_KEY"
+          },
+          investigator: {
+            enabled: true,
+            mode: "native-rlm",
+            provider: "openai-compatible",
+            baseUrl: "https://example.test/v1",
+            model: "gpt-test",
+            apiKeyEnv: "TEST_CODE_BUTLER_API_KEY"
+          }
+        },
+        null,
+        2
+      )
+    );
+  }
+
+  function writeDoctorSummary(rootDir: string): void {
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Summary\n");
+    writeFileSync(
+      join(rootDir, ".code-butler", "project-summary.meta.json"),
+      JSON.stringify({
+        version: 1,
+        summaryPath: join(rootDir, ".code-butler", "project-summary.md"),
+        fingerprint: "test",
+        lastGeneratedAt: "2026-06-24T10:00:00.000Z",
+        lastCheckedAt: "2026-06-24T10:00:00.000Z"
+      })
+    );
   }
 
   it("initializes local storage and imports a conversation", async () => {
@@ -128,6 +176,212 @@ describe("CLI", () => {
     expect(text).toContain("found=1");
     expect(text).toContain("pending=1");
     expect(text).toContain("Conversations in SQLite: 0");
+  });
+
+  it("audits memory quality as JSON without mutating by default", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({
+      source: {
+        id: "conv-1",
+        type: "conversation",
+        title: "session.md",
+        origin: "manual-import",
+        rawContent: "Use SQLite for local project memory."
+      },
+      chunks: [{ text: "Use SQLite for local project memory." }]
+    });
+    store.upsertMemoryCandidate({
+      type: "constraint",
+      title: "Bad HTML",
+      summary: "</code></td><td>architecture.html</td>",
+      reason: "Noisy import.",
+      confidence: 0.9,
+      evidence: [{ sourceType: "conversation", sourceId: "conv-1" }],
+      relatedFiles: [],
+      dedupeKey: "bad-html"
+    });
+    store.close();
+
+    const output: string[] = [];
+    await expect(
+      runCli(["memory", "audit", "--json"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line)
+      })
+    ).resolves.toBe(0);
+
+    const audit = JSON.parse(output.join("\n")) as {
+      scanned: number;
+      changes: Array<{ id: string; nextStatus: string; reasons: string[] }>;
+      topReasons: Array<{ reason: string; count: number }>;
+    };
+    expect(audit.scanned).toBe(1);
+    expect(audit.changes).toEqual([
+      expect.objectContaining({
+        nextStatus: "quarantined",
+        reasons: expect.arrayContaining(["html_or_markup_content"])
+      })
+    ]);
+    expect(audit.topReasons).toEqual([{ reason: "html_or_markup_content", count: 1 }]);
+
+    const after = openMemoryStore(rootDir);
+    after.init();
+    expect(after.listMemoryCandidates({ qualityStatus: "all" })[0]?.qualityStatus).toBe("active");
+    after.close();
+  });
+
+  it("fixes memory quality audit findings when requested", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({
+      source: {
+        id: "conv-1",
+        type: "conversation",
+        title: "session.md",
+        origin: "manual-import",
+        rawContent: "Use SQLite for local project memory."
+      },
+      chunks: [{ text: "Use SQLite for local project memory." }]
+    });
+    store.upsertMemoryCandidate({
+      type: "constraint",
+      title: "Bad HTML",
+      summary: "</code></td><td>architecture.html</td>",
+      reason: "Noisy import.",
+      confidence: 0.9,
+      evidence: [{ sourceType: "conversation", sourceId: "conv-1" }],
+      relatedFiles: [],
+      dedupeKey: "bad-html"
+    });
+    store.close();
+
+    const output: string[] = [];
+    await expect(
+      runCli(["memory", "audit", "--fix"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line)
+      })
+    ).resolves.toBe(0);
+
+    expect(output.join("\n")).toContain("Memory Audit");
+    expect(output.join("\n")).toContain("updated=1");
+    const after = openMemoryStore(rootDir);
+    after.init();
+    expect(after.listMemoryCandidates({ qualityStatus: "all" })[0]).toMatchObject({
+      qualityStatus: "quarantined",
+      qualityReasons: ["html_or_markup_content"]
+    });
+    after.close();
+  });
+
+  it("reports doctor status for a healthy initialized project", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeDoctorConfig(rootDir);
+    writeDoctorSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+    const output: string[] = [];
+
+    await expect(
+      runCli(["doctor"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        now: () => new Date("2026-06-24T12:00:00.000Z")
+      })
+    ).resolves.toBe(0);
+
+    const text = output.join("\n");
+    expect(text).toContain("Code Butler Doctor");
+    expect(text).toContain("Overall: ok");
+    expect(text).toContain("[ok]");
+  });
+
+  it("prints doctor JSON reports", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeDoctorConfig(rootDir);
+    writeDoctorSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+    const output: string[] = [];
+
+    await expect(
+      runCli(["doctor", "--json"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        now: () => new Date("2026-06-24T12:00:00.000Z")
+      })
+    ).resolves.toBe(0);
+
+    const report = JSON.parse(output.join("\n")) as { status: string; projectRoot: string; checks: unknown[] };
+    expect(report.status).toBe("ok");
+    expect(report.projectRoot).toBe(rootDir);
+    expect(report.checks.length).toBeGreaterThan(0);
+  });
+
+  it("exits nonzero on doctor errors without creating project state", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const output: string[] = [];
+
+    await expect(
+      runCli(["doctor"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line)
+      })
+    ).resolves.toBe(1);
+
+    expect(output.join("\n")).toContain("[error]");
+    expect(existsSync(join(rootDir, ".code-butler", "config.json"))).toBe(false);
+    expect(existsSync(join(rootDir, ".code-butler", "memory.sqlite"))).toBe(false);
+  });
+
+  it("exits nonzero for doctor warnings in strict mode", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeDoctorConfig(rootDir);
+    writeDoctorSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+    const output: string[] = [];
+
+    await expect(
+      runCli(["doctor", "--strict"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        now: () => new Date("2026-06-24T12:00:00.000Z")
+      })
+    ).resolves.toBe(1);
+
+    expect(output.join("\n")).toContain("Overall: warning");
+    expect(output.join("\n")).toContain("[warn]");
+  });
+
+  it("rejects unknown doctor flags", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const errors: string[] = [];
+
+    await expect(
+      runCli(["doctor", "--bogus"], {
+        cwd: rootDir,
+        stderr: (line) => errors.push(line)
+      })
+    ).resolves.toBe(1);
+
+    expect(errors.join("\n")).toContain("Unknown doctor option: --bogus");
+    expect(errors.join("\n")).toContain("code-butler doctor [--json] [--strict]");
   });
 
   it("rejects invalid watch intervals", async () => {
