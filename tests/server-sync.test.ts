@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -89,6 +89,9 @@ describe("server startup sync", () => {
     expect(summary.lastSyncAt).toBeTruthy();
     expect(summary.sources).toBeGreaterThan(0);
     expect(summary.syncSources.codex?.lastSyncAt).toBeTruthy();
+    expect(existsSync(join(repoDir, "AGENTS.md"))).toBe(false);
+    expect(existsSync(join(repoDir, "CLAUDE.md"))).toBe(false);
+    expect(existsSync(join(repoDir, ".code-butler", "project-summary.md"))).toBe(false);
 
     projectServer.store.close();
   });

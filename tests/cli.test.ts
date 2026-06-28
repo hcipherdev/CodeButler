@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { runCli } from "../src/cli.js";
+import { isCliEntrypoint, runCli } from "../src/cli.js";
 import { loadProjectConfig } from "../src/config.js";
 import type { ProjectSummaryGenerator } from "../src/project-summary/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
@@ -16,6 +17,19 @@ describe("CLI", () => {
     for (const dir of tempDirs) cleanupTempDir(dir);
     tempDirs = [];
     delete process.env.TEST_CODE_BUTLER_API_KEY;
+  });
+
+  it("recognizes symlinked bin paths as the CLI entrypoint", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const realCli = join(rootDir, "dist", "cli.js");
+    const binCli = join(rootDir, "bin", "code-butler");
+    mkdirSync(join(rootDir, "dist"), { recursive: true });
+    mkdirSync(join(rootDir, "bin"), { recursive: true });
+    writeFileSync(realCli, "#!/usr/bin/env node\n");
+    symlinkSync(realCli, binCli);
+
+    expect(isCliEntrypoint(pathToFileURL(realCli).href, binCli)).toBe(true);
   });
 
   function createConversationProject(): { rootDir: string; claudeDir: string } {
@@ -130,6 +144,36 @@ describe("CLI", () => {
     expect(output.join("\n")).toContain("Imported conversation");
   });
 
+  it("explicit init installs fallback project summary and agent bootstraps", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeFileSync(join(rootDir, "README.md"), "# Auto Summary Project\n");
+    writeFileSync(join(rootDir, "AGENTS.md"), "old agents");
+    writeFileSync(join(rootDir, "CLAUDE.md"), "old claude");
+    const output: string[] = [];
+
+    await expect(
+      runCli(["init"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        now: () => new Date("2026-06-16T10:00:00Z")
+      })
+    ).resolves.toBe(0);
+
+    expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain(
+      "Fallback Project Summary"
+    );
+    expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "project-summary.meta.json"), "utf8"))).toMatchObject({
+      provider: "fallback"
+    });
+    expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toContain("summarize_project_brief");
+    expect(readFileSync(join(rootDir, "CLAUDE.md"), "utf8")).toContain("sync_project_memory");
+    expect(readFileSync(join(rootDir, "AGENTS.md.code-butler-backup-2026-06-16T10-00-00-000Z"), "utf8")).toBe("old agents");
+    expect(readFileSync(join(rootDir, "CLAUDE.md.code-butler-backup-2026-06-16T10-00-00-000Z"), "utf8")).toBe("old claude");
+    expect(output.join("\n")).toContain("fallback summary was created");
+    expect(output.join("\n")).toContain("code-butler project-summary refresh --force");
+  });
+
   it("initializes config and syncs configured sources", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -148,6 +192,34 @@ describe("CLI", () => {
     expect(repoDir).toBeTruthy();
     expect(codexDir).toBeTruthy();
     expect(claudeDir).toBeTruthy();
+  });
+
+  it("sync does not bootstrap an uninitialized project", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.json"),
+      JSON.stringify(
+        {
+          sources: {
+            git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
+            codex: { enabled: false, roots: [], includeDefaultRoots: false },
+            claude: { enabled: false, roots: [] }
+          }
+        },
+        null,
+        2
+      )
+    );
+    const output: string[] = [];
+
+    await expect(runCli(["sync"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
+
+    expect(output.join("\n")).toContain("Synced project memory");
+    expect(existsSync(join(rootDir, "AGENTS.md"))).toBe(false);
+    expect(existsSync(join(rootDir, "CLAUDE.md"))).toBe(false);
+    expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(false);
   });
 
   it("reports source status without writing sync cursors", async () => {
@@ -489,6 +561,17 @@ describe("CLI", () => {
     const output: string[] = [];
     const controller = new AbortController();
     let summaryGenerations = 0;
+    writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Existing Brief\n");
+    writeFileSync(
+      join(rootDir, ".code-butler", "project-summary.meta.json"),
+      JSON.stringify({
+        version: 1,
+        summaryPath: join(rootDir, ".code-butler", "project-summary.md"),
+        fingerprint: "old",
+        lastGeneratedAt: "2026-06-14T10:00:00.000Z",
+        lastCheckedAt: "2026-06-14T10:00:00.000Z"
+      })
+    );
 
     const watch = runCli(["watch", "--interval", "1", "--source", "claude"], {
       cwd: rootDir,
@@ -532,13 +615,41 @@ describe("CLI", () => {
     await expect(watch).resolves.toBe(0);
   });
 
-  it("installs project summary bootstrap files", async () => {
+  it("watch does not bootstrap an uninitialized project", async () => {
+    vi.useFakeTimers();
+    const { rootDir } = createConversationProject();
+    const output: string[] = [];
+    const controller = new AbortController();
+    let summaryGenerations = 0;
+
+    const watch = runCli(["watch", "--interval", "1", "--source", "claude"], {
+      cwd: rootDir,
+      stdout: (line) => output.push(line),
+      signal: controller.signal,
+      projectSummaryGenerator: {
+        async generate() {
+          summaryGenerations += 1;
+          return "# Watch Generated Brief\n";
+        }
+      },
+      now: () => new Date("2026-06-16T10:00:00Z")
+    });
+
+    await vi.waitFor(() => expect(output.filter((line) => line.includes("Synced project memory"))).toHaveLength(1));
+    expect(summaryGenerations).toBe(0);
+    expect(existsSync(join(rootDir, "AGENTS.md"))).toBe(false);
+    expect(existsSync(join(rootDir, "CLAUDE.md"))).toBe(false);
+    expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(false);
+    controller.abort();
+
+    await expect(watch).resolves.toBe(0);
+  });
+
+  it("installs, reports, and uninstalls the macOS watch launch agent", async () => {
     const rootDir = makeTempDir();
-    tempDirs.push(rootDir);
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, launchdHomeDir);
     mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
-    writeFileSync(join(rootDir, "README.md"), "# CLI Summary Project\n");
-    writeFileSync(join(rootDir, "AGENTS.md"), "old agents");
-    writeFileSync(join(rootDir, "CLAUDE.md"), "old claude");
     writeFileSync(
       join(rootDir, ".code-butler", "config.json"),
       JSON.stringify(
@@ -554,25 +665,65 @@ describe("CLI", () => {
       )
     );
     const output: string[] = [];
-    const generator: ProjectSummaryGenerator = {
-      async generate() {
-        return "# CLI Generated Brief\n";
-      }
-    };
+
+    await expect(
+      runCli(["watch", "install", "--interval", "45", "--source", "git"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceLaunchctl: false
+      })
+    ).resolves.toBe(0);
+
+    const launchAgentsDir = join(launchdHomeDir, "Library", "LaunchAgents");
+    const plistFiles = readdirSync(launchAgentsDir).filter((name) => name.startsWith("com.codebutler.watch."));
+    expect(plistFiles).toHaveLength(1);
+    const plist = readFileSync(join(launchAgentsDir, plistFiles[0]!), "utf8");
+    expect(plist).toContain("<string>watch</string>");
+    expect(plist).toContain("<string>--interval</string>");
+    expect(plist).toContain("<string>45</string>");
+    expect(plist).toContain("<string>--source</string>");
+    expect(plist).toContain("<string>git</string>");
+    expect(plist).toContain(`<string>${rootDir}</string>`);
+
+    const statusOutput: string[] = [];
+    await expect(
+      runCli(["watch", "status"], {
+        cwd: rootDir,
+        stdout: (line) => statusOutput.push(line),
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceLaunchctl: false
+      })
+    ).resolves.toBe(0);
+    expect(statusOutput.join("\n")).toContain("installed=true");
+
+    await expect(
+      runCli(["watch", "uninstall"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceLaunchctl: false
+      })
+    ).resolves.toBe(0);
+    expect(existsSync(join(launchAgentsDir, plistFiles[0]!))).toBe(false);
+  });
+
+  it("rejects removed project summary install command", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const errors: string[] = [];
 
     await expect(
       runCli(["project-summary", "install"], {
         cwd: rootDir,
-        stdout: (line) => output.push(line),
-        projectSummaryGenerator: generator,
-        now: () => new Date("2026-06-16T10:00:00Z")
+        stderr: (line) => errors.push(line)
       })
-    ).resolves.toBe(0);
+    ).resolves.toBe(1);
 
-    expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain("CLI Generated Brief");
-    expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toContain("summarize_project_brief");
-    expect(readFileSync(join(rootDir, ".code-butler", "backups", "agent-instructions", "2026-06-16T10-00-00-000Z", "AGENTS.md"), "utf8")).toBe("old agents");
-    expect(output.join("\n")).toContain("Installed project summary");
+    expect(errors.join("\n")).toContain("project-summary <refresh|status>");
   });
 
   it("reports project summary status", async () => {

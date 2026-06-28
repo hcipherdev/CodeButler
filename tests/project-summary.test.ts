@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
 import {
+  initializeProjectSummary,
   installProjectSummary,
   readProjectBrief,
   refreshProjectSummary,
@@ -78,8 +79,8 @@ describe("project narrative summary", () => {
     expect(readFileSync(join(rootDir, "CLAUDE.md"), "utf8")).toContain("current_project");
     expect(readFileSync(join(rootDir, "CLAUDE.md"), "utf8")).not.toContain("project-scoped Code Butler MCP tools");
     expect(readFileSync(join(rootDir, "CLAUDE.md"), "utf8")).not.toContain("may be named `code-butler`");
-    expect(readFileSync(join(rootDir, ".code-butler", "backups", "agent-instructions", "2026-06-16T10-00-00-000Z", "AGENTS.md"), "utf8")).toContain("stale agent instructions");
-    expect(readFileSync(join(rootDir, ".code-butler", "backups", "agent-instructions", "2026-06-16T10-00-00-000Z", "CLAUDE.md"), "utf8")).toContain("stale claude instructions");
+    expect(readFileSync(join(rootDir, "AGENTS.md.code-butler-backup-2026-06-16T10-00-00-000Z"), "utf8")).toContain("stale agent instructions");
+    expect(readFileSync(join(rootDir, "CLAUDE.md.code-butler-backup-2026-06-16T10-00-00-000Z"), "utf8")).toContain("stale claude instructions");
     expect(getProjectSummaryStatus(rootDir).exists).toBe(true);
     store.close();
   });
@@ -163,6 +164,28 @@ describe("project narrative summary", () => {
 
     expect(quiet.generated).toBe(false);
     expect(outputs).toHaveLength(1);
+    store.close();
+  });
+
+  it("explicit initialization is idempotent after bootstraps are current", async () => {
+    const { rootDir, generator } = createProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    const first = await initializeProjectSummary(store, config, {
+      generator,
+      now: () => new Date("2026-06-15T00:00:00Z")
+    });
+    const second = await initializeProjectSummary(store, config, {
+      generator,
+      now: () => new Date("2026-06-16T00:00:00Z")
+    });
+
+    expect(first.backupDir).toBe(rootDir);
+    expect(second.backupDir).toBeUndefined();
+    expect(readFileSync(join(rootDir, "AGENTS.md.code-butler-backup-2026-06-15T00-00-00-000Z"), "utf8")).toContain("stale agent instructions");
+    expect(existsSync(join(rootDir, "AGENTS.md.code-butler-backup-2026-06-16T00-00-00-000Z"))).toBe(false);
     store.close();
   });
 });
