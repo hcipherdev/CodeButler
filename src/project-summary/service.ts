@@ -118,12 +118,21 @@ export interface ProjectSummaryRefreshResult {
 export interface ProjectSummaryInstallResult extends ProjectSummaryRefreshResult {
   agentFiles: string[];
   backupDir?: string;
+  backupFiles?: string[];
 }
 
 export interface ProjectSummaryOperationOptions {
   generator?: ProjectSummaryGenerator;
   now?: () => Date;
   force?: boolean;
+  warn?: (line: string) => void;
+}
+
+export interface ProjectSummaryInstalledResult extends ProjectSummaryRefreshResult {
+  agentFiles: string[];
+  backupDir?: string;
+  backupFiles?: string[];
+  fallback: boolean;
 }
 
 export function readProjectBrief(rootDir: string): ProjectBrief {
@@ -176,28 +185,59 @@ export async function installProjectSummary(
 ): Promise<ProjectSummaryInstallResult> {
   const rootDir = projectRoot(config, store);
   const refreshed = await refreshProjectSummary(store, config, options);
-  const existingAgentFiles = AGENT_FILE_NAMES.map((fileName) => join(rootDir, fileName)).filter(existsSync);
-  const backupDir =
-    existingAgentFiles.length > 0
-      ? join(rootDir, ".code-butler", "backups", "agent-instructions", timestampForBackup(nowDate(options)))
-      : undefined;
-  if (backupDir) {
-    mkdirSync(backupDir, { recursive: true });
-    for (const agentFile of existingAgentFiles) {
-      copyFileSync(agentFile, join(backupDir, agentFile.endsWith("AGENTS.md") ? "AGENTS.md" : "CLAUDE.md"));
-    }
-  }
-
-  for (const fileName of AGENT_FILE_NAMES) {
-    writeFileSync(join(rootDir, fileName), agentBootstrapText(fileName));
-  }
+  const bootstrap = ensureAgentBootstrapFiles(rootDir, nowDate(options));
 
   const result: ProjectSummaryInstallResult = {
     ...refreshed,
     agentFiles: AGENT_FILE_NAMES.map((fileName) => join(rootDir, fileName))
   };
-  if (backupDir !== undefined) result.backupDir = backupDir;
+  if (bootstrap.backupDir !== undefined) result.backupDir = bootstrap.backupDir;
+  if (bootstrap.backupFiles.length > 0) result.backupFiles = bootstrap.backupFiles;
   return result;
+}
+
+export async function initializeProjectSummary(
+  store: MemoryStore,
+  config: ProjectConfig,
+  options: ProjectSummaryOperationOptions = {}
+): Promise<ProjectSummaryInstalledResult> {
+  const rootDir = projectRoot(config, store);
+  const existing = readProjectBrief(rootDir);
+  let refreshed: ProjectSummaryRefreshResult;
+  let fallback = false;
+
+  if (existing.exists) {
+    refreshed = {
+      checked: false,
+      generated: false,
+      summaryPath: existing.summaryPath
+    };
+    if (existing.meta?.fingerprint !== undefined) refreshed.fingerprint = existing.meta.fingerprint;
+    if (existing.meta !== undefined) refreshed.meta = existing.meta;
+  } else {
+    try {
+      refreshed = await refreshProjectSummary(store, config, options);
+    } catch (error) {
+      fallback = true;
+      const fallbackGenerator = createFallbackProjectSummaryGenerator(error);
+      refreshed = await refreshProjectSummary(store, config, {
+        ...options,
+        generator: fallbackGenerator,
+        force: true
+      });
+      const message = fallbackSummaryWarning(error);
+      options.warn?.(message);
+    }
+  }
+
+  const bootstrap = ensureAgentBootstrapFiles(rootDir, nowDate(options));
+  return {
+    ...refreshed,
+    fallback,
+    agentFiles: AGENT_FILE_NAMES.map((fileName) => join(rootDir, fileName)),
+    ...(bootstrap.backupDir ? { backupDir: bootstrap.backupDir } : {}),
+    ...(bootstrap.backupFiles.length > 0 ? { backupFiles: bootstrap.backupFiles } : {})
+  };
 }
 
 export async function refreshProjectSummary(
@@ -354,6 +394,97 @@ function isSummaryRefreshDue(meta: ProjectSummaryMeta | undefined, now: Date): b
   return now.getTime() - lastCheckedAt >= DAILY_REFRESH_MS;
 }
 
+function ensureAgentBootstrapFiles(rootDir: string, now: Date): { backupDir?: string; backupFiles: string[] } {
+  const filesToBackUp: Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; path: string }> = [];
+  const filesToWrite: Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; path: string; content: string }> = [];
+
+  for (const fileName of AGENT_FILE_NAMES) {
+    const path = join(rootDir, fileName);
+    const content = agentBootstrapText(fileName);
+    if (existsSync(path)) {
+      const current = readFileSync(path, "utf8");
+      if (current === content) continue;
+      if (!isGeneratedBootstrap(current)) filesToBackUp.push({ fileName, path });
+    }
+    filesToWrite.push({ fileName, path, content });
+  }
+
+  const backupFiles: string[] = [];
+  if (filesToBackUp.length > 0) {
+    const timestamp = timestampForBackup(now);
+    for (const file of filesToBackUp) {
+      const backupPath = join(rootDir, `${file.fileName}.code-butler-backup-${timestamp}`);
+      copyFileSync(file.path, backupPath);
+      backupFiles.push(backupPath);
+    }
+  }
+
+  for (const file of filesToWrite) {
+    writeFileSync(file.path, file.content);
+  }
+
+  return backupFiles.length > 0 ? { backupDir: rootDir, backupFiles } : { backupFiles };
+}
+
+function createFallbackProjectSummaryGenerator(error: unknown): ProjectSummaryGenerator {
+  return {
+    name: "fallback",
+    async generate(input): Promise<string> {
+      const manifests = input.codeContext.manifests.map((file) => `- ${file.path}`).join("\n") || "- none indexed";
+      const docs = input.codeContext.docs.map((file) => `- ${file.path}`).join("\n") || "- none indexed";
+      const inventory = input.codeContext.inventory.slice(0, 30).map((entry) => `- ${entry}`).join("\n") || "- none indexed";
+      const memories = input.codeContext.memories
+        .slice(0, 10)
+        .map((memory) => `- ${memory.type}: ${memory.title} - ${memory.summary}`)
+        .join("\n") || "- none indexed";
+      const commits = input.codeContext.commits
+        .slice(0, 10)
+        .map((commit) => `- ${commit.hash.slice(0, 12)} ${commit.message}`)
+        .join("\n") || "- none indexed";
+      return [
+        "# Fallback Project Summary",
+        "",
+        "This is a limited fallback summary created without an API-backed model.",
+        "Add the configured project-summary API key, then run `code-butler project-summary refresh --force` to regenerate a richer summary.",
+        "",
+        `Project root: ${input.projectRoot}`,
+        "",
+        "## Why This Fallback Was Used",
+        fallbackErrorMessage(error),
+        "",
+        "## Indexed Manifests",
+        manifests,
+        "",
+        "## Indexed Docs",
+        docs,
+        "",
+        "## Project Inventory",
+        inventory,
+        "",
+        "## Durable Memories",
+        memories,
+        "",
+        "## Recent Commits",
+        commits,
+        "",
+        "## Agent Usage",
+        "Use Code Butler MCP tools such as `sync_project_memory`, `summarize_project_brief`, `summarize_active_context`, `search_project_memory`, and `explain_code_change` for current project context."
+      ].join("\n");
+    }
+  };
+}
+
+function fallbackSummaryWarning(error: unknown): string {
+  return [
+    `Code Butler fallback summary was created because the configured project-summary provider was unavailable: ${fallbackErrorMessage(error)}`,
+    "After adding the required API key, run `code-butler project-summary refresh --force` to regenerate the richer summary."
+  ].join(" ");
+}
+
+function fallbackErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function projectRoot(config: ProjectConfig, store: MemoryStore): string {
   return config.sources.git.repoPath || store.paths.rootDir;
 }
@@ -379,6 +510,9 @@ function readAgentHintFiles(rootDir: string): Array<{ fileName: "AGENTS.md" | "C
 function readLatestBackedUpAgentHints(
   rootDir: string
 ): Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; content: string }> {
+  const rootBackupHints = readLatestRootAgentBackups(rootDir);
+  if (rootBackupHints.length > 0) return rootBackupHints;
+
   const backupRoot = join(rootDir, ".code-butler", "backups", "agent-instructions");
   if (!existsSync(backupRoot) || !statSync(backupRoot).isDirectory()) return [];
   const backupDirs = readdirSync(backupRoot, { withFileTypes: true })
@@ -391,6 +525,38 @@ function readLatestBackedUpAgentHints(
     if (hints.length > 0) return hints;
   }
   return [];
+}
+
+function readLatestRootAgentBackups(
+  rootDir: string
+): Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; content: string }> {
+  if (!existsSync(rootDir) || !statSync(rootDir).isDirectory()) return [];
+  const groups = new Map<string, Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; path: string }>>();
+  for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const match = entry.name.match(agentBackupPattern());
+    if (!match?.[1] || !match[2]) continue;
+    const timestamp = match[2];
+    const fileName = match[1] as "AGENTS.md" | "CLAUDE.md";
+    const current = groups.get(timestamp) ?? [];
+    current.push({ fileName, path: join(rootDir, entry.name) });
+    groups.set(timestamp, current);
+  }
+
+  const latestTimestamp = [...groups.keys()].sort().reverse()[0];
+  if (!latestTimestamp) return [];
+  return (groups.get(latestTimestamp) ?? []).map((backup) => ({
+    fileName: backup.fileName,
+    content: truncate(readFileSync(backup.path, "utf8"), MAX_CONTEXT_FILE_CHARS)
+  }));
+}
+
+function isAgentBackupFile(fileName: string): boolean {
+  return agentBackupPattern().test(fileName);
+}
+
+function agentBackupPattern(): RegExp {
+  return /^(AGENTS\.md|CLAUDE\.md)\.code-butler-backup-(.+)$/;
 }
 
 function isGeneratedBootstrap(content: string): boolean {
@@ -420,6 +586,7 @@ function readProjectInventory(rootDir: string): string[] {
   const entries: string[] = [];
   for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
     if (IGNORED_INVENTORY_NAMES.has(entry.name)) continue;
+    if (isAgentBackupFile(entry.name)) continue;
     const suffix = entry.isDirectory() ? "/" : "";
     entries.push(`${entry.name}${suffix}`);
   }

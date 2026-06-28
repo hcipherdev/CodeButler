@@ -165,7 +165,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("exposes project brief handlers without rewriting agent files", async () => {
+  it("exposes project brief handlers without installing agent bootstrap files", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     writeFileSync(join(rootDir, "README.md"), "# MCP Project\n");
@@ -184,14 +184,75 @@ describe("MCP tool handlers", () => {
       now: () => new Date("2026-06-16T10:00:00Z")
     });
     const refreshed = await handlers.refresh_project_summary({ force: true });
-    const brief = handlers.summarize_project_brief();
+    const brief = await handlers.summarize_project_brief();
 
     expect(refreshed.generated).toBe(true);
     expect(brief.exists).toBe(true);
     expect(brief.summary).toContain("MCP Generated Brief");
     expect(brief.meta?.lastGeneratedAt).toBe("2026-06-16T10:00:00.000Z");
     expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toBe("original agents");
+    expect(existsSync(join(rootDir, "AGENTS.md.code-butler-backup-2026-06-16T10-00-00-000Z"))).toBe(false);
     expect(existsSync(join(rootDir, "CLAUDE.md"))).toBe(false);
+
+    store.close();
+  });
+
+  it("returns missing project brief without mutating files when no summary exists", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeFileSync(join(rootDir, "README.md"), "# Auto MCP Project\n");
+    writeFileSync(join(rootDir, "AGENTS.md"), "old agents");
+    const warnings: string[] = [];
+    const store = openMemoryStore(rootDir);
+    store.init();
+
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-06-16T10:00:00Z"),
+      warn: (line) => warnings.push(line)
+    });
+    const brief = await handlers.summarize_project_brief();
+
+    expect(brief.exists).toBe(false);
+    expect(brief.summary).toBe("");
+    expect(brief.meta).toBeUndefined();
+    expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toBe("old agents");
+    expect(existsSync(join(rootDir, "AGENTS.md.code-butler-backup-2026-06-16T10-00-00-000Z"))).toBe(false);
+    expect(existsSync(join(rootDir, "CLAUDE.md"))).toBe(false);
+    expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(false);
+    expect(warnings).toEqual([]);
+
+    store.close();
+  });
+
+  it("sync_project_memory does not bootstrap an uninitialized project", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.json"),
+      JSON.stringify(
+        {
+          sources: {
+            git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
+            codex: { enabled: false, roots: [], includeDefaultRoots: false },
+            claude: { enabled: false, roots: [] }
+          }
+        },
+        null,
+        2
+      )
+    );
+    const store = openMemoryStore(rootDir);
+    store.init();
+
+    const handlers = createProjectMemoryToolHandlers(store, { rootDir });
+    const result = await handlers.sync_project_memory({});
+
+    expect(result.memories.promoted).toBe(0);
+    expect(existsSync(join(rootDir, "AGENTS.md"))).toBe(false);
+    expect(existsSync(join(rootDir, "CLAUDE.md"))).toBe(false);
+    expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(false);
 
     store.close();
   });

@@ -1,7 +1,10 @@
 #!/usr/bin/env node
-import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { ensureProjectConfig, loadProjectConfig } from "./config.js";
 import { addDecision, importDecisionMarkdown } from "./decisions/store.js";
@@ -11,7 +14,8 @@ import { ingestGitRepository } from "./ingest/git.js";
 import { auditMemoryQuality } from "./memory/quality.js";
 import {
   getProjectSummaryStatus,
-  installProjectSummary,
+  initializeProjectSummary,
+  readProjectBrief,
   refreshProjectSummary,
   refreshProjectSummaryIfDue,
   relativeSummaryPath,
@@ -36,6 +40,10 @@ export interface CliOptions {
   now?: (() => Date) | undefined;
   env?: Partial<Pick<NodeJS.ProcessEnv, "CODE_BUTLER_PROJECT_ROOT">> | undefined;
   startServer?: ServerStarter | undefined;
+  watchServiceHomeDir?: string | undefined;
+  watchServicePlatform?: NodeJS.Platform | undefined;
+  watchServiceLaunchctl?: boolean | undefined;
+  cliPath?: string | undefined;
 }
 
 export async function runCli(args = process.argv.slice(2), options: CliOptions = {}): Promise<number> {
@@ -54,10 +62,21 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
     if (command === "init") {
       const store = openMemoryStore(cwd);
       store.init();
-      store.close();
-      ensureProjectConfig(cwd);
-      stdout(`Initialized project memory at ${join(cwd, ".code-butler")}`);
-      return 0;
+      try {
+        const config = loadProjectConfig(cwd);
+        const installed = await initializeProjectSummary(store, config, {
+          ...projectSummaryOperationOptions(options),
+          warn: stdout
+        });
+        stdout(`Initialized project memory at ${join(cwd, ".code-butler")}`);
+        stdout(`Project summary ready at ${relativeSummaryPath(cwd, installed.summaryPath)}`);
+        if (installed.backupFiles?.length) {
+          stdout(`Backed up agent files: ${installed.backupFiles.map((file) => relativeSummaryPath(cwd, file)).join(", ")}`);
+        }
+        return 0;
+      } finally {
+        store.close();
+      }
     }
 
     if (command === "config") {
@@ -92,7 +111,11 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
       return await runWatch(rest, cwd, stdout, {
         signal: options.signal,
         projectSummaryGenerator: options.projectSummaryGenerator,
-        now: options.now
+        now: options.now,
+        watchServiceHomeDir: options.watchServiceHomeDir,
+        watchServicePlatform: options.watchServicePlatform,
+        watchServiceLaunchctl: options.watchServiceLaunchctl,
+        cliPath: options.cliPath
       });
     }
 
@@ -125,6 +148,15 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
   } catch (error) {
     stderr(error instanceof Error ? error.message : String(error));
     return 1;
+  }
+}
+
+export function isCliEntrypoint(importMetaUrl: string, argvPath: string | undefined): boolean {
+  if (!argvPath) return false;
+  try {
+    return realpathSync(fileURLToPath(importMetaUrl)) === realpathSync(argvPath);
+  } catch {
+    return importMetaUrl === pathToFileURL(argvPath).href;
   }
 }
 
@@ -358,8 +390,8 @@ async function runProjectSummary(
   options: Pick<CliOptions, "projectSummaryGenerator" | "now"> = {}
 ): Promise<number> {
   const [subcommand, ...rest] = args;
-  if (!subcommand || !["install", "refresh", "status"].includes(subcommand)) {
-    throw new Error("Usage: code-butler project-summary <install|refresh|status> [--force]");
+  if (!subcommand || !["refresh", "status"].includes(subcommand)) {
+    throw new Error("Usage: code-butler project-summary <refresh|status> [--force]");
   }
 
   if (subcommand === "status") {
@@ -392,16 +424,6 @@ async function runProjectSummary(
   try {
     const config = loadProjectConfig(cwd);
     const operationOptions = projectSummaryOperationOptions(options);
-    if (subcommand === "install") {
-      await syncProjectMemory(store, config, { source: "all" });
-      const result = await installProjectSummary(store, config, operationOptions);
-      stdout(`Installed project summary at ${relativeSummaryPath(cwd, result.summaryPath)}`);
-      if (result.backupDir) {
-        stdout(`Backed up agent files at ${relativeSummaryPath(cwd, result.backupDir)}`);
-      }
-      return 0;
-    }
-
     const result = await refreshProjectSummary(store, config, {
       ...operationOptions,
       force: rest.includes("--force")
@@ -421,8 +443,16 @@ async function runWatch(
   args: string[],
   cwd: string,
   stdout: (line: string) => void,
-  options: Pick<CliOptions, "signal" | "projectSummaryGenerator" | "now"> = {}
+  options: Pick<
+    CliOptions,
+    "signal" | "projectSummaryGenerator" | "now" | "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl" | "cliPath"
+  > = {}
 ): Promise<number> {
+  const [subcommand, ...subcommandRest] = args;
+  if (subcommand === "install") return runWatchInstall(subcommandRest, cwd, stdout, options);
+  if (subcommand === "uninstall") return runWatchUninstall(cwd, stdout, options);
+  if (subcommand === "status") return runWatchStatus(cwd, stdout, options);
+
   const source = parseSyncSourceFlag(args);
   const intervalSeconds = parseNumberFlag(args, "--interval") ?? 30;
   const store = openMemoryStore(cwd);
@@ -447,19 +477,21 @@ async function runWatch(
       stdout(
         `Synced project memory at ${result.completedAt} (git=${result.sources.git.imported}, codex=${result.sources.codex.imported}, claude=${result.sources.claude.imported}, promoted=${result.memories.promoted})`
       );
-      try {
-        const summaryResult = await refreshProjectSummaryIfDue(store, config, {
-          ...projectSummaryOperationOptions(options)
-        });
-        if (summaryResult.checked) {
-          stdout(
-            summaryResult.generated
-              ? `Refreshed project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
-              : `Checked project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
-          );
+      if (readProjectBrief(config.sources.git.repoPath).exists) {
+        try {
+          const summaryResult = await refreshProjectSummaryIfDue(store, config, {
+            ...projectSummaryOperationOptions(options)
+          });
+          if (summaryResult.checked) {
+            stdout(
+              summaryResult.generated
+                ? `Refreshed project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
+                : `Checked project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
+            );
+          }
+        } catch (error) {
+          stdout(`Project summary refresh skipped: ${error instanceof Error ? error.message : String(error)}`);
         }
-      } catch (error) {
-        stdout(`Project summary refresh skipped: ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
       running = false;
@@ -485,6 +517,132 @@ async function runWatch(
     }
     close();
   }
+}
+
+async function runWatchInstall(
+  args: string[],
+  cwd: string,
+  stdout: (line: string) => void,
+  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl" | "cliPath"> = {}
+): Promise<number> {
+  const platform = options.watchServicePlatform ?? process.platform;
+  if (platform !== "darwin") throw new Error("code-butler watch install currently supports macOS launchd only.");
+  const source = parseSyncSourceFlag(args);
+  const intervalSeconds = parseNumberFlag(args, "--interval") ?? 30;
+  const service = watchService(cwd, options);
+  mkdirSync(join(cwd, ".code-butler", "logs"), { recursive: true });
+  mkdirSync(join(service.homeDir, "Library", "LaunchAgents"), { recursive: true });
+  writeFileSync(service.plistPath, watchPlist(cwd, service.label, intervalSeconds, source, options.cliPath));
+  if (options.watchServiceLaunchctl !== false) {
+    loadLaunchAgent(service.plistPath);
+  }
+  stdout(`Installed Code Butler watch service ${service.label}`);
+  stdout(`plist=${service.plistPath}`);
+  stdout(`logs=${join(cwd, ".code-butler", "logs")}`);
+  return 0;
+}
+
+async function runWatchUninstall(
+  cwd: string,
+  stdout: (line: string) => void,
+  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl"> = {}
+): Promise<number> {
+  const platform = options.watchServicePlatform ?? process.platform;
+  if (platform !== "darwin") throw new Error("code-butler watch uninstall currently supports macOS launchd only.");
+  const service = watchService(cwd, options);
+  if (existsSync(service.plistPath) && options.watchServiceLaunchctl !== false) {
+    unloadLaunchAgent(service.plistPath);
+  }
+  rmSync(service.plistPath, { force: true });
+  stdout(`Uninstalled Code Butler watch service ${service.label}`);
+  return 0;
+}
+
+async function runWatchStatus(
+  cwd: string,
+  stdout: (line: string) => void,
+  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform"> = {}
+): Promise<number> {
+  const platform = options.watchServicePlatform ?? process.platform;
+  if (platform !== "darwin") throw new Error("code-butler watch status currently supports macOS launchd only.");
+  const service = watchService(cwd, options);
+  stdout("Code Butler Watch Status");
+  stdout(`label=${service.label}`);
+  stdout(`plist=${service.plistPath}`);
+  stdout(`installed=${existsSync(service.plistPath)}`);
+  return 0;
+}
+
+function watchService(
+  cwd: string,
+  options: Pick<CliOptions, "watchServiceHomeDir"> = {}
+): { homeDir: string; label: string; plistPath: string } {
+  const homeDir = options.watchServiceHomeDir ?? homedir();
+  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
+  const label = `com.codebutler.watch.${hash}`;
+  return {
+    homeDir,
+    label,
+    plistPath: join(homeDir, "Library", "LaunchAgents", `${label}.plist`)
+  };
+}
+
+function watchPlist(cwd: string, label: string, intervalSeconds: number, source: SyncSourceName | "all", cliPath?: string): string {
+  const cli = cliPath ?? process.argv[1] ?? join(cwd, "dist", "cli.js");
+  const logsDir = join(cwd, ".code-butler", "logs");
+  const args = [process.execPath, cli, "watch", "--interval", String(intervalSeconds), "--source", source];
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    "<dict>",
+    "  <key>Label</key>",
+    `  <string>${xmlEscape(label)}</string>`,
+    "  <key>ProgramArguments</key>",
+    "  <array>",
+    ...args.map((arg) => `    <string>${xmlEscape(arg)}</string>`),
+    "  </array>",
+    "  <key>WorkingDirectory</key>",
+    `  <string>${xmlEscape(cwd)}</string>`,
+    "  <key>RunAtLoad</key>",
+    "  <true/>",
+    "  <key>KeepAlive</key>",
+    "  <true/>",
+    "  <key>StandardOutPath</key>",
+    `  <string>${xmlEscape(join(logsDir, "watch.out.log"))}</string>`,
+    "  <key>StandardErrorPath</key>",
+    `  <string>${xmlEscape(join(logsDir, "watch.err.log"))}</string>`,
+    "</dict>",
+    "</plist>"
+  ].join("\n") + "\n";
+}
+
+function loadLaunchAgent(plistPath: string): void {
+  const domain = `gui/${process.getuid?.() ?? ""}`;
+  try {
+    execFileSync("launchctl", ["bootstrap", domain, plistPath], { stdio: "ignore" });
+  } catch {
+    execFileSync("launchctl", ["bootout", domain, plistPath], { stdio: "ignore" });
+    execFileSync("launchctl", ["bootstrap", domain, plistPath], { stdio: "ignore" });
+  }
+}
+
+function unloadLaunchAgent(plistPath: string): void {
+  const domain = `gui/${process.getuid?.() ?? ""}`;
+  try {
+    execFileSync("launchctl", ["bootout", domain, plistPath], { stdio: "ignore" });
+  } catch {
+    // Already unloaded.
+  }
+}
+
+function xmlEscape(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 function projectSummaryOperationOptions(
@@ -658,7 +816,9 @@ function usage(): string {
     "  code-butler sync [--source <git|codex|claude|all>]",
     "  code-butler sources status",
     "  code-butler watch [--interval <seconds>] [--source <git|codex|claude|all>]",
-    "  code-butler project-summary install",
+    "  code-butler watch install [--interval <seconds>] [--source <git|codex|claude|all>]",
+    "  code-butler watch status",
+    "  code-butler watch uninstall",
     "  code-butler project-summary refresh [--force]",
     "  code-butler project-summary status",
     "  code-butler hooks install",
@@ -667,7 +827,7 @@ function usage(): string {
   ].join("\n");
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+if (isCliEntrypoint(import.meta.url, process.argv[1])) {
   runCli().then((code) => {
     if (code !== 0) process.exitCode = code;
   });

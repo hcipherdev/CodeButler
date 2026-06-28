@@ -168,7 +168,7 @@ export interface ProjectMemoryToolHandlers {
   };
   sync_project_memory(input: {
     source?: SyncSourceName | "all";
-  }): ReturnType<typeof syncProjectMemory>;
+  }): Promise<Awaited<ReturnType<typeof syncProjectMemory>>>;
   summarize_project_state(): ProjectSummary;
   summarize_memory_health(): ReturnType<typeof summarizeMemoryHealth>;
   run_doctor(): DoctorReport;
@@ -186,13 +186,13 @@ export function createProjectMemoryToolHandlers(
     rootDir?: string;
     projectSummaryGenerator?: ProjectSummaryGenerator;
     now?: () => Date;
+    warn?: (line: string) => void;
     startupMetadata?: ProjectStartupMetadata | undefined;
   } = {}
 ): ProjectMemoryToolHandlers {
   const rootDir = options.rootDir ?? store.paths.rootDir;
   const config = loadProjectConfig(rootDir);
   const startupMetadata = options.startupMetadata ?? { configCreated: false, databaseCreated: false };
-
   return {
     current_project() {
       return {
@@ -254,7 +254,7 @@ export function createProjectMemoryToolHandlers(
         expiredOnly: normalized.expiredOnly
       };
     },
-    sync_project_memory(input) {
+    async sync_project_memory(input) {
       return syncProjectMemory(store, config, { source: input.source ?? "all" });
     },
     summarize_project_state() {
@@ -488,7 +488,7 @@ export function registerProjectMemoryTools(
       description: "Read the local project narrative summary and freshness metadata without mutating files.",
       inputSchema: {}
     },
-    async () => asJsonContent(handlers.summarize_project_brief())
+    async () => asJsonContent(await handlers.summarize_project_brief())
   );
 
   server.registerTool(
