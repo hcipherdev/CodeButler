@@ -8,11 +8,17 @@ import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("doctor service", () => {
   let tempDirs: string[] = [];
+  const originalCodeButlerHome = process.env.CODE_BUTLER_HOME;
 
   afterEach(() => {
     for (const dir of tempDirs) cleanupTempDir(dir);
     tempDirs = [];
     delete process.env.TEST_CODE_BUTLER_API_KEY;
+    if (originalCodeButlerHome === undefined) {
+      delete process.env.CODE_BUTLER_HOME;
+    } else {
+      process.env.CODE_BUTLER_HOME = originalCodeButlerHome;
+    }
   });
 
   function writeConfig(rootDir: string, overrides: Record<string, unknown> = {}): void {
@@ -138,7 +144,29 @@ describe("doctor service", () => {
     );
     expect(report.nextActions).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ command: "code-butler sources status" })
+        expect.objectContaining({ command: "code-butler sources status" }),
+        expect.objectContaining({ command: "edit ~/.config/code-butler/.env" })
+      ])
+    );
+  });
+
+  it("reports missing project profiles as config errors", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeConfig(rootDir, {
+      extractor: { profile: "missing" }
+    });
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+
+    expect(report.status).toBe("error");
+    expect(report.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "config:load",
+          status: "error",
+          detail: expect.stringContaining('Unknown Code Butler provider profile "missing" for extractor')
+        })
       ])
     );
   });
