@@ -35,6 +35,27 @@ Use it to:
 - Search temporary working context separately from durable project memory.
 - Audit memory quality and diagnose setup issues with `code-butler doctor`.
 
+## What It Looks Like
+
+Representative example:
+
+```text
+User: Use Code Butler to explain why src/cache.ts changed before you edit it.
+
+Agent: I synced project memory and found:
+- related commits that changed src/cache.ts
+- conversation context explaining the cache invalidation issue
+- a durable decision to invalidate cache entries after writes
+- a rejected approach that tried time-based expiry only
+
+The current constraint is: keep writes synchronous with cache invalidation so
+future reads cannot observe stale data.
+```
+
+The exact answer depends on the local evidence in your repository. Code Butler
+does not invent remote project knowledge; it searches the Git history,
+conversation logs, decisions, and summaries available on your machine.
+
 ## How It Compares
 
 Code Butler does not replace Git, your agent instructions, or your notes. It
@@ -71,23 +92,22 @@ Memory can come from:
 
 ## Requirements
 
-- Node.js 24 or newer
+- Node.js 24 or newer. Code Butler uses Node's built-in SQLite support.
 - Git
 
 ## Quick Start
 
-Install dependencies and build the CLI:
+Code Butler is a v0.1 early-access tool. The fastest path is the npm CLI:
 
 ```bash
-npm install
-npm run build
+npm install -g code-butler
 ```
 
 Recommended: initialize Code Butler in each project where you want agents to
 use the full memory workflow:
 
 ```bash
-node dist/cli.js init
+code-butler init
 ```
 
 `init` is the explicit opt-in setup step and the best default for real
@@ -119,63 +139,52 @@ project brief does not rewrite visible project files before `init`.
 Run an incremental sync:
 
 ```bash
-node dist/cli.js sync
+code-butler sync
 ```
 
 Inspect source status:
 
 ```bash
-node dist/cli.js sources status
+code-butler sources status
 ```
 
 Refresh the project narrative summary manually:
 
 ```bash
-node dist/cli.js project-summary refresh
-node dist/cli.js project-summary status
+code-butler project-summary refresh
+code-butler project-summary status
 ```
 
 If `init` created a fallback summary, add the configured API key and run:
 
 ```bash
-node dist/cli.js project-summary refresh --force
+code-butler project-summary refresh --force
 ```
 
 Check setup health:
 
 ```bash
-node dist/cli.js doctor
-```
-
-During development, you can run the TypeScript entrypoint directly:
-
-```bash
-npx tsx src/cli.ts --help
+code-butler doctor
 ```
 
 ## MCP Setup
 
-Build the project first:
+Configure your MCP client to launch Code Butler with `npx`:
 
 ```bash
-npm run build
+npx -y code-butler mcp --project-root /absolute/path/to/project
 ```
 
-Then configure your MCP client to launch Code Butler:
+Or use a global install:
 
 ```bash
-node /absolute/path/to/code-butler/dist/cli.js mcp
+code-butler mcp --project-root /absolute/path/to/project
 ```
 
-`code-butler mcp` resolves the current Git repository and creates project-local
+`code-butler mcp` resolves the target Git repository and creates project-local
 internal memory storage on first launch. It does not create `AGENTS.md`,
 `CLAUDE.md`, or `.code-butler/project-summary.md`; run `code-butler init` when
-you are ready for that explicit setup. If the MCP client starts outside the
-target repository, pass an explicit project root:
-
-```bash
-node /absolute/path/to/code-butler/dist/cli.js mcp --project-root /absolute/path/to/project
-```
+you are ready for that explicit setup.
 
 Once connected, agents can call tools such as:
 
@@ -189,19 +198,46 @@ Once connected, agents can call tools such as:
 - `investigate_project_history`
 - `summarize_recent_activity`
 
+## Build From Source
+
+Clone the repository, install dependencies, and build the CLI:
+
+```bash
+npm install
+npm run build
+```
+
+Run the built CLI locally:
+
+```bash
+node dist/cli.js --help
+```
+
+During development, you can run the TypeScript entrypoint directly:
+
+```bash
+npx tsx src/cli.ts --help
+```
+
+For source-built MCP setup, point your MCP client at the built CLI:
+
+```bash
+node /absolute/path/to/code-butler/dist/cli.js mcp --project-root /absolute/path/to/project
+```
+
 ## Daily Workflow
 
 Keep memory fresh in the foreground while you work:
 
 ```bash
-node dist/cli.js watch
+code-butler watch
 ```
 
 Install a macOS user watcher for regular background sync and summary refresh:
 
 ```bash
-node dist/cli.js watch install
-node dist/cli.js watch status
+code-butler watch install
+code-butler watch status
 ```
 
 The installed watcher runs the same watch loop automatically. It syncs local
@@ -217,7 +253,7 @@ a daemon when MCP starts or when a project is opened.
 Remove the watcher:
 
 ```bash
-node dist/cli.js watch uninstall
+code-butler watch uninstall
 ```
 
 Ask your agent to sync before project-history questions:
@@ -247,7 +283,7 @@ themselves.
 Add a durable decision manually:
 
 ```bash
-node dist/cli.js decision add \
+code-butler decision add \
   --topic "cache invalidation" \
   --decision "Invalidate cache after writes" \
   --reason "Avoid stale reads after mutation" \
@@ -257,15 +293,15 @@ node dist/cli.js decision add \
 Import a conversation export:
 
 ```bash
-node dist/cli.js ingest conversation ./session.md
-node dist/cli.js ingest conversation ./session.jsonl
+code-butler ingest conversation ./session.md
+code-butler ingest conversation ./session.jsonl
 ```
 
 Audit memory quality:
 
 ```bash
-node dist/cli.js memory audit
-node dist/cli.js memory audit --fix
+code-butler memory audit
+code-butler memory audit --fix
 ```
 
 ## Privacy / Local State
@@ -309,10 +345,4 @@ Build the package:
 
 ```bash
 npm run build
-```
-
-Run the public export tests:
-
-```bash
-npm run test:public-sync
 ```

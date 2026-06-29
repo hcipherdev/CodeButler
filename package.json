@@ -2,12 +2,33 @@
   "name": "code-butler",
   "version": "0.1.0",
   "description": "Local-first Project Memory MCP server for reconstructing project reasoning.",
+  "license": "Apache-2.0",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hcipherdev/CodeButler.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hcipherdev/CodeButler/issues"
+  },
+  "homepage": "https://github.com/hcipherdev/CodeButler#readme",
+  "keywords": [
+    "mcp",
+    "codex",
+    "claude",
+    "project-memory",
+    "local-first",
+    "agent-memory",
+    "developer-tools"
+  ],
+  "files": [
+    "dist"
+  ],
   "bin": {
     "code-butler": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:public-sync": "node --test public-sync/tests/sync-public-repo.test.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
