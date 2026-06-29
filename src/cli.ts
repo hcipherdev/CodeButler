@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { ensureProjectConfig, loadProjectConfig } from "./config.js";
+import { ensureGlobalConfig, ensureProjectConfig, loadProjectConfig } from "./config.js";
 import { addDecision, importDecisionMarkdown } from "./decisions/store.js";
 import { runDoctor } from "./doctor/service.js";
 import { parseConversationFile } from "./ingest/conversation.js";
@@ -200,13 +200,18 @@ async function runMcp(
 }
 
 async function runConfig(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
-  const [subcommand] = args;
-  if (subcommand !== "init") {
-    throw new Error("Usage: code-butler config init");
+  const [subcommand, nested] = args;
+  if (subcommand === "init" && nested === undefined) {
+    const configPath = ensureProjectConfig(cwd);
+    stdout(`Initialized project config at ${configPath}`);
+    return 0;
   }
-  const configPath = ensureProjectConfig(cwd);
-  stdout(`Initialized project config at ${configPath}`);
-  return 0;
+  if (subcommand === "global" && nested === "init" && args.length === 2) {
+    const configPath = ensureGlobalConfig();
+    stdout(`Initialized global config at ${configPath}`);
+    return 0;
+  }
+  throw new Error("Usage: code-butler config <init|global init>");
 }
 
 async function runIngest(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
@@ -807,6 +812,7 @@ function usage(): string {
     "Usage:",
     "  code-butler init",
     "  code-butler config init",
+    "  code-butler config global init",
     "  code-butler ingest conversation <file>",
     "  code-butler ingest git <repo> [--max-commits <n>]",
     "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",

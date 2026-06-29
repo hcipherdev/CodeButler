@@ -11,12 +11,18 @@ import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("CLI", () => {
   let tempDirs: string[] = [];
+  const originalCodeButlerHome = process.env.CODE_BUTLER_HOME;
 
   afterEach(() => {
     vi.useRealTimers();
     for (const dir of tempDirs) cleanupTempDir(dir);
     tempDirs = [];
     delete process.env.TEST_CODE_BUTLER_API_KEY;
+    if (originalCodeButlerHome === undefined) {
+      delete process.env.CODE_BUTLER_HOME;
+    } else {
+      process.env.CODE_BUTLER_HOME = originalCodeButlerHome;
+    }
   });
 
   it("recognizes symlinked bin paths as the CLI entrypoint", () => {
@@ -192,6 +198,39 @@ describe("CLI", () => {
     expect(repoDir).toBeTruthy();
     expect(codexDir).toBeTruthy();
     expect(claudeDir).toBeTruthy();
+  });
+
+  it("initializes global config without writing secrets", async () => {
+    const rootDir = makeTempDir();
+    const globalHome = join(rootDir, "global-code-butler");
+    tempDirs.push(rootDir);
+    process.env.CODE_BUTLER_HOME = globalHome;
+    const output: string[] = [];
+
+    await expect(runCli(["config", "global", "init"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
+
+    expect(existsSync(join(globalHome, "config.json"))).toBe(true);
+    expect(existsSync(join(globalHome, ".env.example"))).toBe(true);
+    expect(existsSync(join(globalHome, ".gitignore"))).toBe(true);
+    expect(readFileSync(join(globalHome, ".env.example"), "utf8")).toContain("OPENAI_API_KEY=");
+    expect(readFileSync(join(globalHome, ".env.example"), "utf8")).not.toContain("sk-");
+    expect(JSON.parse(readFileSync(join(globalHome, "config.json"), "utf8"))).toMatchObject({
+      defaults: {
+        extractorProfile: "cheap",
+        investigatorProfile: "smart"
+      },
+      profiles: {
+        cheap: {
+          provider: "openai-compatible",
+          apiKeyEnv: "OPENAI_API_KEY"
+        },
+        smart: {
+          provider: "openai-compatible",
+          apiKeyEnv: "OPENAI_API_KEY"
+        }
+      }
+    });
+    expect(output.join("\n")).toContain(`Initialized global config at ${join(globalHome, "config.json")}`);
   });
 
   it("sync does not bootstrap an uninitialized project", async () => {

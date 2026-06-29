@@ -274,12 +274,18 @@ Code Butler stores project state under `.code-butler/` in the repository being
 indexed. That directory can include config files, SQLite databases, sync
 cursors, conversation imports, and generated project summaries.
 
+Generated project `.code-butler/.gitignore` files ignore all `.code-butler/`
+contents by default except `.code-butler/project-summary.md`. This keeps local
+runtime memory out of `git status` while still allowing a curated narrative
+summary to be tracked when you want it.
+
 Keep real local state private:
 
-- Do not commit `.code-butler/config.json` if it contains machine-specific
-  paths or settings.
-- Do not commit `.code-butler/.env` or any API keys.
-- Do not commit `.code-butler/memory.sqlite` or imported conversation logs.
+- Keep `.code-butler/config.json` local if it contains machine-specific paths
+  or settings.
+- Never commit `.code-butler/.env` or any API keys.
+- Never commit `.code-butler/memory.sqlite`, SQLite sidecars, sync metadata,
+  backups, or imported conversation logs.
 - Use generated example config files as references only.
 
 LLM extraction is optional. Raw sync, deterministic directives, manual

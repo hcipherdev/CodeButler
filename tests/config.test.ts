@@ -8,14 +8,20 @@ import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("project config", () => {
   let tempDirs: string[] = [];
-  const envKeys = ["CODE_BUTLER_TEST_FILE_ENV", "CODE_BUTLER_TEST_EXISTING_ENV"];
+  const envKeys = [
+    "CODE_BUTLER_HOME",
+    "CODE_BUTLER_TEST_FILE_ENV",
+    "CODE_BUTLER_TEST_EXISTING_ENV",
+    "CODE_BUTLER_TEST_GLOBAL_ENV",
+    "CODE_BUTLER_TEST_PROFILE_KEY",
+    "CODE_BUTLER_TEST_SMART_KEY"
+  ];
   const originalEnv = new Map<string, string | undefined>();
 
   afterEach(() => {
     for (const dir of tempDirs) cleanupTempDir(dir);
     tempDirs = [];
-    for (const key of envKeys) {
-      const original = originalEnv.get(key);
+    for (const [key, original] of originalEnv.entries()) {
       if (original === undefined) {
         delete process.env[key];
       } else {
@@ -27,13 +33,22 @@ describe("project config", () => {
 
   it("creates defaults and merges on-disk overrides", () => {
     const rootDir = makeTempDir();
-    tempDirs.push(rootDir);
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    originalEnv.set("CODE_BUTLER_HOME", process.env.CODE_BUTLER_HOME);
+    process.env.CODE_BUTLER_HOME = globalHome;
 
     const configPath = ensureProjectConfig(rootDir);
     const defaults = loadProjectConfig(rootDir);
+    const generatedProjectConfig = JSON.parse(readFileSync(configPath, "utf8"));
 
     expect(existsSync(configPath)).toBe(true);
+    expect(generatedProjectConfig.extractor).toBeUndefined();
+    expect(generatedProjectConfig.investigator).toBeUndefined();
     expect(existsSync(join(rootDir, ".code-butler", ".gitignore"))).toBe(true);
+    expect(readFileSync(join(rootDir, ".code-butler", ".gitignore"), "utf8")).toBe(
+      ["/*", "!/project-summary.md", ""].join("\n")
+    );
     expect(existsSync(join(rootDir, ".code-butler", ".env.example"))).toBe(true);
     expect(existsSync(join(rootDir, ".code-butler", "config.examples.json"))).toBe(true);
     expect(defaults.sources.git.enabled).toBe(true);
@@ -157,6 +172,19 @@ describe("project config", () => {
     expect(existsSync(join(codeButlerDir, "config.examples.json"))).toBe(true);
   });
 
+  it("upgrades legacy project ignore files to hide local memory state", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const codeButlerDir = join(rootDir, ".code-butler");
+    const gitignorePath = join(codeButlerDir, ".gitignore");
+    mkdirSync(codeButlerDir, { recursive: true });
+    writeFileSync(gitignorePath, [".env", ".env.*", "!*.example", ""].join("\n"));
+
+    ensureProjectConfig(rootDir);
+
+    expect(readFileSync(gitignorePath, "utf8")).toBe(["/*", "!/project-summary.md", ""].join("\n"));
+  });
+
   it("adds current Codex sessions when legacy configs only point at archived sessions", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -235,6 +263,189 @@ describe("project config", () => {
 
     expect(process.env.CODE_BUTLER_TEST_FILE_ENV).toBe("from-file");
     expect(process.env.CODE_BUTLER_TEST_EXISTING_ENV).toBe("from-shell");
+  });
+
+  it("loads missing environment variables from global Code Butler .env", () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    for (const key of ["CODE_BUTLER_HOME", "CODE_BUTLER_TEST_GLOBAL_ENV"]) {
+      originalEnv.set(key, process.env[key]);
+      delete process.env[key];
+    }
+    process.env.CODE_BUTLER_HOME = globalHome;
+
+    writeFileSync(join(globalHome, ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-global\n");
+
+    loadProjectConfig(rootDir);
+
+    expect(process.env.CODE_BUTLER_TEST_GLOBAL_ENV).toBe("from-global");
+  });
+
+  it("keeps shell environment over project and global env files", () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    for (const key of ["CODE_BUTLER_HOME", "CODE_BUTLER_TEST_GLOBAL_ENV"]) {
+      originalEnv.set(key, process.env[key]);
+      delete process.env[key];
+    }
+    process.env.CODE_BUTLER_HOME = globalHome;
+    process.env.CODE_BUTLER_TEST_GLOBAL_ENV = "from-shell";
+
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, ".code-butler", ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-project\n");
+    writeFileSync(join(globalHome, ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-global\n");
+
+    loadProjectConfig(rootDir);
+
+    expect(process.env.CODE_BUTLER_TEST_GLOBAL_ENV).toBe("from-shell");
+  });
+
+  it("keeps project env values over global env values", () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    for (const key of ["CODE_BUTLER_HOME", "CODE_BUTLER_TEST_GLOBAL_ENV"]) {
+      originalEnv.set(key, process.env[key]);
+      delete process.env[key];
+    }
+    process.env.CODE_BUTLER_HOME = globalHome;
+
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, ".code-butler", ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-project\n");
+    writeFileSync(join(globalHome, ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-global\n");
+
+    loadProjectConfig(rootDir);
+
+    expect(process.env.CODE_BUTLER_TEST_GLOBAL_ENV).toBe("from-project");
+  });
+
+  it("resolves global default profiles into concrete provider config", () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    originalEnv.set("CODE_BUTLER_HOME", process.env.CODE_BUTLER_HOME);
+    process.env.CODE_BUTLER_HOME = globalHome;
+    writeFileSync(
+      join(globalHome, "config.json"),
+      JSON.stringify(
+        {
+          defaults: {
+            extractorProfile: "cheap",
+            investigatorProfile: "smart"
+          },
+          profiles: {
+            cheap: {
+              provider: "openai-compatible",
+              baseUrl: "https://cheap.example/v1",
+              model: "cheap-model",
+              apiKeyEnv: "CODE_BUTLER_TEST_PROFILE_KEY",
+              maxTokens: 1200
+            },
+            smart: {
+              provider: "openai-compatible",
+              baseUrl: "https://smart.example/v1",
+              model: "smart-model",
+              apiKeyEnv: "CODE_BUTLER_TEST_SMART_KEY",
+              maxTokens: 2500
+            }
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    const config = loadProjectConfig(rootDir);
+
+    expect(config.extractor).toMatchObject({
+      provider: "openai-compatible",
+      baseUrl: "https://cheap.example/v1",
+      model: "cheap-model",
+      apiKeyEnv: "CODE_BUTLER_TEST_PROFILE_KEY",
+      maxTokens: 1200
+    });
+    expect(config.investigator).toMatchObject({
+      provider: "openai-compatible",
+      baseUrl: "https://smart.example/v1",
+      model: "smart-model",
+      apiKeyEnv: "CODE_BUTLER_TEST_SMART_KEY",
+      maxTokens: 2500
+    });
+  });
+
+  it("allows project profiles and explicit fields to override global defaults", () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    originalEnv.set("CODE_BUTLER_HOME", process.env.CODE_BUTLER_HOME);
+    process.env.CODE_BUTLER_HOME = globalHome;
+    writeFileSync(
+      join(globalHome, "config.json"),
+      JSON.stringify(
+        {
+          defaults: { extractorProfile: "cheap", investigatorProfile: "cheap" },
+          profiles: {
+            cheap: {
+              provider: "openai-compatible",
+              baseUrl: "https://cheap.example/v1",
+              model: "cheap-model",
+              apiKeyEnv: "CODE_BUTLER_TEST_PROFILE_KEY"
+            },
+            smart: {
+              provider: "openai-compatible",
+              baseUrl: "https://smart.example/v1",
+              model: "smart-model",
+              apiKeyEnv: "CODE_BUTLER_TEST_SMART_KEY"
+            }
+          }
+        },
+        null,
+        2
+      )
+    );
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(
+      configPath,
+      JSON.stringify(
+        {
+          extractor: {
+            profile: "smart",
+            model: "project-model"
+          },
+          investigator: {
+            profile: "smart",
+            maxSteps: 24
+          }
+        },
+        null,
+        2
+      )
+    );
+
+    const config = loadProjectConfig(rootDir);
+
+    expect(config.extractor).toMatchObject({
+      baseUrl: "https://smart.example/v1",
+      model: "project-model",
+      apiKeyEnv: "CODE_BUTLER_TEST_SMART_KEY"
+    });
+    expect(config.investigator).toMatchObject({
+      baseUrl: "https://smart.example/v1",
+      model: "smart-model",
+      apiKeyEnv: "CODE_BUTLER_TEST_SMART_KEY",
+      maxSteps: 24
+    });
+  });
+
+  it("fails clearly when a selected profile is missing", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(configPath, JSON.stringify({ extractor: { profile: "missing" } }, null, 2));
+
+    expect(() => loadProjectConfig(rootDir)).toThrow('Unknown Code Butler provider profile "missing" for extractor');
   });
 
   it("does not inherit OpenAI base URLs for Anthropic AWS provider overrides", () => {

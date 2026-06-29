@@ -301,6 +301,10 @@ export interface ExtractorConfig {
   maxTokens?: number | undefined;
 }
 
+export interface ExtractorConfigInput extends Partial<ExtractorConfig> {
+  profile?: string | undefined;
+}
+
 export interface PromotionConfig {
   confidenceThreshold: number;
   requireCommitAndConversation: boolean;
@@ -340,6 +344,10 @@ export interface InvestigatorConfig {
   topKPerSearch: number;
   evidenceThreshold: number;
   returnTrace: boolean;
+}
+
+export interface InvestigatorConfigInput extends Partial<InvestigatorConfig> {
+  profile?: string | undefined;
 }
 
 export interface ProjectConfig {

@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type { ProjectConfig } from "./types.js";
+import type { ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, ProjectConfig } from "./types.js";
 
 interface ProjectConfigFile {
   sources?: {
@@ -10,14 +10,38 @@ interface ProjectConfigFile {
     codex?: Partial<ProjectConfig["sources"]["codex"]>;
     claude?: Partial<ProjectConfig["sources"]["claude"]>;
   };
-  extractor?: Partial<ProjectConfig["extractor"]>;
-  investigator?: Partial<ProjectConfig["investigator"]>;
+  extractor?: ExtractorConfigInput;
+  investigator?: InvestigatorConfigInput;
   promotion?: Partial<ProjectConfig["promotion"]>;
   sync?: Partial<ProjectConfig["sync"]>;
   deterministic?: Partial<ProjectConfig["deterministic"]> & {
     triggers?: Partial<ProjectConfig["deterministic"]["triggers"]>;
   };
 }
+
+type ProviderProfileConfig = Partial<ExtractorConfig>;
+
+interface GlobalConfigFile {
+  defaults?: {
+    extractorProfile?: string | undefined;
+    investigatorProfile?: string | undefined;
+  };
+  profiles?: Record<string, ProviderProfileConfig>;
+}
+
+type ProviderKind = "extractor" | "investigator";
+
+const PROVIDER_KEYS = [
+  "provider",
+  "baseUrl",
+  "model",
+  "apiKeyEnv",
+  "workspaceIdEnv",
+  "regionEnv",
+  "maxTokens"
+] as const;
+const PROJECT_CODE_BUTLER_IGNORE = ["/*", "!/project-summary.md", ""].join("\n");
+const LEGACY_ENV_ONLY_IGNORE = [".env", ".env.*", "!*.example", ""].join("\n");
 
 export function ensureProjectConfig(rootDir: string): string {
   const configPath = join(rootDir, ".code-butler", "config.json");
@@ -27,6 +51,21 @@ export function ensureProjectConfig(rootDir: string): string {
   ensureProjectConfigExamples(rootDir);
   if (existsSync(configPath)) return configPath;
   writeFileSync(configPath, JSON.stringify(defaultConfigFile(), null, 2));
+  return configPath;
+}
+
+export function globalConfigDir(): string {
+  return resolve(process.env.CODE_BUTLER_HOME?.trim() || join(homedir(), ".config", "code-butler"));
+}
+
+export function ensureGlobalConfig(): string {
+  const globalDir = globalConfigDir();
+  const configPath = join(globalDir, "config.json");
+  mkdirSync(globalDir, { recursive: true });
+  ensureEnvGitignore(globalDir);
+  ensureGlobalEnvExample(globalDir);
+  if (existsSync(configPath)) return configPath;
+  writeFileSync(configPath, JSON.stringify(defaultGlobalConfigFile(), null, 2));
   return configPath;
 }
 
@@ -45,8 +84,10 @@ export function loadExistingProjectConfig(rootDir: string): ProjectConfig {
 
 function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
   loadProjectEnv(rootDir);
+  loadGlobalEnv();
   const raw = readFileSync(configPath, "utf8");
   const parsed = raw.trim().length > 0 ? (JSON.parse(raw) as ProjectConfigFile) : {};
+  const globalConfig = loadGlobalConfig();
   const defaults = defaultConfig(rootDir, configPath);
 
   const git = parsed.sources?.git ?? {};
@@ -76,8 +117,8 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
         roots: (claude.roots ?? defaults.sources.claude.roots).map((root) => resolveRootedPath(rootDir, root))
       }
     },
-    extractor: mergeProviderConfig(defaults.extractor, parsed.extractor),
-    investigator: mergeProviderConfig(defaults.investigator, parsed.investigator),
+    extractor: resolveProviderConfig("extractor", defaults.extractor, globalConfig, parsed.extractor),
+    investigator: resolveProviderConfig("investigator", defaults.investigator, globalConfig, parsed.investigator),
     promotion: {
       ...defaults.promotion,
       ...(parsed.promotion ?? {})
@@ -165,21 +206,69 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
   };
 }
 
-function mergeProviderConfig<T extends ProjectConfig["extractor"] | ProjectConfig["investigator"]>(
+function resolveProviderConfig(
+  kind: "extractor",
+  defaults: ExtractorConfig,
+  globalConfig: GlobalConfigFile,
+  overrides: ExtractorConfigInput | undefined
+): ExtractorConfig;
+function resolveProviderConfig(
+  kind: "investigator",
+  defaults: InvestigatorConfig,
+  globalConfig: GlobalConfigFile,
+  overrides: InvestigatorConfigInput | undefined
+): InvestigatorConfig;
+function resolveProviderConfig<T extends ExtractorConfig | InvestigatorConfig>(
+  kind: ProviderKind,
   defaults: T,
-  overrides: Partial<T> | undefined
+  globalConfig: GlobalConfigFile,
+  overrides: ExtractorConfigInput | InvestigatorConfigInput | undefined
 ): T {
-  const merged = {
-    ...defaults,
-    ...(overrides ?? {})
+  const merged: Record<string, unknown> = { ...defaults };
+  let providerLayer = Object.prototype.hasOwnProperty.call(defaults, "provider") ? 0 : -1;
+  let baseUrlLayer = Object.prototype.hasOwnProperty.call(defaults, "baseUrl") ? 0 : -1;
+
+  const applyLayer = (values: Record<string, unknown> | undefined, layer: number, providerOnly: boolean): void => {
+    if (!values) return;
+    const keys = providerOnly ? PROVIDER_KEYS : Object.keys(values);
+    for (const key of keys) {
+      if (key === "profile") continue;
+      if (!Object.prototype.hasOwnProperty.call(values, key)) continue;
+      const value = values[key];
+      if (value === undefined) continue;
+      merged[key] = value;
+      if (key === "provider") providerLayer = layer;
+      if (key === "baseUrl") baseUrlLayer = layer;
+    }
   };
-  if (merged.provider === "anthropic-aws" && overrides?.baseUrl === undefined) {
+
+  const defaultProfileName =
+    kind === "extractor" ? globalConfig.defaults?.extractorProfile : globalConfig.defaults?.investigatorProfile;
+  applyLayer(readProviderProfile(globalConfig, defaultProfileName, kind), 1, true);
+  applyLayer(readProviderProfile(globalConfig, overrides?.profile, kind), 2, true);
+  applyLayer(overrides as Record<string, unknown> | undefined, 3, false);
+
+  if (merged.provider === "anthropic-aws" && baseUrlLayer < providerLayer) {
     delete merged.baseUrl;
   }
-  return merged;
+
+  return merged as T;
 }
 
-function defaultConfigFile(): Omit<ProjectConfig, "configPath"> {
+function readProviderProfile(
+  config: GlobalConfigFile,
+  profileName: string | undefined,
+  kind: ProviderKind
+): ProviderProfileConfig | undefined {
+  if (!profileName) return undefined;
+  const profile = config.profiles?.[profileName];
+  if (!profile) {
+    throw new Error(`Unknown Code Butler provider profile "${profileName}" for ${kind}`);
+  }
+  return profile;
+}
+
+function defaultConfigFile(): ProjectConfigFile {
   const home = homedir();
   const codexRoots = defaultCodexRoots(home);
   return {
@@ -202,26 +291,6 @@ function defaultConfigFile(): Omit<ProjectConfig, "configPath"> {
         roots: [join(home, ".claude", "projects")],
         projectOnly: true
       }
-    },
-    extractor: {
-      provider: "openai-compatible",
-      baseUrl: "https://api.openai.com/v1",
-      model: "gpt-5-mini",
-      apiKeyEnv: "OPENAI_API_KEY"
-    },
-    investigator: {
-      enabled: true,
-      mode: "native-rlm",
-      provider: "openai-compatible",
-      baseUrl: "https://api.openai.com/v1",
-      model: "gpt-5-mini",
-      apiKeyEnv: "OPENAI_API_KEY",
-      maxDepth: 3,
-      maxSteps: 18,
-      maxBranching: 2,
-      topKPerSearch: 5,
-      evidenceThreshold: 0.75,
-      returnTrace: true
     },
     promotion: {
       confidenceThreshold: 0.85,
@@ -266,8 +335,22 @@ function normalizeCodexRoots(
   return [...new Set(roots)];
 }
 
+function loadGlobalConfig(): GlobalConfigFile {
+  const configPath = join(globalConfigDir(), "config.json");
+  if (!existsSync(configPath)) return {};
+  const raw = readFileSync(configPath, "utf8");
+  return raw.trim().length > 0 ? (JSON.parse(raw) as GlobalConfigFile) : {};
+}
+
+function loadGlobalEnv(): void {
+  loadEnvFile(join(globalConfigDir(), ".env"));
+}
+
 function loadProjectEnv(rootDir: string): void {
-  const envPath = join(rootDir, ".code-butler", ".env");
+  loadEnvFile(join(rootDir, ".code-butler", ".env"));
+}
+
+function loadEnvFile(envPath: string): void {
   if (!existsSync(envPath)) return;
   const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
   for (const line of lines) {
@@ -282,8 +365,14 @@ function loadProjectEnv(rootDir: string): void {
 
 function ensureProjectGitignore(rootDir: string): void {
   const gitignorePath = join(rootDir, ".code-butler", ".gitignore");
+  if (existsSync(gitignorePath) && readFileSync(gitignorePath, "utf8") !== LEGACY_ENV_ONLY_IGNORE) return;
+  writeFileSync(gitignorePath, PROJECT_CODE_BUTLER_IGNORE);
+}
+
+function ensureEnvGitignore(dir: string): void {
+  const gitignorePath = join(dir, ".gitignore");
   if (existsSync(gitignorePath)) return;
-  writeFileSync(gitignorePath, [".env", ".env.*", "!*.example", ""].join("\n"));
+  writeFileSync(gitignorePath, LEGACY_ENV_ONLY_IGNORE);
 }
 
 function ensureProjectEnvExample(rootDir: string): void {
@@ -292,8 +381,9 @@ function ensureProjectEnvExample(rootDir: string): void {
   writeFileSync(
     envExamplePath,
     [
-      "# Project-local Code Butler credentials",
-      "# Copy this file to .code-butler/.env and fill in only the providers you use.",
+      "# Project-local Code Butler credential overrides",
+      "# Prefer one-time global credentials in ~/.config/code-butler/.env.",
+      "# Copy this file to .code-butler/.env only when this project needs different provider credentials.",
       "",
       "# OpenAI-compatible providers, including OpenAI, OpenRouter, LiteLLM, Ollama, and LM Studio.",
       "OPENAI_API_KEY=",
@@ -307,6 +397,55 @@ function ensureProjectEnvExample(rootDir: string): void {
       ""
     ].join("\n")
   );
+}
+
+function ensureGlobalEnvExample(globalDir: string): void {
+  const envExamplePath = join(globalDir, ".env.example");
+  if (existsSync(envExamplePath)) return;
+  writeFileSync(
+    envExamplePath,
+    [
+      "# Global Code Butler credentials",
+      "# Copy this file to ~/.config/code-butler/.env and fill in only the providers you use.",
+      "# Set CODE_BUTLER_HOME to use a different global config directory.",
+      "",
+      "# OpenAI-compatible providers, including OpenAI, OpenRouter, LiteLLM, Ollama, and LM Studio.",
+      "OPENAI_API_KEY=",
+      "OPENROUTER_API_KEY=",
+      "LITELLM_KEY=",
+      "",
+      "# Claude Platform on AWS direct provider (provider: anthropic-aws).",
+      "ANTHROPIC_AWS_API_KEY=",
+      "ANTHROPIC_AWS_WORKSPACE_ID=",
+      "AWS_REGION=us-east-1",
+      ""
+    ].join("\n")
+  );
+}
+
+function defaultGlobalConfigFile(): GlobalConfigFile {
+  return {
+    defaults: {
+      extractorProfile: "cheap",
+      investigatorProfile: "smart"
+    },
+    profiles: {
+      cheap: {
+        provider: "openai-compatible",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5-mini",
+        apiKeyEnv: "OPENAI_API_KEY",
+        maxTokens: 1200
+      },
+      smart: {
+        provider: "openai-compatible",
+        baseUrl: "https://api.openai.com/v1",
+        model: "gpt-5",
+        apiKeyEnv: "OPENAI_API_KEY",
+        maxTokens: 2500
+      }
+    }
+  };
 }
 
 function ensureProjectConfigExamples(rootDir: string): void {

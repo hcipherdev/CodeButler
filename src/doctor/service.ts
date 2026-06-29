@@ -2,7 +2,7 @@ import { existsSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { loadExistingProjectConfig } from "../config.js";
+import { globalConfigDir, loadExistingProjectConfig } from "../config.js";
 import { getProjectSummaryStatus } from "../project-summary/service.js";
 import { getClaudeSourceStatus, getCodexSourceStatus, type ConversationSourceStatus } from "../sources/codex.js";
 import type { MemoryStore } from "../storage/store.js";
@@ -534,9 +534,15 @@ function addExtractorChecks(
   });
   addAction({
     priority: "low",
-    command: "edit .code-butler/.env",
-    reason: "Set provider credentials for LLM extraction and investigation. Deterministic mode still works without them."
+    command: `edit ${globalEnvPathForDisplay()}`,
+    reason:
+      "Set global provider credentials for LLM extraction and investigation. Use project .code-butler/.env only for overrides. Deterministic mode still works without them."
   });
+}
+
+function globalEnvPathForDisplay(): string {
+  if (!process.env.CODE_BUTLER_HOME?.trim()) return "~/.config/code-butler/.env";
+  return join(globalConfigDir(), ".env");
 }
 
 function addMemoryCheck(
