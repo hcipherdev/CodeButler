@@ -127,6 +127,13 @@ describe("CLI", () => {
     );
   }
 
+  const unavailableSummaryGenerator: ProjectSummaryGenerator = {
+    name: "test-unavailable",
+    async generate() {
+      throw new Error("test summary provider unavailable");
+    }
+  };
+
   it("initializes local storage and imports a conversation", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -134,7 +141,13 @@ describe("CLI", () => {
     const conversation = join(rootDir, "session.md");
     writeFileSync(conversation, "We changed src/cache.ts to prevent stale reads.");
 
-    await expect(runCli(["init"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
+    await expect(
+      runCli(["init"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        projectSummaryGenerator: unavailableSummaryGenerator
+      })
+    ).resolves.toBe(0);
     await expect(
       runCli(["ingest", "conversation", conversation], {
         cwd: rootDir,
@@ -162,6 +175,7 @@ describe("CLI", () => {
       runCli(["init"], {
         cwd: rootDir,
         stdout: (line) => output.push(line),
+        projectSummaryGenerator: unavailableSummaryGenerator,
         now: () => new Date("2026-06-16T10:00:00Z")
       })
     ).resolves.toBe(0);
@@ -189,7 +203,13 @@ describe("CLI", () => {
     const claudeDir = join(rootDir, "claude");
     writeFileSync(join(rootDir, "placeholder.txt"), "");
 
-    await expect(runCli(["init"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
+    await expect(
+      runCli(["init"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        projectSummaryGenerator: unavailableSummaryGenerator
+      })
+    ).resolves.toBe(0);
 
     const config = loadProjectConfig(rootDir);
     expect(existsSync(config.configPath)).toBe(true);
