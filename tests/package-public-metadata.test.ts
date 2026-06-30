@@ -13,6 +13,7 @@ describe("public package metadata", () => {
     bin?: { "code-butler"?: string };
     files?: string[];
     keywords?: string[];
+    scripts?: Record<string, string>;
   };
 
   it("publishes discoverable metadata for the public npm package", () => {
@@ -31,5 +32,7 @@ describe("public package metadata", () => {
     expect(packageJson.keywords).toEqual(
       expect.arrayContaining(["mcp", "codex", "claude", "project-memory", "local-first"])
     );
+    expect(packageJson.scripts?.prepack).toBe("npm run build");
+    expect(packageJson.scripts?.prepublishOnly).toBe("npm run typecheck && npm test");
   });
 });

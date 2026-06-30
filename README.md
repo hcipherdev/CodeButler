@@ -97,7 +97,7 @@ Memory can come from:
 
 ## Quick Start
 
-Code Butler is a v0.1 early-access tool. The fastest path is the npm CLI:
+Install the Code Butler CLI from npm:
 
 ```bash
 npm install -g code-butler
