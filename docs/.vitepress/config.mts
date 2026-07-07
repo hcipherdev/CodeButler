@@ -5,6 +5,7 @@ export default defineConfig({
   description: "Local-first project memory for coding agents.",
   base: "/CodeButler/",
   cleanUrls: true,
+  ignoreDeadLinks: [/\/architecture\.html/],
   themeConfig: {
     nav: [
       { text: "Quick Start", link: "/quickstart" },

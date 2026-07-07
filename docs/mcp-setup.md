@@ -34,4 +34,4 @@ Start by syncing memory and reading the project brief. For continuation question
 
 ## See Also
 
-[Architecture overview](/CodeButler/architecture.html) — full system diagram with pipeline stages, layer stack, and data flows.
+[Architecture overview](/architecture.html) — full system diagram with pipeline stages, layer stack, and data flows.
