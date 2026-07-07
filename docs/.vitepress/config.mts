@@ -9,6 +9,7 @@ export default defineConfig({
     nav: [
       { text: "Quick Start", link: "/quickstart" },
       { text: "MCP Setup", link: "/mcp-setup" },
+      { text: "Architecture", link: "/architecture.html" },
       { text: "GitHub", link: "https://github.com/hcipherdev/CodeButler" },
     ],
     sidebar: [
@@ -19,6 +20,7 @@ export default defineConfig({
           { text: "Quick Start", link: "/quickstart" },
           { text: "MCP Setup", link: "/mcp-setup" },
           { text: "Public Sync", link: "/public-sync" },
+          { text: "Architecture", link: "/architecture.html" },
         ],
       },
     ],
