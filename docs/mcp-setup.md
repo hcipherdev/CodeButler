@@ -31,3 +31,7 @@ Agents can call tools such as:
 ## Recommended Agent Flow
 
 Start by syncing memory and reading the project brief. For continuation questions, summarize active context first. For file-specific questions, use code-change explanation and project memory search before editing.
+
+## See Also
+
+[Architecture overview](/CodeButler/architecture.html) — full system diagram with pipeline stages, layer stack, and data flows.
