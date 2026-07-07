@@ -649,6 +649,7 @@ function agentBootstrapText(fileName: "AGENTS.md" | "CLAUDE.md"): string {
     "## Code Butler Project Memory",
     "- Use the global Code Butler MCP server named `code-butler` for this repository.",
     "- The global server resolves this repository and uses its project-local `.code-butler/` memory; call `current_project` when you need to confirm which project is active.",
+    "- If Code Butler MCP tools are not visible, use the client's tool discovery for `code-butler` or `current_project` before falling back to files or git.",
     "- Before coding or answering project-history questions, call `sync_project_memory` when the MCP server is available.",
     "- Start by calling `summarize_project_brief` for the current narrative summary and freshness metadata.",
     "- For continuation questions like \"where were we?\", \"continue\", or after compaction, call `summarize_active_context` first; use `search_temporary_memory` for targeted working context.",

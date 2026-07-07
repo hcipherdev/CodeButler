@@ -299,8 +299,105 @@ describe("MCP tool handlers", () => {
     expect(recent.conversations).toHaveLength(1);
     expect(recent.conversations[0]?.sourceId).toBe("conversation-today");
     expect(recent.commits.map((commit) => commit.hash)).toEqual(["def456"]);
-    expect(recent.why).toContain("Fixed cache invalidation because stale reads were leaking through.");
+    expect(recent.summary[0]).toBe("Commit def456: Fix cache invalidation (src/cache.ts).");
+    expect(recent.highlights[0]).toMatchObject({
+      kind: "commit",
+      text: "Commit def456: Fix cache invalidation (src/cache.ts)."
+    });
+    expect(recent.why).toEqual([
+      "Commit def456: Fix cache invalidation (src/cache.ts).",
+      "Conversation context: Fixed cache invalidation because stale reads were leaking through."
+    ]);
     expect(recent.freshness.hasIndexedSourcesInWindow).toBe(true);
+    store.close();
+  });
+
+  it("filters noisy recent conversation chunks out of summary and why", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const sourceId = store.addSourceWithChunks({
+      source: {
+        id: "conversation-noisy",
+        type: "conversation",
+        title: "noisy-session.jsonl",
+        origin: "codex",
+        rawContent: "Mixed noisy and useful content.",
+        metadata: { timestamp: "2026-06-18T08:30:00.000Z" }
+      },
+      chunks: [
+        { text: "<permissions instructions>\nFilesystem sandboxing defines which files can be read or written." },
+        { text: "# AGENTS.md instructions for /Users/spiel/Documents/code-butler" },
+        { text: "The npm publish path should use prepack before packing." }
+      ]
+    });
+    store.db
+      .prepare("update sources set created_at = ? where id = ?")
+      .run("2026-06-18T08:30:00.000Z", sourceId);
+
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-06-18T12:00:00.000Z")
+    });
+    const recent = handlers.summarize_recent_activity({
+      since: "2026-06-18T00:00:00.000Z",
+      until: "2026-06-18T23:59:59.000Z",
+      includeWorkingTree: false
+    });
+
+    expect(recent.conversations[0]?.chunks).toHaveLength(3);
+    expect(recent.summary).toEqual(["Conversation context: The npm publish path should use prepack before packing."]);
+    expect(recent.why).toEqual(["Conversation context: The npm publish path should use prepack before packing."]);
+    expect(recent.why.join("\n")).not.toContain("permissions instructions");
+    expect(recent.why.join("\n")).not.toContain("AGENTS.md instructions");
+    store.close();
+  });
+
+  it("warns when the narrative project summary is older than the latest sync", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Old summary\n");
+    writeFileSync(
+      join(rootDir, ".code-butler", "project-summary.meta.json"),
+      JSON.stringify({
+        version: 1,
+        summaryPath: join(rootDir, ".code-butler", "project-summary.md"),
+        fingerprint: "old",
+        lastGeneratedAt: "2026-06-15T08:00:00.000Z",
+        lastCheckedAt: "2026-06-15T08:00:00.000Z"
+      })
+    );
+    store.recordSyncStatus({
+      source: "git",
+      enabled: true,
+      lastSyncAt: "2026-06-18T09:00:00.000Z",
+      lastSuccessAt: "2026-06-18T09:00:00.000Z"
+    });
+    store.addCommit({
+      hash: "fresh123",
+      authorName: "Test User",
+      authorEmail: "test@example.com",
+      authoredAt: "2026-06-18T09:00:00.000Z",
+      message: "Update launch docs",
+      changedFiles: ["README.md"],
+      diffSummary: "+ launch docs"
+    });
+
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-06-18T12:00:00.000Z")
+    });
+    const recent = handlers.summarize_recent_activity({
+      since: "2026-06-18T00:00:00.000Z",
+      until: "2026-06-18T23:59:59.000Z",
+      includeWorkingTree: false
+    });
+
+    expect(recent.freshness.warning).toContain("Project summary is older than the latest successful sync");
     store.close();
   });
 
@@ -512,6 +609,8 @@ describe("MCP tool handlers", () => {
 
     expect(recent.workingTree.available).toBe(true);
     expect(recent.workingTree.status.some((line) => line.includes("src/cache.ts"))).toBe(true);
+    expect(recent.summary.some((line) => line.includes("Working tree:"))).toBe(true);
+    expect(recent.highlights.some((highlight) => highlight.kind === "working_tree")).toBe(true);
     expect(recent.conversations).toEqual([]);
     store.close();
   });
