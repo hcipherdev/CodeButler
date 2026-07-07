@@ -19,6 +19,7 @@ import {
 import type { MemoryStore, ProjectSummary } from "../storage/store.js";
 import { syncProjectMemory } from "../sync/service.js";
 import type {
+  EvidenceRef,
   MemoryQualityStatus,
   MemoryType,
   SearchResult,
@@ -34,6 +35,14 @@ export interface RecentActivitySummary {
     since: string;
     until: string;
   };
+  summary: string[];
+  highlights: Array<{
+    kind: "commit" | "working_tree" | "conversation";
+    text: string;
+    evidence?: EvidenceRef | undefined;
+    relatedFiles?: string[] | undefined;
+    sourceId?: string | undefined;
+  }>;
   conversations: Array<{
     sourceId: string;
     title: string;
@@ -818,17 +827,28 @@ function summarizeRecentActivity(
   };
   if (sourcesInWindow.length === 0) {
     freshness.warning = `No Code Butler sources indexed for ${formatHumanDate(since)}; run \`code-butler watch\` or \`sync_project_memory\` after logs flush.`;
+  } else {
+    const projectBrief = readProjectBrief(rootDir);
+    const summaryCheckedAt = projectBrief.meta?.lastCheckedAt ?? projectBrief.meta?.lastGeneratedAt;
+    if (projectSummary.lastSyncAt && summaryCheckedAt && dateIsBefore(summaryCheckedAt, projectSummary.lastSyncAt)) {
+      freshness.warning = "Project summary is older than the latest successful sync; run `code-butler project-summary refresh` or confirm the background watcher is running.";
+    }
   }
+  const workingTree = includeWorkingTree ? readWorkingTree(rootDir) : emptyWorkingTree(false);
+  const highlights = summarizeRecentHighlights(conversations, commits, workingTree);
+  const summary = highlights.map((highlight) => highlight.text).slice(0, 8);
 
   return {
     window: {
       since: sinceIso,
       until: untilIso
     },
+    summary,
+    highlights,
     conversations,
     commits,
-    workingTree: includeWorkingTree ? readWorkingTree(rootDir) : emptyWorkingTree(false),
-    why: summarizeWhy(conversations, commits),
+    workingTree,
+    why: summary,
     freshness
   };
 }
@@ -862,6 +882,13 @@ function dateInWindow(value: string | undefined, sinceIso: string, untilIso: str
   if (Number.isNaN(date.getTime())) return false;
   const iso = date.toISOString();
   return iso >= sinceIso && iso <= untilIso;
+}
+
+function dateIsBefore(left: string, right: string): boolean {
+  const leftDate = new Date(left);
+  const rightDate = new Date(right);
+  if (Number.isNaN(leftDate.getTime()) || Number.isNaN(rightDate.getTime())) return false;
+  return leftDate.getTime() < rightDate.getTime();
 }
 
 function readWorkingTree(rootDir: string): RecentActivitySummary["workingTree"] {
@@ -898,15 +925,88 @@ function emptyWorkingTree(requested: boolean): RecentActivitySummary["workingTre
   };
 }
 
-function summarizeWhy(
+function summarizeRecentHighlights(
   conversations: RecentActivitySummary["conversations"],
-  commits: RecentActivitySummary["commits"]
-): string[] {
-  const reasons = [
-    ...conversations.flatMap((conversation) => conversation.chunks.map((chunk) => chunk.text)),
-    ...commits.map((commit) => commit.message)
-  ];
-  return [...new Set(reasons)].slice(0, 20);
+  commits: RecentActivitySummary["commits"],
+  workingTree: RecentActivitySummary["workingTree"]
+): RecentActivitySummary["highlights"] {
+  const highlights: RecentActivitySummary["highlights"] = [];
+
+  for (const commit of commits.slice(0, 8)) {
+    highlights.push({
+      kind: "commit",
+      text: commitHighlightText(commit),
+      evidence: { sourceType: "commit", sourceId: commit.hash },
+      relatedFiles: commit.changedFiles
+    });
+  }
+
+  if (workingTree.available && (workingTree.status.length > 0 || workingTree.diffStat.length > 0)) {
+    const statusCount = workingTree.status.length;
+    const firstStat = workingTree.diffStat[0];
+    highlights.push({
+      kind: "working_tree",
+      text: firstStat
+        ? `Working tree: ${statusCount} changed or untracked path(s); ${firstStat}.`
+        : `Working tree: ${statusCount} changed or untracked path(s).`
+    });
+  }
+
+  const seenConversationText = new Set<string>();
+  for (const conversation of conversations) {
+    for (const chunk of conversation.chunks) {
+      const text = cleanRecentActivityText(chunk.text);
+      if (!text || seenConversationText.has(text)) continue;
+      seenConversationText.add(text);
+      highlights.push({
+        kind: "conversation",
+        text: `Conversation context: ${text}`,
+        evidence: { sourceType: "conversation", sourceId: conversation.sourceId, locator: chunk.chunkId },
+        sourceId: conversation.sourceId
+      });
+      if (highlights.filter((highlight) => highlight.kind === "conversation").length >= 5) return highlights;
+    }
+  }
+
+  return highlights;
+}
+
+function commitHighlightText(commit: RecentActivitySummary["commits"][number]): string {
+  const hash = commit.hash.slice(0, 12);
+  const files = commit.changedFiles.slice(0, 3).join(", ");
+  const suffix = files ? ` (${files}${commit.changedFiles.length > 3 ? ", ..." : ""}).` : ".";
+  return `Commit ${hash}: ${commit.message}${suffix}`;
+}
+
+function cleanRecentActivityText(value: string): string | undefined {
+  const collapsed = value.replace(/\s+/g, " ").trim();
+  if (!collapsed || isNoisyRecentActivityText(collapsed)) return undefined;
+  return truncateText(collapsed, 220);
+}
+
+function isNoisyRecentActivityText(value: string): boolean {
+  const lower = value.toLowerCase();
+  return [
+    "<permissions instructions",
+    "filesystem sandboxing defines",
+    "# agents.md instructions",
+    "# claude.md instructions",
+    "the following is the codex agent history",
+    "approval request start",
+    "planned action json",
+    "<environment_context>",
+    "<skills_instructions>",
+    "<plugins_instructions>",
+    "tool exec_command call",
+    "tool exec_command result",
+    "original token count",
+    "wall time:"
+  ].some((pattern) => lower.includes(pattern));
+}
+
+function truncateText(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 1).trimEnd()}...`;
 }
 
 function parseJsonObjectLocal(value: string): Record<string, unknown> {

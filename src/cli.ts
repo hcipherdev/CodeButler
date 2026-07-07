@@ -1,8 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -28,6 +25,13 @@ import { getClaudeSourceStatus, getCodexSourceStatus } from "./sources/codex.js"
 import { openMemoryStore } from "./storage/store.js";
 import { syncProjectMemory } from "./sync/service.js";
 import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, SyncSourceName } from "./types.js";
+import {
+  getWatchServiceStatus,
+  installWatchService,
+  uninstallWatchService,
+  type WatchServiceCommandRunner,
+  type WatchServiceResult
+} from "./watch-service.js";
 
 type ServerStarter = (options: ProjectMemoryServerOptions) => Promise<unknown>;
 
@@ -43,6 +47,7 @@ export interface CliOptions {
   watchServiceHomeDir?: string | undefined;
   watchServicePlatform?: NodeJS.Platform | undefined;
   watchServiceLaunchctl?: boolean | undefined;
+  watchServiceCommandRunner?: WatchServiceCommandRunner | undefined;
   cliPath?: string | undefined;
 }
 
@@ -72,6 +77,14 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
         stdout(`Project summary ready at ${relativeSummaryPath(cwd, installed.summaryPath)}`);
         if (installed.backupFiles?.length) {
           stdout(`Backed up agent files: ${installed.backupFiles.map((file) => relativeSummaryPath(cwd, file)).join(", ")}`);
+        }
+        try {
+          const watcher = installWatchService(watchServiceOptions(cwd, options));
+          stdout(`Background watcher installed: ${watcher.label}`);
+          stdout(watchServiceLocationLine(watcher));
+          stdout(`logs=${watcher.logsDir}`);
+        } catch (error) {
+          throw new Error(`Failed to install Code Butler background watcher: ${error instanceof Error ? error.message : String(error)}`);
         }
         return 0;
       } finally {
@@ -115,6 +128,7 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
         watchServiceHomeDir: options.watchServiceHomeDir,
         watchServicePlatform: options.watchServicePlatform,
         watchServiceLaunchctl: options.watchServiceLaunchctl,
+        watchServiceCommandRunner: options.watchServiceCommandRunner,
         cliPath: options.cliPath
       });
     }
@@ -450,7 +464,14 @@ async function runWatch(
   stdout: (line: string) => void,
   options: Pick<
     CliOptions,
-    "signal" | "projectSummaryGenerator" | "now" | "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl" | "cliPath"
+    | "signal"
+    | "projectSummaryGenerator"
+    | "now"
+    | "watchServiceHomeDir"
+    | "watchServicePlatform"
+    | "watchServiceLaunchctl"
+    | "watchServiceCommandRunner"
+    | "cliPath"
   > = {}
 ): Promise<number> {
   const [subcommand, ...subcommandRest] = args;
@@ -528,37 +549,23 @@ async function runWatchInstall(
   args: string[],
   cwd: string,
   stdout: (line: string) => void,
-  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl" | "cliPath"> = {}
+  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl" | "watchServiceCommandRunner" | "cliPath"> = {}
 ): Promise<number> {
-  const platform = options.watchServicePlatform ?? process.platform;
-  if (platform !== "darwin") throw new Error("code-butler watch install currently supports macOS launchd only.");
   const source = parseSyncSourceFlag(args);
   const intervalSeconds = parseNumberFlag(args, "--interval") ?? 30;
-  const service = watchService(cwd, options);
-  mkdirSync(join(cwd, ".code-butler", "logs"), { recursive: true });
-  mkdirSync(join(service.homeDir, "Library", "LaunchAgents"), { recursive: true });
-  writeFileSync(service.plistPath, watchPlist(cwd, service.label, intervalSeconds, source, options.cliPath));
-  if (options.watchServiceLaunchctl !== false) {
-    loadLaunchAgent(service.plistPath);
-  }
+  const service = installWatchService(watchServiceOptions(cwd, options, { intervalSeconds, source }));
   stdout(`Installed Code Butler watch service ${service.label}`);
-  stdout(`plist=${service.plistPath}`);
-  stdout(`logs=${join(cwd, ".code-butler", "logs")}`);
+  stdout(watchServiceLocationLine(service));
+  stdout(`logs=${service.logsDir}`);
   return 0;
 }
 
 async function runWatchUninstall(
   cwd: string,
   stdout: (line: string) => void,
-  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl"> = {}
+  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl" | "watchServiceCommandRunner" | "cliPath"> = {}
 ): Promise<number> {
-  const platform = options.watchServicePlatform ?? process.platform;
-  if (platform !== "darwin") throw new Error("code-butler watch uninstall currently supports macOS launchd only.");
-  const service = watchService(cwd, options);
-  if (existsSync(service.plistPath) && options.watchServiceLaunchctl !== false) {
-    unloadLaunchAgent(service.plistPath);
-  }
-  rmSync(service.plistPath, { force: true });
+  const service = uninstallWatchService(watchServiceOptions(cwd, options));
   stdout(`Uninstalled Code Butler watch service ${service.label}`);
   return 0;
 }
@@ -566,88 +573,38 @@ async function runWatchUninstall(
 async function runWatchStatus(
   cwd: string,
   stdout: (line: string) => void,
-  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform"> = {}
+  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl" | "watchServiceCommandRunner" | "cliPath"> = {}
 ): Promise<number> {
-  const platform = options.watchServicePlatform ?? process.platform;
-  if (platform !== "darwin") throw new Error("code-butler watch status currently supports macOS launchd only.");
-  const service = watchService(cwd, options);
+  const service = getWatchServiceStatus(watchServiceOptions(cwd, options));
   stdout("Code Butler Watch Status");
   stdout(`label=${service.label}`);
-  stdout(`plist=${service.plistPath}`);
-  stdout(`installed=${existsSync(service.plistPath)}`);
+  stdout(watchServiceLocationLine(service));
+  stdout(`installed=${service.installed}`);
   return 0;
 }
 
-function watchService(
+function watchServiceOptions(
   cwd: string,
-  options: Pick<CliOptions, "watchServiceHomeDir"> = {}
-): { homeDir: string; label: string; plistPath: string } {
-  const homeDir = options.watchServiceHomeDir ?? homedir();
-  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-  const label = `com.codebutler.watch.${hash}`;
+  options: Pick<CliOptions, "watchServiceHomeDir" | "watchServicePlatform" | "watchServiceLaunchctl" | "watchServiceCommandRunner" | "cliPath">,
+  overrides: { intervalSeconds?: number; source?: SyncSourceName | "all" } = {}
+): Parameters<typeof installWatchService>[0] {
   return {
-    homeDir,
-    label,
-    plistPath: join(homeDir, "Library", "LaunchAgents", `${label}.plist`)
+    cwd,
+    homeDir: options.watchServiceHomeDir,
+    platform: options.watchServicePlatform,
+    cliPath: options.cliPath ?? fileURLToPath(import.meta.url),
+    intervalSeconds: overrides.intervalSeconds,
+    source: overrides.source,
+    commandRunner: options.watchServiceCommandRunner,
+    runCommands: options.watchServiceLaunchctl !== false
   };
 }
 
-function watchPlist(cwd: string, label: string, intervalSeconds: number, source: SyncSourceName | "all", cliPath?: string): string {
-  const cli = cliPath ?? process.argv[1] ?? join(cwd, "dist", "cli.js");
-  const logsDir = join(cwd, ".code-butler", "logs");
-  const args = [process.execPath, cli, "watch", "--interval", String(intervalSeconds), "--source", source];
-  return [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
-    '<plist version="1.0">',
-    "<dict>",
-    "  <key>Label</key>",
-    `  <string>${xmlEscape(label)}</string>`,
-    "  <key>ProgramArguments</key>",
-    "  <array>",
-    ...args.map((arg) => `    <string>${xmlEscape(arg)}</string>`),
-    "  </array>",
-    "  <key>WorkingDirectory</key>",
-    `  <string>${xmlEscape(cwd)}</string>`,
-    "  <key>RunAtLoad</key>",
-    "  <true/>",
-    "  <key>KeepAlive</key>",
-    "  <true/>",
-    "  <key>StandardOutPath</key>",
-    `  <string>${xmlEscape(join(logsDir, "watch.out.log"))}</string>`,
-    "  <key>StandardErrorPath</key>",
-    `  <string>${xmlEscape(join(logsDir, "watch.err.log"))}</string>`,
-    "</dict>",
-    "</plist>"
-  ].join("\n") + "\n";
-}
-
-function loadLaunchAgent(plistPath: string): void {
-  const domain = `gui/${process.getuid?.() ?? ""}`;
-  try {
-    execFileSync("launchctl", ["bootstrap", domain, plistPath], { stdio: "ignore" });
-  } catch {
-    execFileSync("launchctl", ["bootout", domain, plistPath], { stdio: "ignore" });
-    execFileSync("launchctl", ["bootstrap", domain, plistPath], { stdio: "ignore" });
-  }
-}
-
-function unloadLaunchAgent(plistPath: string): void {
-  const domain = `gui/${process.getuid?.() ?? ""}`;
-  try {
-    execFileSync("launchctl", ["bootout", domain, plistPath], { stdio: "ignore" });
-  } catch {
-    // Already unloaded.
-  }
-}
-
-function xmlEscape(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
+function watchServiceLocationLine(service: WatchServiceResult): string {
+  if (service.servicePath && service.platform === "darwin") return `plist=${service.servicePath}`;
+  if (service.servicePath) return `service=${service.servicePath}`;
+  if (service.taskName) return `task=${service.taskName}`;
+  return `platform=${service.platform}`;
 }
 
 function projectSummaryOperationOptions(
@@ -822,7 +779,6 @@ function usage(): string {
     "  code-butler sync [--source <git|codex|claude|all>]",
     "  code-butler sources status",
     "  code-butler watch [--interval <seconds>] [--source <git|codex|claude|all>]",
-    "  code-butler watch install [--interval <seconds>] [--source <git|codex|claude|all>]",
     "  code-butler watch status",
     "  code-butler watch uninstall",
     "  code-butler project-summary refresh [--force]",

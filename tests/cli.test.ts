@@ -38,6 +38,29 @@ describe("CLI", () => {
     expect(isCliEntrypoint(pathToFileURL(realCli).href, binCli)).toBe(true);
   });
 
+  it("hides watch install from help while keeping the compatibility command", async () => {
+    const rootDir = makeTempDir();
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, launchdHomeDir);
+    const helpOutput: string[] = [];
+    const installOutput: string[] = [];
+    const { runner } = recordCommands();
+
+    await expect(runCli(["help"], { cwd: rootDir, stdout: (line) => helpOutput.push(line) })).resolves.toBe(0);
+    expect(helpOutput.join("\n")).not.toContain("watch install");
+
+    await expect(
+      runCli(["watch", "install"], {
+        cwd: rootDir,
+        stdout: (line) => installOutput.push(line),
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceCommandRunner: runner
+      })
+    ).resolves.toBe(0);
+    expect(installOutput.join("\n")).toContain("Installed Code Butler watch service");
+  });
+
   function createConversationProject(): { rootDir: string; claudeDir: string } {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -134,9 +157,23 @@ describe("CLI", () => {
     }
   };
 
+  function recordCommands(): {
+    commands: Array<{ command: string; args: string[] }>;
+    runner: (command: string, args: string[]) => void;
+  } {
+    const commands: Array<{ command: string; args: string[] }> = [];
+    return {
+      commands,
+      runner(command, args) {
+        commands.push({ command, args });
+      }
+    };
+  }
+
   it("initializes local storage and imports a conversation", async () => {
     const rootDir = makeTempDir();
-    tempDirs.push(rootDir);
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, launchdHomeDir);
     const output: string[] = [];
     const conversation = join(rootDir, "session.md");
     writeFileSync(conversation, "We changed src/cache.ts to prevent stale reads.");
@@ -145,7 +182,10 @@ describe("CLI", () => {
       runCli(["init"], {
         cwd: rootDir,
         stdout: (line) => output.push(line),
-        projectSummaryGenerator: unavailableSummaryGenerator
+        projectSummaryGenerator: unavailableSummaryGenerator,
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceCommandRunner: recordCommands().runner
       })
     ).resolves.toBe(0);
     await expect(
@@ -165,18 +205,23 @@ describe("CLI", () => {
 
   it("explicit init installs fallback project summary and agent bootstraps", async () => {
     const rootDir = makeTempDir();
-    tempDirs.push(rootDir);
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, launchdHomeDir);
     writeFileSync(join(rootDir, "README.md"), "# Auto Summary Project\n");
     writeFileSync(join(rootDir, "AGENTS.md"), "old agents");
     writeFileSync(join(rootDir, "CLAUDE.md"), "old claude");
     const output: string[] = [];
+    const { runner } = recordCommands();
 
     await expect(
       runCli(["init"], {
         cwd: rootDir,
         stdout: (line) => output.push(line),
         projectSummaryGenerator: unavailableSummaryGenerator,
-        now: () => new Date("2026-06-16T10:00:00Z")
+        now: () => new Date("2026-06-16T10:00:00Z"),
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceCommandRunner: runner
       })
     ).resolves.toBe(0);
 
@@ -188,15 +233,137 @@ describe("CLI", () => {
     });
     expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toContain("summarize_project_brief");
     expect(readFileSync(join(rootDir, "CLAUDE.md"), "utf8")).toContain("sync_project_memory");
+    expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toContain("tool discovery");
+    expect(readFileSync(join(rootDir, "CLAUDE.md"), "utf8")).toContain("tool discovery");
     expect(readFileSync(join(rootDir, "AGENTS.md.code-butler-backup-2026-06-16T10-00-00-000Z"), "utf8")).toBe("old agents");
     expect(readFileSync(join(rootDir, "CLAUDE.md.code-butler-backup-2026-06-16T10-00-00-000Z"), "utf8")).toBe("old claude");
     expect(output.join("\n")).toContain("fallback summary was created");
     expect(output.join("\n")).toContain("code-butler project-summary refresh --force");
   });
 
+  it("init installs and starts the macOS background watcher", async () => {
+    const rootDir = makeTempDir();
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, launchdHomeDir);
+    writeFileSync(join(rootDir, "README.md"), "# Watch Project\n");
+    const output: string[] = [];
+    const { commands, runner } = recordCommands();
+
+    await expect(
+      runCli(["init"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        projectSummaryGenerator: unavailableSummaryGenerator,
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceCommandRunner: runner,
+        cliPath: "/opt/code-butler/dist/cli.js"
+      })
+    ).resolves.toBe(0);
+
+    const launchAgentsDir = join(launchdHomeDir, "Library", "LaunchAgents");
+    const plistFiles = readdirSync(launchAgentsDir).filter((name) => name.startsWith("com.codebutler.watch."));
+    expect(plistFiles).toHaveLength(1);
+    const plist = readFileSync(join(launchAgentsDir, plistFiles[0]!), "utf8");
+    expect(plist).toContain("<string>watch</string>");
+    expect(plist).toContain("<string>--interval</string>");
+    expect(plist).toContain("<string>30</string>");
+    expect(plist).toContain("<string>--source</string>");
+    expect(plist).toContain("<string>all</string>");
+    expect(plist).toContain("<string>/opt/code-butler/dist/cli.js</string>");
+    expect(commands.some((item) => item.command === "launchctl" && item.args.includes("bootstrap"))).toBe(true);
+    expect(output.join("\n")).toContain("Background watcher installed");
+  });
+
+  it("init installs and starts the Linux user systemd watcher", async () => {
+    const rootDir = makeTempDir();
+    const systemdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, systemdHomeDir);
+    writeFileSync(join(rootDir, "README.md"), "# Linux Watch Project\n");
+    const output: string[] = [];
+    const { commands, runner } = recordCommands();
+
+    await expect(
+      runCli(["init"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        projectSummaryGenerator: unavailableSummaryGenerator,
+        watchServiceHomeDir: systemdHomeDir,
+        watchServicePlatform: "linux",
+        watchServiceCommandRunner: runner,
+        cliPath: "/opt/code-butler/dist/cli.js"
+      })
+    ).resolves.toBe(0);
+
+    const unitDir = join(systemdHomeDir, ".config", "systemd", "user");
+    const unitFiles = readdirSync(unitDir).filter((name) => name.startsWith("code-butler-watch-"));
+    expect(unitFiles).toHaveLength(1);
+    const unit = readFileSync(join(unitDir, unitFiles[0]!), "utf8");
+    expect(unit).toContain("ExecStart=");
+    expect(unit).toContain("/opt/code-butler/dist/cli.js watch --interval 30 --source all");
+    expect(commands).toContainEqual({ command: "systemctl", args: ["--user", "daemon-reload"] });
+    expect(commands).toContainEqual({ command: "systemctl", args: ["--user", "enable", "--now", unitFiles[0]!] });
+    expect(output.join("\n")).toContain("Background watcher installed");
+  });
+
+  it("init creates and starts the Windows scheduled task watcher", async () => {
+    const rootDir = makeTempDir();
+    const homeDir = makeTempDir();
+    tempDirs.push(rootDir, homeDir);
+    writeFileSync(join(rootDir, "README.md"), "# Windows Watch Project\n");
+    const output: string[] = [];
+    const { commands, runner } = recordCommands();
+
+    await expect(
+      runCli(["init"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        projectSummaryGenerator: unavailableSummaryGenerator,
+        watchServiceHomeDir: homeDir,
+        watchServicePlatform: "win32",
+        watchServiceCommandRunner: runner,
+        cliPath: "C:\\CodeButler\\dist\\cli.js"
+      })
+    ).resolves.toBe(0);
+
+    const createCommand = commands.find((item) => item.command === "schtasks.exe" && item.args.includes("/Create"));
+    const runCommand = commands.find((item) => item.command === "schtasks.exe" && item.args.includes("/Run"));
+    expect(createCommand?.args).toEqual(expect.arrayContaining(["/SC", "ONLOGON", "/F"]));
+    expect(createCommand?.args.join(" ")).toContain("C:\\CodeButler\\dist\\cli.js");
+    expect(createCommand?.args.join(" ")).toContain("watch --interval 30 --source all");
+    expect(runCommand?.args).toEqual(expect.arrayContaining(["/TN"]));
+    expect(output.join("\n")).toContain("Background watcher installed");
+  });
+
+  it("init reports a clear error when background watcher installation fails", async () => {
+    const rootDir = makeTempDir();
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, launchdHomeDir);
+    writeFileSync(join(rootDir, "README.md"), "# Failing Watch Project\n");
+    const errors: string[] = [];
+
+    await expect(
+      runCli(["init"], {
+        cwd: rootDir,
+        stderr: (line) => errors.push(line),
+        projectSummaryGenerator: unavailableSummaryGenerator,
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceCommandRunner() {
+          throw new Error("launchctl unavailable");
+        }
+      })
+    ).resolves.toBe(1);
+
+    expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(true);
+    expect(errors.join("\n")).toContain("Failed to install Code Butler background watcher");
+    expect(errors.join("\n")).toContain("launchctl unavailable");
+  });
+
   it("initializes config and syncs configured sources", async () => {
     const rootDir = makeTempDir();
-    tempDirs.push(rootDir);
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, launchdHomeDir);
     const output: string[] = [];
     const repoDir = join(rootDir, "repo");
     const codexDir = join(rootDir, "codex");
@@ -207,7 +374,10 @@ describe("CLI", () => {
       runCli(["init"], {
         cwd: rootDir,
         stdout: (line) => output.push(line),
-        projectSummaryGenerator: unavailableSummaryGenerator
+        projectSummaryGenerator: unavailableSummaryGenerator,
+        watchServiceHomeDir: launchdHomeDir,
+        watchServicePlatform: "darwin",
+        watchServiceCommandRunner: recordCommands().runner
       })
     ).resolves.toBe(0);
 

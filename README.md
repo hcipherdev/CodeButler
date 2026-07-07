@@ -115,7 +115,8 @@ projects. It creates project-local memory, writes
 `.code-butler/project-summary.md`, and backs up existing
 `AGENTS.md` / `CLAUDE.md` beside the originals as
 `*.code-butler-backup-<timestamp>` before replacing them with short Butler
-bootstrap instructions.
+bootstrap instructions. It also installs and starts the per-project background
+watcher so local memory and the project summary stay fresh after setup.
 
 Those bootstrap files are what make future Codex or Claude sessions naturally
 use Code Butler before editing. The project summary gives agents a fast
@@ -127,8 +128,9 @@ project summary, no agent bootstrap instructions, and
 `summarize_project_brief` reports that no summary exists.
 
 There is no separate `project-summary install` step for normal use. `init`
-creates the first summary and bootstrap files; `project-summary refresh` and
-`project-summary status` are the ongoing summary commands.
+creates the first summary, bootstrap files, and background updater;
+`project-summary refresh` and `project-summary status` remain available for
+manual checks.
 
 If no API key is available, Code Butler creates a limited fallback summary,
 records it as a fallback in summary metadata, and tells you how to regenerate a
@@ -233,22 +235,22 @@ Keep memory fresh in the foreground while you work:
 code-butler watch
 ```
 
-Install a macOS user watcher for regular background sync and summary refresh:
+Check the installed background watcher:
 
 ```bash
-code-butler watch install
 code-butler watch status
 ```
 
-The installed watcher runs the same watch loop automatically. It syncs local
-sources and refreshes `.code-butler/project-summary.md` when the daily gated
-fingerprint check says the summary is due. It does not rewrite `AGENTS.md` or
-`CLAUDE.md`; those bootstrap files are installed only by explicit
-`code-butler init`.
+The watcher installed by `code-butler init` runs the same watch loop
+automatically. It syncs local sources and refreshes
+`.code-butler/project-summary.md` when the daily gated fingerprint check says
+the summary is due. It does not rewrite `AGENTS.md` or `CLAUDE.md`; those
+bootstrap files are installed only by explicit `code-butler init`.
 
-Use `watch status` to confirm whether the per-project macOS launchd job is
-installed. Background refresh is opt-in; Code Butler does not silently install
-a daemon when MCP starts or when a project is opened.
+Use `watch status` to confirm whether the per-project background watcher is
+installed. Code Butler does not silently install a daemon when MCP starts or
+when a project is opened; installation happens during explicit
+`code-butler init`.
 
 Remove the watcher:
 

@@ -31,6 +31,8 @@
     "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "docs:dev": "vitepress docs --host 127.0.0.1",
+    "docs:build": "vitepress build docs",
     "serve": "node dist/server.js",
     "prepack": "npm run build",
     "prepublishOnly": "npm run typecheck && npm test"
@@ -46,6 +48,7 @@
     "@types/node": "^24.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.8.0",
+    "vitepress": "^1.6.4",
     "vitest": "^3.2.0"
   }
 }
