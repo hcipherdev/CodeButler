@@ -1,0 +1,1574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Code Butler — Architecture</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@300;400;500&display=swap');
+
+  :root {
+    --bg:        #0a0b0f;
+    --bg2:       #111318;
+    --bg3:       #191c23;
+    --border:    #252830;
+    --muted:     #454a58;
+    --text:      #c8cdd8;
+    --bright:    #ebedf2;
+    --accent:    #5b8cff;
+    --accent2:   #a259ff;
+    --green:     #3ddba1;
+    --orange:    #ff8c42;
+    --red:       #ff5f6d;
+    --yellow:    #f5c842;
+    --cyan:      #42d4f5;
+    --glow:      rgba(91,140,255,0.18);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── noise grain overlay ── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+    pointer-events: none; z-index: 9999; opacity: 0.4;
+  }
+
+  /* ── page header ── */
+  header {
+    padding: 48px 64px 32px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: flex-end; justify-content: space-between;
+    gap: 24px;
+  }
+  .logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800; font-size: 28px;
+    color: var(--bright);
+    letter-spacing: -0.5px;
+  }
+  .logo span { color: var(--accent); }
+  .subtitle {
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-top: 4px;
+  }
+  .badge {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 6px 16px;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+  }
+  .badge b { color: var(--accent); font-weight: 500; }
+
+  /* ── main canvas ── */
+  main {
+    padding: 48px 64px;
+    display: flex; flex-direction: column; gap: 48px;
+  }
+
+  /* ── section title ── */
+  .section-label {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.2em;
+    color: var(--muted);
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 24px;
+  }
+  .section-label::after {
+    content: '';
+    flex: 1; height: 1px;
+    background: linear-gradient(to right, var(--border), transparent);
+  }
+
+  /* ══════════════════════════════
+     PIPELINE FLOW
+  ══════════════════════════════ */
+  .pipeline {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    overflow-x: auto;
+    padding-bottom: 8px;
+  }
+
+  .pipe-stage {
+    flex: 1; min-width: 150px;
+    position: relative;
+    display: flex; flex-direction: column;
+    gap: 0;
+  }
+
+  .pipe-stage + .pipe-stage::before {
+    content: '';
+    position: absolute; left: -1px; top: 32px; bottom: 32px; width: 1px;
+    background: linear-gradient(to bottom, transparent, var(--border) 30%, var(--border) 70%, transparent);
+    z-index: 1;
+  }
+
+  .stage-header {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-right: none;
+    padding: 14px 18px;
+    display: flex; align-items: center; gap: 10px;
+    position: relative;
+  }
+  .pipe-stage:first-child .stage-header { border-radius: 8px 0 0 0; }
+  .pipe-stage:last-child  .stage-header { border-right: 1px solid var(--border); border-radius: 0 8px 0 0; }
+
+  .stage-num {
+    width: 22px; height: 22px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Syne', sans-serif; font-weight: 800; font-size: 10px;
+    flex-shrink: 0;
+  }
+  .stage-title {
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 12px;
+    color: var(--bright); letter-spacing: 0.04em;
+  }
+
+  .stage-body {
+    border: 1px solid var(--border);
+    border-top: none; border-right: none;
+    background: var(--bg2);
+    flex: 1; padding: 16px 18px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .pipe-stage:last-child .stage-body { border-right: 1px solid var(--border); border-radius: 0 0 8px 0; }
+  .pipe-stage:first-child .stage-body { border-radius: 0 0 0 8px; }
+
+  .stage-item {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--text);
+  }
+  .stage-item .dot {
+    width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+  }
+
+  /* flow arrow between stages */
+  .pipe-arrow {
+    display: flex; align-items: center; padding: 0 2px; flex-shrink: 0;
+    position: relative; z-index: 2;
+  }
+  .pipe-arrow svg { color: var(--accent); opacity: 0.7; }
+
+  /* ══════════════════════════════
+     LAYER STACK (central diagram)
+  ══════════════════════════════ */
+  .arch-grid {
+    display: grid;
+    grid-template-columns: 240px 1fr 280px;
+    gap: 24px;
+    align-items: start;
+  }
+
+  /* left column: sources */
+  .sources-col { display: flex; flex-direction: column; gap: 10px; }
+
+  .source-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    display: flex; align-items: center; gap: 12px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+  .source-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 18px var(--glow);
+  }
+  .source-icon {
+    width: 32px; height: 32px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; flex-shrink: 0;
+  }
+  .source-name {
+    font-family: 'Syne', sans-serif; font-weight: 600; font-size: 13px;
+    color: var(--bright);
+  }
+  .source-desc { font-size: 11px; color: var(--muted); }
+
+  /* center: layered stack */
+  .layers-stack { display: flex; flex-direction: column; gap: 4px; position: relative; }
+
+  .layer {
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+  .layer:hover { border-color: var(--layer-color, var(--accent)); }
+
+  .layer-head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px;
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    user-select: none;
+  }
+  .layer-head::-webkit-details-marker { display: none; }
+
+  .layer-icon {
+    width: 28px; height: 28px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; flex-shrink: 0;
+  }
+  .layer-title {
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 13px;
+    color: var(--bright); flex: 1;
+  }
+  .layer-subtitle { font-size: 11px; color: var(--muted); }
+  .layer-toggle {
+    color: var(--muted); font-size: 10px;
+    transition: transform 0.2s;
+  }
+  details.layer[open] .layer-toggle { transform: rotate(180deg); }
+
+  .layer-body {
+    background: var(--bg2);
+    padding: 16px 20px;
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 8px 16px;
+  }
+  .layer-item {
+    display: flex; align-items: flex-start; gap: 8px;
+    font-size: 12px; color: var(--text);
+  }
+  .layer-item .dot { width: 5px; height: 5px; border-radius: 50%; margin-top: 5px; flex-shrink: 0; }
+
+  /* right column: MCP tools */
+  .mcp-col { display: flex; flex-direction: column; gap: 8px; }
+  .mcp-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 13px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    cursor: default;
+  }
+  .mcp-card:hover {
+    border-color: var(--accent2);
+    box-shadow: 0 0 14px rgba(162,89,255,0.15);
+  }
+  .mcp-tool-name {
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.03em;
+    margin-bottom: 2px;
+  }
+  .mcp-tool-desc { font-size: 10px; color: var(--muted); line-height: 1.4; }
+  .mcp-group-label {
+    font-family: 'Syne', sans-serif;
+    font-size: 10px; font-weight: 700;
+    color: var(--muted); letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 6px 0 2px;
+  }
+
+  /* ══════════════════════════════
+     STORAGE SCHEMA
+  ══════════════════════════════ */
+  .storage-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 12px;
+  }
+  .table-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+  .table-card:hover { border-color: var(--green); }
+  .table-head {
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 14px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .table-name {
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 12px;
+    color: var(--bright);
+  }
+  .table-tag {
+    margin-left: auto;
+    font-size: 9px; letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 2px 7px; border-radius: 4px;
+    background: var(--bg); color: var(--muted);
+  }
+  .table-fields {
+    padding: 10px 14px;
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  .field-row {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px;
+  }
+  .field-name { color: var(--text); }
+  .field-type { color: var(--muted); font-size: 10px; }
+  .field-pk { color: var(--yellow); font-size: 10px; }
+
+  /* ══════════════════════════════
+     DETERMINISTIC TRIGGERS TABLE
+  ══════════════════════════════ */
+  .trigger-table {
+    border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+    width: 100%;
+  }
+  .trigger-table thead tr { background: var(--bg3); }
+  .trigger-table th {
+    padding: 12px 18px;
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 11px;
+    color: var(--muted); text-align: left; text-transform: uppercase; letter-spacing: 0.1em;
+    border-bottom: 1px solid var(--border);
+  }
+  .trigger-table td {
+    padding: 11px 18px;
+    font-size: 12px; color: var(--text);
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  .trigger-table tbody tr:last-child td { border-bottom: none; }
+  .trigger-table tbody tr:hover td { background: var(--bg3); }
+  .code { color: var(--accent); font-size: 11px; }
+  .promoted { color: var(--green); font-size: 11px; }
+  .candidate { color: var(--orange); font-size: 11px; }
+  .mem-type {
+    display: inline-block;
+    padding: 2px 8px; border-radius: 4px;
+    font-size: 10px; letter-spacing: 0.06em;
+    font-weight: 500;
+  }
+  .mem-decision    { background: rgba(91,140,255,0.12); color: var(--accent); }
+  .mem-constraint  { background: rgba(61,219,161,0.12); color: var(--green); }
+  .mem-bugfix      { background: rgba(245,200,66,0.12); color: var(--yellow); }
+  .mem-rejected    { background: rgba(255,95,109,0.12); color: var(--red); }
+  .mem-generic     { background: rgba(255,140,66,0.12); color: var(--orange); }
+  .mem-temporary   { background: rgba(66,212,245,0.12); color: var(--cyan); }
+
+  /* ══════════════════════════════
+     FILE MAP
+  ══════════════════════════════ */
+  .file-map {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 10px;
+  }
+  .file-row {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 14px;
+    display: flex; align-items: flex-start; gap: 10px;
+    transition: border-color 0.2s;
+  }
+  .file-row:hover { border-color: var(--accent); }
+  .file-path {
+    font-size: 11px; color: var(--accent); flex-shrink: 0;
+    line-height: 1.8;
+  }
+  .file-desc { font-size: 11px; color: var(--muted); line-height: 1.5; }
+
+  /* ══════════════════════════════
+     INVESTIGATION FLOW
+  ══════════════════════════════ */
+  .inv-flow {
+    display: flex; align-items: center; gap: 0;
+    overflow-x: auto;
+    padding: 4px 0;
+  }
+  .inv-node {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 18px;
+    min-width: 160px; text-align: center;
+    flex-shrink: 0;
+    position: relative;
+  }
+  .inv-node:hover { border-color: var(--accent2); }
+  .inv-node-icon { font-size: 22px; margin-bottom: 8px; }
+  .inv-node-title {
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 12px;
+    color: var(--bright); margin-bottom: 4px;
+  }
+  .inv-node-desc { font-size: 11px; color: var(--muted); line-height: 1.4; }
+  .inv-sep {
+    flex-shrink: 0; padding: 0 8px;
+    color: var(--muted); font-size: 18px;
+  }
+  .inv-branch {
+    display: flex; flex-direction: column; gap: 8px;
+    flex-shrink: 0;
+  }
+  .inv-branch-label {
+    font-size: 10px; color: var(--muted); text-align: center;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    margin-bottom: 2px;
+  }
+  .inv-node-small {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 14px;
+    font-size: 11px; color: var(--text);
+    white-space: nowrap;
+    transition: border-color 0.2s;
+  }
+  .inv-node-small:hover { border-color: var(--accent2); }
+
+  /* ══════════════════════════════
+     CONFIG CALLOUT
+  ══════════════════════════════ */
+  .config-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 24px;
+  }
+  .config-section {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden;
+  }
+  .config-head {
+    background: var(--bg3); border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 12px;
+    color: var(--bright); display: flex; align-items: center; gap: 8px;
+  }
+  .config-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .config-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .config-key { font-size: 12px; color: var(--text); }
+  .config-val { font-size: 11px; color: var(--accent); text-align: right; max-width: 180px; word-break: break-all; }
+  .config-bool-on  { color: var(--green); }
+  .config-bool-off { color: var(--muted); }
+
+  /* ══════════════════════════════
+     PROMOTION LOGIC
+  ══════════════════════════════ */
+  .promo-flow {
+    display: flex; align-items: center; gap: 16px;
+    flex-wrap: wrap;
+  }
+  .promo-box {
+    flex: 1; min-width: 180px;
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px 20px;
+  }
+  .promo-box-title {
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 12px;
+    color: var(--bright); margin-bottom: 10px;
+  }
+  .promo-item { font-size: 12px; color: var(--text); margin-bottom: 6px; display: flex; gap: 8px; }
+  .promo-arrow {
+    font-size: 24px; color: var(--muted); flex-shrink: 0;
+    display: flex; align-items: center;
+  }
+
+  /* ══════════════════════════════
+     GLOBAL LAUNCHER
+  ══════════════════════════════ */
+  .launcher-flow {
+    display: flex; align-items: center; gap: 12px;
+    flex-wrap: wrap;
+  }
+  .launcher-step {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 18px;
+    min-width: 140px; text-align: center;
+    flex-shrink: 0;
+  }
+  .launcher-step-title {
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 12px;
+    color: var(--bright); margin-bottom: 4px;
+  }
+  .launcher-step-desc { font-size: 11px; color: var(--muted); }
+  .launcher-arrow { color: var(--muted); font-size: 18px; flex-shrink: 0; }
+
+  /* ══════════════════════════════
+     SCROLLBAR
+  ══════════════════════════════ */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* ══════════════════════════════
+     ANIMATIONS
+  ══════════════════════════════ */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .anim { animation: fadeUp 0.5s ease both; }
+  .anim-1 { animation-delay: 0.05s; }
+  .anim-2 { animation-delay: 0.12s; }
+  .anim-3 { animation-delay: 0.20s; }
+  .anim-4 { animation-delay: 0.28s; }
+  .anim-5 { animation-delay: 0.36s; }
+  .anim-6 { animation-delay: 0.44s; }
+  .anim-7 { animation-delay: 0.52s; }
+  .anim-8 { animation-delay: 0.60s; }
+  .anim-9 { animation-delay: 0.68s; }
+
+  /* ══════════════════════════════
+     RESPONSIVE
+  ══════════════════════════════ */
+  @media (max-width: 1100px) {
+    header, main { padding-left: 28px; padding-right: 28px; }
+    .arch-grid { grid-template-columns: 1fr; }
+    .config-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="logo">code<span>butler</span></div>
+    <div class="subtitle">Local-First Project Memory System — Architecture Overview</div>
+  </div>
+  <div class="badge">SQLite · MCP · TypeScript · <b>9 layers</b> · <b>18 tools</b></div>
+</header>
+
+<main>
+
+  <!-- ─── SYNC PIPELINE ─────────────────────────────────── -->
+  <section class="anim anim-1">
+    <div class="section-label">Sync Pipeline</div>
+    <div class="pipeline">
+
+      <div class="pipe-stage">
+        <div class="stage-header" style="border-radius:8px 0 0 0">
+          <div class="stage-num" style="background:rgba(91,140,255,.15);color:var(--accent)">1</div>
+          <div class="stage-title">Sources</div>
+        </div>
+        <div class="stage-body" style="border-radius:0 0 0 8px">
+          <div class="stage-item"><div class="dot" style="background:var(--accent)"></div>Git commits + diffs</div>
+          <div class="stage-item"><div class="dot" style="background:var(--accent)"></div>Codex session logs</div>
+          <div class="stage-item"><div class="dot" style="background:var(--accent)"></div>Claude conversation logs</div>
+          <div class="stage-item"><div class="dot" style="background:var(--accent)"></div>Manual conversation files</div>
+          <div class="stage-item"><div class="dot" style="background:var(--accent)"></div>Manual decision records</div>
+        </div>
+      </div>
+
+      <div class="pipe-arrow">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M4 10h12M12 6l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="pipe-stage">
+        <div class="stage-header">
+          <div class="stage-num" style="background:rgba(61,219,161,.12);color:var(--green)">2</div>
+          <div class="stage-title">Raw Ingest</div>
+        </div>
+        <div class="stage-body">
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Import new evidence</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Chunk source text</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Store commits + diffs</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>FTS-index content</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Advance sync cursor</div>
+        </div>
+      </div>
+
+      <div class="pipe-arrow">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M4 10h12M12 6l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="pipe-stage">
+        <div class="stage-header">
+          <div class="stage-num" style="background:rgba(245,200,66,.12);color:var(--yellow)">3</div>
+          <div class="stage-title">Deterministic</div>
+        </div>
+        <div class="stage-body">
+          <div class="stage-item"><div class="dot" style="background:var(--yellow)"></div><code class="code">remember this decision:</code></div>
+          <div class="stage-item"><div class="dot" style="background:var(--yellow)"></div><code class="code">remember this constraint:</code></div>
+          <div class="stage-item"><div class="dot" style="background:var(--yellow)"></div><code class="code">remember this bug fix:</code></div>
+          <div class="stage-item"><div class="dot" style="background:var(--yellow)"></div><code class="code">remember this rejected approach:</code></div>
+          <div class="stage-item"><div class="dot" style="background:var(--yellow)"></div>ADR / test / config / doc files</div>
+        </div>
+      </div>
+
+      <div class="pipe-arrow">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M4 10h12M12 6l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="pipe-stage">
+        <div class="stage-header">
+          <div class="stage-num" style="background:rgba(66,212,245,.12);color:var(--cyan)">4</div>
+          <div class="stage-title">Temporary</div>
+        </div>
+        <div class="stage-body">
+          <div class="stage-item"><div class="dot" style="background:var(--cyan)"></div>Task state extraction</div>
+          <div class="stage-item"><div class="dot" style="background:var(--cyan)"></div>Working hypotheses</div>
+          <div class="stage-item"><div class="dot" style="background:var(--cyan)"></div>Open questions</div>
+          <div class="stage-item"><div class="dot" style="background:var(--cyan)"></div>User instructions</div>
+          <div class="stage-item"><div class="dot" style="background:var(--cyan)"></div>TTL-scoped, auto-expires</div>
+        </div>
+      </div>
+
+      <div class="pipe-arrow">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M4 10h12M12 6l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="pipe-stage">
+        <div class="stage-header">
+          <div class="stage-num" style="background:rgba(162,89,255,.12);color:var(--accent2)">5</div>
+          <div class="stage-title">LLM Extract</div>
+        </div>
+        <div class="stage-body">
+          <div class="stage-item"><div class="dot" style="background:var(--accent2)"></div>Optional (needs API key)</div>
+          <div class="stage-item"><div class="dot" style="background:var(--accent2)"></div>OpenAI-compatible provider</div>
+          <div class="stage-item"><div class="dot" style="background:var(--accent2)"></div>Anthropic AWS provider</div>
+          <div class="stage-item"><div class="dot" style="background:var(--accent2)"></div>Extracts memory candidates</div>
+          <div class="stage-item"><div class="dot" style="background:var(--accent2)"></div>Skipped if no key set</div>
+        </div>
+      </div>
+
+      <div class="pipe-arrow">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M4 10h12M12 6l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="pipe-stage">
+        <div class="stage-header">
+          <div class="stage-num" style="background:rgba(255,95,109,.12);color:var(--red)">6</div>
+          <div class="stage-title">Promotion</div>
+        </div>
+        <div class="stage-body">
+          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Confidence ≥ 0.85</div>
+          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>≥ 2 source categories</div>
+          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Quality gate (active/review/quarantine)</div>
+          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Citation resolution + trust scoring</div>
+          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Candidate → Memory</div>
+        </div>
+      </div>
+
+      <div class="pipe-arrow">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+          <path d="M4 10h12M12 6l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+
+      <div class="pipe-stage">
+        <div class="stage-header" style="border-radius:0 8px 0 0">
+          <div class="stage-num" style="background:rgba(255,140,66,.12);color:var(--orange)">7</div>
+          <div class="stage-title">MCP / CLI</div>
+        </div>
+        <div class="stage-body" style="border-radius:0 0 8px 0">
+          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>18 MCP tools exposed</div>
+          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate</div>
+          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Memory health + doctor</div>
+          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Project narrative summaries</div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ─── GLOBAL MCP LAUNCHER ────────────────────────────── -->
+  <section class="anim anim-2">
+    <div class="section-label">Global MCP Launcher — Project Root Resolution</div>
+    <div class="launcher-flow">
+      <div class="launcher-step">
+        <div class="launcher-step-title">--project-root</div>
+        <div class="launcher-step-desc">Explicit path flag</div>
+      </div>
+      <div class="launcher-arrow">→</div>
+      <div class="launcher-step">
+        <div class="launcher-step-title">ENV var</div>
+        <div class="launcher-step-desc">CODE_BUTLER_PROJECT_ROOT</div>
+      </div>
+      <div class="launcher-arrow">→</div>
+      <div class="launcher-step">
+        <div class="launcher-step-title">Git discovery</div>
+        <div class="launcher-step-desc">Walk up to .git root</div>
+      </div>
+      <div class="launcher-arrow">→</div>
+      <div class="launcher-step">
+        <div class="launcher-step-title">--init-here</div>
+        <div class="launcher-step-desc">Use cwd (no Git)</div>
+      </div>
+      <div class="launcher-arrow">→</div>
+      <div class="launcher-step" style="border-color:var(--green)">
+        <div class="launcher-step-title" style="color:var(--green)">Project Root</div>
+        <div class="launcher-step-desc">Auto-init .code-butler/</div>
+      </div>
+    </div>
+    <div style="margin-top:12px;font-size:11px;color:var(--muted);padding-left:4px">
+      <code class="code">code-butler mcp</code> resolves project root once, auto-creates config.json + memory.sqlite + .gitignore, then starts MCP server scoped to that project.<br>
+      <code class="code">code-butler init</code> runs full setup: generates project summary, writes AGENTS.md/CLAUDE.md, and installs the background watcher service.
+    </div>
+  </section>
+
+  <!-- ─── BACKGROUND WATCHER ─────────────────────────────── -->
+  <section class="anim anim-3">
+    <div class="section-label">Background Watcher — src/watch-service.ts</div>
+    <div class="launcher-flow">
+      <div class="launcher-step">
+        <div class="launcher-step-title">code-butler init</div>
+        <div class="launcher-step-desc">Setup + auto-install</div>
+      </div>
+      <div class="launcher-arrow">→</div>
+      <div class="launcher-step">
+        <div class="launcher-step-title">Platform detect</div>
+        <div class="launcher-step-desc">darwin / linux / win32</div>
+      </div>
+      <div class="launcher-arrow">→</div>
+      <div class="launcher-step">
+        <div class="launcher-step-title">Service install</div>
+        <div class="launcher-step-desc">launchd · systemd · Task Scheduler</div>
+      </div>
+      <div class="launcher-arrow">→</div>
+      <div class="launcher-step">
+        <div class="launcher-step-title">Periodic sync</div>
+        <div class="launcher-step-desc">Runs code-butler sync on interval</div>
+      </div>
+      <div class="launcher-arrow">→</div>
+      <div class="launcher-step" style="border-color:var(--green)">
+        <div class="launcher-step-title" style="color:var(--green)">Always Fresh</div>
+        <div class="launcher-step-desc">Memory stays current</div>
+      </div>
+    </div>
+    <div style="margin-top:12px;font-size:11px;color:var(--muted);padding-left:4px">
+      <code class="code">watch install</code> is hidden from CLI help (triggered by init). <code class="code">watch status</code> and <code class="code">watch uninstall</code> remain user-facing.
+    </div>
+  </section>
+
+  <!-- ─── ARCHITECTURE LAYERS + SOURCES + MCP ─────────── -->
+  <section class="anim anim-4">
+    <div class="section-label">System Layers</div>
+    <div class="arch-grid">
+
+      <!-- LEFT: Sources -->
+      <div>
+        <div class="section-label" style="font-size:10px;margin-bottom:14px">Input Sources</div>
+        <div class="sources-col">
+          <div class="source-card">
+            <div class="source-icon" style="background:rgba(91,140,255,.12)">⬡</div>
+            <div>
+              <div class="source-name">Git</div>
+              <div class="source-desc">Commits, changed files, diff snippets (max 12k chars)</div>
+            </div>
+          </div>
+          <div class="source-card">
+            <div class="source-icon" style="background:rgba(61,219,161,.12)">◈</div>
+            <div>
+              <div class="source-name">Codex Logs</div>
+              <div class="source-desc">~/.codex/archived_sessions — conversation turns</div>
+            </div>
+          </div>
+          <div class="source-card">
+            <div class="source-icon" style="background:rgba(162,89,255,.12)">◎</div>
+            <div>
+              <div class="source-name">Claude Logs</div>
+              <div class="source-desc">~/.claude/projects — conversation turns</div>
+            </div>
+          </div>
+          <div class="source-card">
+            <div class="source-icon" style="background:rgba(245,200,66,.12)">⬙</div>
+            <div>
+              <div class="source-name">Manual Ingest</div>
+              <div class="source-desc">.md / .jsonl conversation files, imported via CLI</div>
+            </div>
+          </div>
+          <div class="source-card">
+            <div class="source-icon" style="background:rgba(255,140,66,.12)">⬕</div>
+            <div>
+              <div class="source-name">Manual Decisions</div>
+              <div class="source-desc">CLI-added or markdown-imported decision records</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CENTER: Layer stack -->
+      <div>
+        <div class="section-label" style="font-size:10px;margin-bottom:14px">Processing Layers</div>
+        <div class="layers-stack">
+
+          <details class="layer" open style="--layer-color:var(--accent)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(91,140,255,.12)">⬡</div>
+              <div class="layer-title">Sync Service</div>
+              <div class="layer-subtitle">src/sync/service.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Incremental sync orchestration</div>
+              <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Per-source cursor tracking</div>
+              <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Auto-sync on server start</div>
+              <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Runs deterministic → temporary → LLM chain</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--yellow)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(245,200,66,.12)">⚡</div>
+              <div class="layer-title">Deterministic Triggers</div>
+              <div class="layer-subtitle">src/deterministic/triggers.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Conversation directive parsing</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>No API key required</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Git file-change rules</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>ADR / test / config / doc facts</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--cyan)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(66,212,245,.12)">⏳</div>
+              <div class="layer-title">Temporary Memory</div>
+              <div class="layer-subtitle">src/deterministic/temporary.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Thread/session/project scoping</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>TTL-based auto-expiry (24h default)</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>6 kinds: task, question, hypothesis, test, file, instruction</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Prioritized in search results</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--accent2)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(162,89,255,.12)">🤖</div>
+              <div class="layer-title">LLM Extractor</div>
+              <div class="layer-subtitle">src/extract/openai.ts · anthropic-aws.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--accent2)"></div>OpenAI-compatible provider</div>
+              <div class="layer-item"><div class="dot" style="background:var(--accent2)"></div>Anthropic AWS provider</div>
+              <div class="layer-item"><div class="dot" style="background:var(--accent2)"></div>Optional — skipped if no key</div>
+              <div class="layer-item"><div class="dot" style="background:var(--accent2)"></div>Generates memory candidates</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--green)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(61,219,161,.12)">🗄</div>
+              <div class="layer-title">Storage Layer</div>
+              <div class="layer-subtitle">src/storage/store.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>SQLite at .code-butler/memory.sqlite</div>
+              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>FTS for sources, chunks, and temporary memories</div>
+              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Candidate + promoted durable memories</div>
+              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Quality metadata (status, reasons, verified_at)</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--cyan)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(66,212,245,.12)">🔬</div>
+              <div class="layer-title">Evidence & Quality</div>
+              <div class="layer-subtitle">src/evidence/citations.ts · src/memory/quality.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Citation resolution (commit, conversation, file)</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Trust summary scoring</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Quality assessment (active/needs_review/quarantined)</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Memory audit with auto-fix</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--red)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(255,95,109,.12)">📝</div>
+              <div class="layer-title">Project Summary</div>
+              <div class="layer-subtitle">src/project-summary/service.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Fingerprint-based change detection</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Daily refresh schedule</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Generates project-summary.md narrative</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Agent bootstrap hints (AGENTS.md / CLAUDE.md)</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--orange)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(255,140,66,.12)">🔌</div>
+              <div class="layer-title">MCP Server</div>
+              <div class="layer-subtitle">src/server.ts · src/mcp/tools.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>18 exposed tools</div>
+              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Global launcher via code-butler mcp</div>
+              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate, summarize</div>
+              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Memory health, doctor, project briefs</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--yellow)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(245,200,66,.12)">🩺</div>
+              <div class="layer-title">Doctor</div>
+              <div class="layer-subtitle">src/doctor/service.ts</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Health checks: storage, sync, sources, config</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Prioritized next-actions with commands</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>CLI: code-butler doctor [--json] [--strict]</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>MCP: run_doctor tool</div>
+            </div>
+          </details>
+
+        </div>
+      </div>
+
+      <!-- RIGHT: MCP Tools -->
+      <div>
+        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (18)</div>
+        <div class="mcp-col">
+          <div class="mcp-group-label">Search & Read</div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">current_project</div>
+            <div class="mcp-tool-desc">Report active project-local store</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">search_project_memory</div>
+            <div class="mcp-tool-desc">Search promoted memories + raw sources</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">read_memory_source</div>
+            <div class="mcp-tool-desc">Read raw stored source by id</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">find_memories</div>
+            <div class="mcp-tool-desc">Find promoted or candidate durable memories</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">find_decisions</div>
+            <div class="mcp-tool-desc">Find manual + promoted decisions</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">find_related_commits</div>
+            <div class="mcp-tool-desc">Search commits by query or file path</div>
+          </div>
+          <div class="mcp-group-label">Investigation</div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">explain_code_change</div>
+            <div class="mcp-tool-desc">Why a file changed (evidence-backed)</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">investigate_project_history</div>
+            <div class="mcp-tool-desc">Multi-step RLM investigation</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">summarize_recent_activity</div>
+            <div class="mcp-tool-desc">Activity from timestamped sources + Git</div>
+          </div>
+          <div class="mcp-group-label">Temporary Context</div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">search_temporary_memory</div>
+            <div class="mcp-tool-desc">Search unexpired working context</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">summarize_active_context</div>
+            <div class="mcp-tool-desc">Context for continuation/compaction</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">cleanup_temporary_memory</div>
+            <div class="mcp-tool-desc">Delete expired temporary context</div>
+          </div>
+          <div class="mcp-group-label">Sync & Summary</div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">sync_project_memory</div>
+            <div class="mcp-tool-desc">Run incremental sync from sources</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">summarize_project_state</div>
+            <div class="mcp-tool-desc">Counts and sync status</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">summarize_project_brief</div>
+            <div class="mcp-tool-desc">Read project narrative + freshness</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">refresh_project_summary</div>
+            <div class="mcp-tool-desc">Regenerate narrative summary</div>
+          </div>
+          <div class="mcp-group-label">Health & Quality</div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">summarize_memory_health</div>
+            <div class="mcp-tool-desc">Quality audit: active/review/quarantined counts</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">run_doctor</div>
+            <div class="mcp-tool-desc">Full health check with next-action recommendations</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ─── STORAGE SCHEMA ────────────────────────────────── -->
+  <section class="anim anim-5">
+    <div class="section-label">SQLite Schema — .code-butler/memory.sqlite</div>
+    <div class="storage-grid">
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">raw_sources</div>
+          <div class="table-tag">FTS</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">type</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">path</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">content</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">imported_at</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">source_chunks</div>
+          <div class="table-tag">FTS</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">source_id</span><span class="field-type">TEXT FK</span></div>
+          <div class="field-row"><span class="field-name">locator</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">text</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">role</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">git_commits</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">hash</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">message</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">author</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">timestamp</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">changed_files</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">diff_snippet</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">manual_decisions</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">topic</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">decision</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">reason</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">evidence</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">memory_candidates</div>
+          <div class="table-tag" style="color:var(--orange)">STAGING</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">type</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">content</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">confidence</span><span class="field-type">REAL</span></div>
+          <div class="field-row"><span class="field-name">evidence_refs</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">source_category</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">quality_status</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">quality_reasons_json</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">last_verified_at</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">memories</div>
+          <div class="table-tag" style="color:var(--green)">PROMOTED</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">type</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">content</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">confidence</span><span class="field-type">REAL</span></div>
+          <div class="field-row"><span class="field-name">promoted_at</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">evidence_refs</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">quality_status</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">quality_reasons_json</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">last_verified_at</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">temporary_memories</div>
+          <div class="table-tag" style="color:var(--cyan)">FTS + TTL</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">project_id</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">thread_id / session_id</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">kind</span><span class="field-type">TEXT (6 kinds)</span></div>
+          <div class="field-row"><span class="field-name">title / summary / details</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">confidence</span><span class="field-type">REAL</span></div>
+          <div class="field-row"><span class="field-name">expires_at</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">temporary_memory_links</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">memory_id</span><span class="field-type">TEXT FK</span></div>
+          <div class="field-row"><span class="field-name">target_type</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">target_id</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">locator</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">source_entity_relations</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name">source_id</span><span class="field-type">TEXT FK</span></div>
+          <div class="field-row"><span class="field-name">entity_type</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">entity_id</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">relation</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">sync_cursors</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">source</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">cursor</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">last_sync</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ─── DETERMINISTIC TRIGGERS ───────────────────────── -->
+  <section class="anim anim-6">
+    <div class="section-label">Deterministic Memory Triggers</div>
+    <table class="trigger-table">
+      <thead>
+        <tr>
+          <th>Source</th>
+          <th>Trigger Pattern</th>
+          <th>Memory Type</th>
+          <th>Promotion</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Conversation</td>
+          <td><code class="code">remember this decision:</code></td>
+          <td><span class="mem-type mem-decision">decision</span></td>
+          <td><span class="promoted">promoted immediately</span></td>
+        </tr>
+        <tr>
+          <td>Conversation</td>
+          <td><code class="code">remember this constraint:</code></td>
+          <td><span class="mem-type mem-constraint">constraint</span></td>
+          <td><span class="promoted">promoted immediately</span></td>
+        </tr>
+        <tr>
+          <td>Conversation</td>
+          <td><code class="code">remember this bug fix:</code></td>
+          <td><span class="mem-type mem-bugfix">bug_fix</span></td>
+          <td><span class="promoted">promoted immediately</span></td>
+        </tr>
+        <tr>
+          <td>Conversation</td>
+          <td><code class="code">remember this rejected approach:</code></td>
+          <td><span class="mem-type mem-rejected">rejected_approach</span></td>
+          <td><span class="promoted">promoted immediately</span></td>
+        </tr>
+        <tr>
+          <td>Conversation</td>
+          <td><code class="code">remember this:</code></td>
+          <td><span class="mem-type mem-generic">constraint</span></td>
+          <td><span class="candidate">candidate only</span></td>
+        </tr>
+        <tr>
+          <td>Conversation</td>
+          <td>Recent task state, hypotheses, questions, instructions</td>
+          <td><span class="mem-type mem-temporary">temporary (6 kinds)</span></td>
+          <td><span style="color:var(--cyan);font-size:11px">TTL-scoped (24h)</span></td>
+        </tr>
+        <tr>
+          <td>Git (file)</td>
+          <td><code class="code">docs/decisions/*.md, docs/adr/*.md, adr/*.md</code></td>
+          <td><span class="mem-type mem-decision">decision</span></td>
+          <td><span class="promoted">promoted immediately</span></td>
+        </tr>
+        <tr>
+          <td>Git (file)</td>
+          <td><code class="code">test files — it("...") / test("...")</code></td>
+          <td><span class="mem-type mem-constraint">constraint</span></td>
+          <td><span class="candidate">candidate</span></td>
+        </tr>
+        <tr>
+          <td>Git (file)</td>
+          <td><code class="code">package.json, tsconfig.json, .code-butler/config.json</code></td>
+          <td><span class="mem-type mem-generic">package/config fact</span></td>
+          <td><span class="candidate">candidate</span></td>
+        </tr>
+        <tr>
+          <td>Git (file)</td>
+          <td><code class="code">README.md, docs/*.md</code></td>
+          <td><span class="mem-type mem-generic">doc fact</span></td>
+          <td><span class="candidate">candidate</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ─── INVESTIGATION ENGINE ─────────────────────────── -->
+  <section class="anim anim-7">
+    <div class="section-label">Investigation Engine — src/investigate/history.ts</div>
+    <div class="inv-flow">
+      <div class="inv-node">
+        <div class="inv-node-icon">❓</div>
+        <div class="inv-node-title">Natural Language Question</div>
+        <div class="inv-node-desc">e.g. "Why did src/cache.ts change?"</div>
+      </div>
+      <div class="inv-sep">→</div>
+      <div class="inv-node">
+        <div class="inv-node-icon">⏳</div>
+        <div class="inv-node-title">Temporary Context</div>
+        <div class="inv-node-desc">Check unexpired working context first</div>
+      </div>
+      <div class="inv-sep">→</div>
+      <div class="inv-node">
+        <div class="inv-node-icon">🌱</div>
+        <div class="inv-node-title">Seed Memory</div>
+        <div class="inv-node-desc">Load raw/commit/memory evidence</div>
+      </div>
+      <div class="inv-sep">→</div>
+      <div class="inv-node">
+        <div class="inv-node-icon">🧠</div>
+        <div class="inv-node-title">RLM Planner</div>
+        <div class="inv-node-desc">Recursive typed action controller (Zod-validated)</div>
+      </div>
+      <div class="inv-sep">→</div>
+      <div class="inv-branch">
+        <div class="inv-branch-label">11 Actions</div>
+        <div class="inv-node-small">search_temporary_memory</div>
+        <div class="inv-node-small">search_memories</div>
+        <div class="inv-node-small">search_raw_sources</div>
+        <div class="inv-node-small">find_related_commits</div>
+        <div class="inv-node-small">read_source</div>
+        <div class="inv-node-small">read_conversation_window</div>
+        <div class="inv-node-small">read_commit</div>
+        <div class="inv-node-small">follow_evidence_refs</div>
+        <div class="inv-node-small">expand_entity_links</div>
+        <div class="inv-node-small">spawn_subinvestigation</div>
+        <div class="inv-node-small">finalize_answer</div>
+      </div>
+      <div class="inv-sep">→</div>
+      <div class="inv-node">
+        <div class="inv-node-icon">📋</div>
+        <div class="inv-node-title">Trace + Budget</div>
+        <div class="inv-node-desc">Depth, steps, branching limits; evidence scoring</div>
+      </div>
+      <div class="inv-sep">→</div>
+      <div class="inv-node">
+        <div class="inv-node-icon">✅</div>
+        <div class="inv-node-title">Answer</div>
+        <div class="inv-node-desc">Structured evidence-backed explanation</div>
+      </div>
+    </div>
+    <div style="margin-top:12px;font-size:11px;color:var(--muted);padding-left:4px">
+      Falls back to heuristic mode when RLM config is disabled or the provider is unavailable. Providers: OpenAI-compatible or Anthropic AWS.
+    </div>
+  </section>
+
+  <!-- ─── SOURCE FILE MAP ──────────────────────────────── -->
+  <section class="anim anim-8">
+    <div class="section-label">Source File Map</div>
+    <div class="file-map">
+      <div class="file-row">
+        <div class="file-path">src/cli.ts</div>
+        <div class="file-desc">CLI commands — init, config, ingest, decision, memory, doctor, sync, sources, watch, project-summary, hooks, mcp, serve</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/server.ts</div>
+        <div class="file-desc">MCP server entry point, auto-sync on start</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/project-root.ts</div>
+        <div class="file-desc">Project root resolution (flag → env → Git → cwd)</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/config.ts</div>
+        <div class="file-desc">Config creation, defaults, merging, global credentials, provider profiles, CODE_BUTLER_HOME</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/types.ts</div>
+        <div class="file-desc">All shared TypeScript types including RLM, temporary memory, providers</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/json.ts</div>
+        <div class="file-desc">JSON parsing utilities</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/mcp/tools.ts</div>
+        <div class="file-desc">MCP tool registration and handlers (18 tools)</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/sync/service.ts</div>
+        <div class="file-desc">Incremental sync orchestration across all sources</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/storage/store.ts</div>
+        <div class="file-desc">SQLite schema, persistence, FTS search, temporary memory, quality metadata, relations</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/doctor/service.ts</div>
+        <div class="file-desc">Health checks — storage, sync, sources, config; prioritized next-actions</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/evidence/citations.ts</div>
+        <div class="file-desc">Citation resolution, deduplication, trust summary scoring</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/memory/quality.ts</div>
+        <div class="file-desc">Memory quality assessment, audit with auto-fix, health summarization</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/watch-service.ts</div>
+        <div class="file-desc">Background watcher: launchd (macOS), systemd (Linux), Task Scheduler (Windows)</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/deterministic/triggers.ts</div>
+        <div class="file-desc">Rule-based durable memory extraction (no LLM)</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/deterministic/temporary.ts</div>
+        <div class="file-desc">Temporary working context extraction (TTL-scoped, 6 kinds)</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/sources/git.ts</div>
+        <div class="file-desc">Git source sync — commits, changed files, bounded diffs</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/sources/codex.ts</div>
+        <div class="file-desc">Codex + Claude conversation log sync</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/sources/claude.ts</div>
+        <div class="file-desc">Claude log source adapter</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/extract/openai.ts</div>
+        <div class="file-desc">OpenAI-compatible LLM extractor for memory candidates</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/extract/anthropic-aws.ts</div>
+        <div class="file-desc">Anthropic AWS LLM extractor for memory candidates</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/investigate/history.ts</div>
+        <div class="file-desc">Multi-step history investigation controller (RLM)</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/investigate/actions.ts</div>
+        <div class="file-desc">RLM action definitions and validation schemas (11 actions)</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/investigate/openai.ts</div>
+        <div class="file-desc">OpenAI-compatible LLM driver for investigation planner</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/investigate/anthropic-aws.ts</div>
+        <div class="file-desc">Anthropic AWS driver for investigation planner</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/project-summary/service.ts</div>
+        <div class="file-desc">Project narrative generation, fingerprinting, daily refresh</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/project-summary/providers.ts</div>
+        <div class="file-desc">LLM providers for summary generation (OpenAI, AWS)</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/providers/anthropic-aws.ts</div>
+        <div class="file-desc">AWS HTTP client for Anthropic API</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/decisions/store.ts</div>
+        <div class="file-desc">Manual decision add, import markdown, search logic</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/ingest/conversation.ts</div>
+        <div class="file-desc">Manual .md / .jsonl conversation file ingestion</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/ingest/git.ts</div>
+        <div class="file-desc">Manual git history import via CLI flag</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/search/fts.ts</div>
+        <div class="file-desc">Full-text search helpers over SQLite FTS tables</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── CONFIG OVERVIEW ──────────────────────────────── -->
+  <section class="anim anim-9">
+    <div class="section-label">Configuration — .code-butler/config.json</div>
+    <div class="config-grid">
+
+      <div class="config-section">
+        <div class="config-head">⬡ Sources</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">git.enabled</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">git.maxCommits</span><span class="config-val">200</span></div>
+          <div class="config-row"><span class="config-key">git.maxDiffChars</span><span class="config-val">12,000</span></div>
+          <div class="config-row"><span class="config-key">git.hookInstall</span><span class="config-val config-bool-off">false (manual)</span></div>
+          <div class="config-row"><span class="config-key">codex.roots</span><span class="config-val">~/.codex/archived_sessions</span></div>
+          <div class="config-row"><span class="config-key">codex.includeDefaultRoots</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">claude.roots</span><span class="config-val">~/.claude/projects</span></div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-head">⚡ Deterministic Triggers</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">enabled</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">promoteStrongSignals</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">conversationDirectives</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">gitChangedFiles</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">decisionFiles</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">testExpectations</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">packageAndConfigFacts</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">docsFacts</span><span class="config-val config-bool-on">true</span></div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-head">🤖 LLM Extractor</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">provider</span><span class="config-val">openai-compatible | anthropic-aws</span></div>
+          <div class="config-row"><span class="config-key">model</span><span class="config-val">gpt-5-mini (default)</span></div>
+          <div class="config-row"><span class="config-key">apiKeyEnv</span><span class="config-val">OPENAI_API_KEY</span></div>
+          <div class="config-row"><span class="config-key">baseUrl</span><span class="config-val">optional override</span></div>
+          <div class="config-row"><span class="config-key">profile</span><span class="config-val">named global profile</span></div>
+          <div class="config-row"><span class="config-key">fallback (no key)</span><span class="config-val config-bool-on">deterministic only</span></div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-head">🔑 Global Config — ~/.config/code-butler/</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">CODE_BUTLER_HOME</span><span class="config-val">override config dir</span></div>
+          <div class="config-row"><span class="config-key">global .env</span><span class="config-val">shared API keys</span></div>
+          <div class="config-row"><span class="config-key">profiles</span><span class="config-val">named provider configs</span></div>
+          <div class="config-row"><span class="config-key">defaults.extractorProfile</span><span class="config-val">default extractor profile</span></div>
+          <div class="config-row"><span class="config-key">defaults.investigatorProfile</span><span class="config-val">default investigator profile</span></div>
+          <div class="config-row"><span class="config-key">setup</span><span class="config-val">code-butler config global init</span></div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-head">📈 Promotion & Quality</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">confidenceThreshold</span><span class="config-val">0.85</span></div>
+          <div class="config-row"><span class="config-key">requireCommitAndConversation</span><span class="config-val config-bool-on">true</span></div>
+          <div class="config-row"><span class="config-key">minSourceCategories</span><span class="config-val">2</span></div>
+          <div class="config-row"><span class="config-key">qualityGate</span><span class="config-val">active / needs_review / quarantined</span></div>
+          <div class="config-row"><span class="config-key">autoSyncOnServerStart</span><span class="config-val config-bool-on">true</span></div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-head">🔍 Investigator</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">mode</span><span class="config-val">native-rlm</span></div>
+          <div class="config-row"><span class="config-key">provider</span><span class="config-val">openai-compatible | anthropic-aws</span></div>
+          <div class="config-row"><span class="config-key">maxDepth</span><span class="config-val">3</span></div>
+          <div class="config-row"><span class="config-key">maxSteps</span><span class="config-val">configurable</span></div>
+          <div class="config-row"><span class="config-key">maxBranching</span><span class="config-val">configurable</span></div>
+          <div class="config-row"><span class="config-key">topKPerSearch</span><span class="config-val">configurable</span></div>
+          <div class="config-row"><span class="config-key">evidenceThreshold</span><span class="config-val">configurable</span></div>
+          <div class="config-row"><span class="config-key">returnTrace</span><span class="config-val config-bool-on">true</span></div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-head">📝 Project Summary & Init</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">fingerprint</span><span class="config-val">SHA-256 of manifests+docs+inventory</span></div>
+          <div class="config-row"><span class="config-key">refresh</span><span class="config-val">daily (24h cooldown) + watcher</span></div>
+          <div class="config-row"><span class="config-key">output</span><span class="config-val">.code-butler/project-summary.md</span></div>
+          <div class="config-row"><span class="config-key">agent hints</span><span class="config-val">AGENTS.md, CLAUDE.md (explicit init)</span></div>
+          <div class="config-row"><span class="config-key">init flow</span><span class="config-val">summary → bootstrap → watch install</span></div>
+          <div class="config-row"><span class="config-key">fallback</span><span class="config-val">provider: "fallback" when no API key</span></div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+</main>
+
+<script>
+  // Toggle layer details on header click
+  document.querySelectorAll('details.layer summary').forEach(s => {
+    s.addEventListener('click', e => {
+      e.preventDefault();
+      const det = s.closest('details');
+      det.open = !det.open;
+    });
+  });
+
+  // Subtle hover glow on source cards
+  document.querySelectorAll('.source-card, .mcp-card, .table-card, .file-row, .inv-node').forEach(el => {
+    el.addEventListener('mouseenter', () => el.style.transition = 'all 0.2s');
+  });
+</script>
+
+</body>
+</html>
