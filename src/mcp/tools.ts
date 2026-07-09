@@ -8,6 +8,7 @@ import { runDoctor } from "../doctor/service.js";
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
 import { explainCodeChange, investigateProjectHistory } from "../investigate/history.js";
 import { summarizeMemoryHealth } from "../memory/quality.js";
+import { rememberProjectMemory } from "../memory/remember.js";
 import {
   readProjectBrief,
   refreshProjectSummary,
@@ -22,6 +23,7 @@ import type {
   EvidenceRef,
   MemoryQualityStatus,
   MemoryType,
+  MemorySearchResult,
   SearchResult,
   SourceType,
   SyncSourceName,
@@ -135,6 +137,17 @@ export interface ProjectMemoryToolHandlers {
   }): {
     results: ReturnType<MemoryStore["searchMemoryLayer"]>;
   };
+  remember_project_memory(input: {
+    type: MemoryType;
+    text: string;
+    title?: string;
+    reason?: string;
+    relatedFiles?: string[];
+    promote?: boolean;
+  }): {
+    sourceId: string;
+    memory: MemorySearchResult;
+  };
   find_decisions(input: { topic?: string; limit?: number }): ReturnType<typeof findDecisions>;
   find_related_commits(input: {
     query?: string;
@@ -225,6 +238,31 @@ export function createProjectMemoryToolHandlers(
     find_memories(input) {
       return {
         results: store.searchMemoryLayer(normalizeMemorySearchInput(input))
+      };
+    },
+    remember_project_memory(input) {
+      const remembered = rememberProjectMemory(
+        store,
+        normalizeRememberMemoryInput(input),
+        options.now === undefined ? {} : { now: options.now }
+      );
+      const memoryId = remembered.memory?.id ?? remembered.candidate.id;
+      const status = remembered.memory ? "promoted" : "candidate";
+      const memory = store
+        .searchMemoryLayer({
+          query: remembered.memory?.summary ?? remembered.candidate.summary,
+          type: remembered.memory?.type ?? remembered.candidate.type,
+          status,
+          qualityStatus: "all",
+          limit: 100
+        })
+        .find((result) => result.id === memoryId);
+      if (!memory) {
+        throw new Error(`Remembered memory could not be read back: ${memoryId}`);
+      }
+      return {
+        sourceId: remembered.sourceId,
+        memory
       };
     },
     find_decisions(input) {
@@ -346,6 +384,22 @@ export function registerProjectMemoryTools(
       }
     },
     async (input) => asJsonContent(handlers.find_memories(normalizeMemorySearchInput(input)))
+  );
+
+  server.registerTool(
+    "remember_project_memory",
+    {
+      description: "Store an explicit user-requested durable project memory without inspecting local database internals.",
+      inputSchema: {
+        type: memoryTypeSchema,
+        text: z.string().min(1),
+        title: z.string().min(1).optional(),
+        reason: z.string().min(1).optional(),
+        relatedFiles: z.array(z.string().min(1)).optional(),
+        promote: z.boolean().optional()
+      }
+    },
+    async (input) => asJsonContent(handlers.remember_project_memory(normalizeRememberMemoryInput(input)))
   );
 
   server.registerTool(
@@ -560,6 +614,39 @@ function normalizeMemorySearchInput(input: {
   if (input.status !== undefined) normalized.status = input.status;
   if (input.qualityStatus !== undefined) normalized.qualityStatus = input.qualityStatus;
   if (input.limit !== undefined) normalized.limit = input.limit;
+  return normalized;
+}
+
+function normalizeRememberMemoryInput(input: {
+  type: MemoryType;
+  text: string;
+  title?: string | undefined;
+  reason?: string | undefined;
+  relatedFiles?: string[] | undefined;
+  promote?: boolean | undefined;
+}): {
+  type: MemoryType;
+  text: string;
+  title?: string;
+  reason?: string;
+  relatedFiles?: string[];
+  promote?: boolean;
+} {
+  const normalized: {
+    type: MemoryType;
+    text: string;
+    title?: string;
+    reason?: string;
+    relatedFiles?: string[];
+    promote?: boolean;
+  } = {
+    type: input.type,
+    text: input.text
+  };
+  if (input.title !== undefined) normalized.title = input.title;
+  if (input.reason !== undefined) normalized.reason = input.reason;
+  if (input.relatedFiles !== undefined) normalized.relatedFiles = input.relatedFiles;
+  if (input.promote !== undefined) normalized.promote = input.promote;
   return normalized;
 }
 

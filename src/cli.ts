@@ -9,6 +9,7 @@ import { runDoctor } from "./doctor/service.js";
 import { parseConversationFile } from "./ingest/conversation.js";
 import { ingestGitRepository } from "./ingest/git.js";
 import { auditMemoryQuality } from "./memory/quality.js";
+import { rememberProjectMemory } from "./memory/remember.js";
 import {
   getProjectSummaryStatus,
   initializeProjectSummary,
@@ -24,7 +25,7 @@ import { startServer as startProjectMemoryServer, type ProjectMemoryServerOption
 import { getClaudeSourceStatus, getCodexSourceStatus } from "./sources/codex.js";
 import { openMemoryStore } from "./storage/store.js";
 import { syncProjectMemory } from "./sync/service.js";
-import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, SyncSourceName } from "./types.js";
+import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, MemoryType, SyncSourceName } from "./types.js";
 import {
   getWatchServiceStatus,
   installWatchService,
@@ -105,7 +106,7 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
     }
 
     if (command === "memory") {
-      return runMemory(rest, cwd, stdout);
+      return await runMemory(rest, cwd, stdout, { now: options.now });
     }
 
     if (command === "doctor") {
@@ -303,11 +304,57 @@ async function runDecision(args: string[], cwd: string, stdout: (line: string) =
   }
 }
 
-async function runMemory(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
+async function runMemory(
+  args: string[],
+  cwd: string,
+  stdout: (line: string) => void,
+  options: Pick<CliOptions, "now"> = {}
+): Promise<number> {
   const [subcommand, ...rest] = args;
-  if (subcommand !== "audit") {
-    throw new Error("Usage: code-butler memory audit [--fix] [--json]");
+  if (subcommand !== "audit" && subcommand !== "remember") {
+    throw new Error("Usage: code-butler memory <audit|remember> ...");
   }
+
+  if (subcommand === "remember") {
+    const type = parseMemoryTypeFlag(rest, "--type");
+    const text = parseStringFlag(rest, "--text");
+    const title = parseStringFlag(rest, "--title");
+    const reason = parseStringFlag(rest, "--reason");
+    const relatedFiles = parseRepeatedStringFlag(rest, "--related-file");
+    const promote = !rest.includes("--candidate");
+    const allowedFlags = new Set(["--type", "--text", "--title", "--reason", "--related-file", "--candidate"]);
+    const unknownFlag = rest.find((arg) => arg.startsWith("--") && !allowedFlags.has(arg));
+    if (unknownFlag) throw new Error(`Unknown memory remember option: ${unknownFlag}`);
+    if (!type || !text) {
+      throw new Error(
+        "Usage: code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate]"
+      );
+    }
+
+    const store = openMemoryStore(cwd);
+    store.init();
+    try {
+      const remembered = rememberProjectMemory(
+        store,
+        {
+          type,
+          text,
+          ...(title === undefined ? {} : { title }),
+          ...(reason === undefined ? {} : { reason }),
+          relatedFiles,
+          promote
+        },
+        options.now === undefined ? {} : { now: options.now }
+      );
+      const memoryId = remembered.memory?.id ?? remembered.candidate.id;
+      const state = remembered.memory ? "promoted" : "candidate";
+      stdout(`Remembered ${type} memory ${memoryId} (${state})`);
+      return 0;
+    } finally {
+      store.close();
+    }
+  }
+
   const fix = rest.includes("--fix");
   const json = rest.includes("--json");
   const unknownFlag = rest.find((arg) => arg.startsWith("--") && arg !== "--fix" && arg !== "--json");
@@ -654,6 +701,26 @@ function parseNumberFlag(args: string[], flag: string): number | undefined {
   return parsed;
 }
 
+function parseRepeatedStringFlag(args: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== flag) continue;
+    const value = args[index + 1];
+    if (!value) throw new Error(`${flag} requires a value`);
+    values.push(value);
+  }
+  return values;
+}
+
+function parseMemoryTypeFlag(args: string[], flag: string): MemoryType | undefined {
+  const value = parseStringFlag(args, flag);
+  if (value === undefined) return undefined;
+  if (value === "decision" || value === "constraint" || value === "bug_fix" || value === "rejected_approach") {
+    return value;
+  }
+  throw new Error(`${flag} must be one of decision, constraint, bug_fix, rejected_approach`);
+}
+
 function parseSyncSourceFlag(args: string[]): SyncSourceName | "all" {
   const source = (parseStringFlag(args, "--source") ?? "all") as SyncSourceName | "all";
   const validSources = new Set(["git", "codex", "claude", "all"]);
@@ -775,6 +842,7 @@ function usage(): string {
     "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",
     "  code-butler decision import <markdown-file>",
     "  code-butler memory audit [--fix] [--json]",
+    "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate]",
     "  code-butler doctor [--json] [--strict]",
     "  code-butler sync [--source <git|codex|claude|all>]",
     "  code-butler sources status",
