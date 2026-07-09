@@ -95,6 +95,89 @@ describe("deterministic memory triggers", () => {
     expect(result.promoteDedupeKeys).toEqual([]);
   });
 
+  it("extracts fuzzy remember directives with type synonyms and typos", () => {
+    const result = extractDeterministicMemories(
+      {
+        conversations: [
+          {
+            sourceId: "codex:session-2",
+            title: "session.jsonl",
+            rawContent: "",
+            chunks: [
+              {
+                chunkIndex: 0,
+                text: [
+                  "please remember this constrain in the code butler memory: Article templates must update datePublished before publishing.",
+                  "note this bug fix: Restarting the watcher clears stale cursors.",
+                  "save this rejected approach: Do not write raw SQL into the Butler database.",
+                  "remember this project rule: Run article_update.sh after editing articlelist.json."
+                ].join("\n"),
+                metadata: { role: "user" }
+              }
+            ]
+          }
+        ],
+        commits: []
+      },
+      { deterministic: baseConfig }
+    );
+
+    expect(result.memories).toEqual([
+      expect.objectContaining({
+        type: "constraint",
+        summary: "Article templates must update datePublished before publishing.",
+        confidence: 1
+      }),
+      expect.objectContaining({
+        type: "bug_fix",
+        summary: "Restarting the watcher clears stale cursors.",
+        confidence: 1
+      }),
+      expect.objectContaining({
+        type: "rejected_approach",
+        summary: "Do not write raw SQL into the Butler database.",
+        confidence: 1
+      }),
+      expect.objectContaining({
+        type: "constraint",
+        summary: "Run article_update.sh after editing articlelist.json.",
+        confidence: 1
+      })
+    ]);
+    expect(result.promoteDedupeKeys).toEqual([
+      "deterministic:conversation:codex:session-2:0",
+      "deterministic:conversation:codex:session-2:1",
+      "deterministic:conversation:codex:session-2:2",
+      "deterministic:conversation:codex:session-2:3"
+    ]);
+  });
+
+  it("ignores reported remember directives inside investigation prompts", () => {
+    const result = extractDeterministicMemories(
+      {
+        conversations: [
+          {
+            sourceId: "codex:session-3",
+            title: "session.jsonl",
+            rawContent: "",
+            chunks: [
+              {
+                chunkIndex: 0,
+                text: 'When I asked "remember this constraint: always update datePublished", why did Codex run so long?',
+                metadata: { role: "user" }
+              }
+            ]
+          }
+        ],
+        commits: []
+      },
+      { deterministic: baseConfig }
+    );
+
+    expect(result.memories).toHaveLength(0);
+    expect(result.promoteDedupeKeys).toEqual([]);
+  });
+
   it("extracts test expectation candidates from changed test files", () => {
     const result = extractDeterministicMemories(
       {

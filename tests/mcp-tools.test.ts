@@ -165,6 +165,82 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
+  it("remembers project memory with resolvable evidence through the MCP handler", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-07-09T20:00:00.000Z")
+    });
+
+    const remembered = handlers.remember_project_memory({
+      type: "constraint",
+      text: "Article templates must update datePublished to the current date before publishing.",
+      title: "Article templates update datePublished",
+      relatedFiles: ["main_web/article_update.sh"]
+    });
+
+    expect(remembered.memory).toMatchObject({
+      kind: "promoted",
+      type: "constraint",
+      title: "Article templates update datePublished",
+      summary: "Article templates must update datePublished to the current date before publishing.",
+      confidence: 1,
+      qualityStatus: "active",
+      citations: [
+        expect.objectContaining({
+          kind: "conversation",
+          resolved: true
+        }),
+        expect.objectContaining({
+          kind: "file",
+          sourceId: "main_web/article_update.sh"
+        })
+      ],
+      trust: expect.objectContaining({
+        status: "active",
+        resolvedEvidenceCount: 1,
+        unresolvedEvidenceCount: 0
+      })
+    });
+    expect(remembered.sourceId).toMatch(/^manual-memory:/);
+    expect(store.readSource(remembered.sourceId)?.rawContent).toContain("Article templates must update datePublished");
+    expect(handlers.find_memories({ query: "datePublished", status: "promoted", limit: 5 }).results[0]).toMatchObject({
+      id: remembered.memory.id,
+      kind: "promoted"
+    });
+
+    store.close();
+  });
+
+  it("keeps repeated remember_project_memory calls idempotent", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-07-09T20:00:00.000Z")
+    });
+    const input = {
+      type: "constraint" as const,
+      text: "Run article_update.sh after editing articlelist.json."
+    };
+
+    const first = handlers.remember_project_memory(input);
+    const second = handlers.remember_project_memory(input);
+
+    expect(second.memory.id).toBe(first.memory.id);
+    expect(store.listMemories({ status: "promoted", query: "article_update", limit: 10 })).toHaveLength(1);
+    expect(
+      store.db.prepare("select count(*) as count from sources where id = ?").get(first.sourceId)
+    ).toEqual({ count: 1 });
+
+    store.close();
+  });
+
   it("exposes project brief handlers without installing agent bootstrap files", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);

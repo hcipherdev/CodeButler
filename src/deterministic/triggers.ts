@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { cleanMemoryText, parseMemoryDirective, slugMemoryText, titleFromMemoryText } from "../memory/directives.js";
 import type {
   CommitRecord,
   EvidenceRef,
@@ -133,25 +134,7 @@ function splitDirectiveLines(text: string): string[] {
 }
 
 function parseDirective(line: string): Omit<DirectiveMatch, "locator"> | undefined {
-  const match = line.match(
-    /\bremember\s+this(?:\s+(decision|constraint|bug\s*fix|rejected\s+approach))?\s*:\s*(.+)$/i
-  );
-  if (!match?.[2]) return undefined;
-  const typeLabel = match[1]?.toLowerCase().replace(/\s+/g, " ");
-  const type = directiveType(typeLabel);
-  return {
-    type,
-    text: cleanSentence(match[2]),
-    typed: typeLabel !== undefined
-  };
-}
-
-function directiveType(label: string | undefined): MemoryType {
-  if (label === "decision") return "decision";
-  if (label === "constraint") return "constraint";
-  if (label === "bug fix") return "bug_fix";
-  if (label === "rejected approach") return "rejected_approach";
-  return "constraint";
+  return parseMemoryDirective(line);
 }
 
 function extractGitChangedFileMemories(
@@ -361,23 +344,13 @@ function normalizeFilePath(filePath: string): string {
 }
 
 function cleanSentence(value: string): string {
-  return value.trim().replace(/^["'`]+|["'`]+$/g, "");
+  return cleanMemoryText(value);
 }
 
 function titleFromText(value: string): string {
-  const firstLine = cleanSentence(value).split(/\r?\n/)[0] ?? "";
-  const firstSentence = firstLine.split(/(?<=[.!?])\s+/)[0] ?? firstLine;
-  const trimmed = firstSentence.replace(/[.!?:;]+$/g, "").trim();
-  const title = trimmed.length > 90 ? `${trimmed.slice(0, 87).trim()}...` : trimmed;
-  return title.charAt(0).toUpperCase() + title.slice(1);
+  return titleFromMemoryText(value);
 }
 
 function slug(value: string): string {
-  return (
-    value
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 80) || "memory"
-  );
+  return slugMemoryText(value);
 }

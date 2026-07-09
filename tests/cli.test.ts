@@ -534,6 +534,64 @@ describe("CLI", () => {
     after.close();
   });
 
+  it("remembers promoted project memory from the CLI", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const output: string[] = [];
+
+    await expect(
+      runCli(
+        [
+          "memory",
+          "remember",
+          "--type",
+          "constraint",
+          "--text",
+          "Article templates must update datePublished before publishing.",
+          "--title",
+          "Article template dates",
+          "--related-file",
+          "main_web/article_update.sh"
+        ],
+        {
+          cwd: rootDir,
+          stdout: (line) => output.push(line),
+          now: () => new Date("2026-07-09T20:00:00.000Z")
+        }
+      )
+    ).resolves.toBe(0);
+
+    expect(output.join("\n")).toContain("Remembered constraint memory");
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const memories = store.listMemories({ status: "promoted", query: "datePublished", limit: 5 });
+    expect(memories).toHaveLength(1);
+    expect(memories[0]).toMatchObject({
+      type: "constraint",
+      title: "Article template dates",
+      summary: "Article templates must update datePublished before publishing.",
+      source: "manual",
+      relatedFiles: ["main_web/article_update.sh"]
+    });
+    expect(store.readSource(memories[0]!.evidence[0]!.sourceId)?.rawContent).toContain("datePublished");
+    store.close();
+  });
+
+  it("rejects incomplete memory remember CLI input", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const errors: string[] = [];
+
+    await expect(
+      runCli(["memory", "remember", "--type", "constraint"], {
+        cwd: rootDir,
+        stderr: (line) => errors.push(line)
+      })
+    ).resolves.toBe(1);
+
+    expect(errors.join("\n")).toContain("Usage: code-butler memory remember --type");
+  });
+
   it("fixes memory quality audit findings when requested", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
