@@ -24,13 +24,14 @@ Agents can call tools such as:
 - `search_temporary_memory`
 - `search_project_memory`
 - `find_memories`
+- `remember_project_memory`
 - `explain_code_change`
 - `investigate_project_history`
 - `summarize_recent_activity`
 
 ## Recommended Agent Flow
 
-Start by syncing memory and reading the project brief. For continuation questions, summarize active context first. For file-specific questions, use code-change explanation and project memory search before editing.
+Start by syncing memory and reading the project brief. When the user asks to remember, save, or note a project memory, call `current_project`, then `remember_project_memory`, then verify with `find_memories`; do not inspect or write the SQLite database directly. For continuation questions, summarize active context first. For file-specific questions, use code-change explanation and project memory search before editing.
 
 ## See Also
 
