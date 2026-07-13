@@ -8,6 +8,8 @@ import { addDecision, importDecisionMarkdown } from "./decisions/store.js";
 import { runDoctor } from "./doctor/service.js";
 import { parseConversationFile } from "./ingest/conversation.js";
 import { ingestGitRepository } from "./ingest/git.js";
+import { auditMemoryConflicts } from "./memory/conflicts.js";
+import { updateMemoryStatus } from "./memory/lifecycle-service.js";
 import { auditMemoryQuality } from "./memory/quality.js";
 import { rememberProjectMemory } from "./memory/remember.js";
 import {
@@ -25,7 +27,7 @@ import { startServer as startProjectMemoryServer, type ProjectMemoryServerOption
 import { getClaudeSourceStatus, getCodexSourceStatus } from "./sources/codex.js";
 import { openMemoryStore } from "./storage/store.js";
 import { syncProjectMemory } from "./sync/service.js";
-import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, MemoryType, SyncSourceName } from "./types.js";
+import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, MemoryLifecycleStatus, MemoryType, SyncSourceName } from "./types.js";
 import {
   getWatchServiceStatus,
   installWatchService,
@@ -311,8 +313,8 @@ async function runMemory(
   options: Pick<CliOptions, "now"> = {}
 ): Promise<number> {
   const [subcommand, ...rest] = args;
-  if (subcommand !== "audit" && subcommand !== "remember") {
-    throw new Error("Usage: code-butler memory <audit|remember> ...");
+  if (subcommand !== "audit" && subcommand !== "remember" && subcommand !== "status" && subcommand !== "conflicts") {
+    throw new Error("Usage: code-butler memory <audit|remember|status|conflicts> ...");
   }
 
   if (subcommand === "remember") {
@@ -321,14 +323,23 @@ async function runMemory(
     const title = parseStringFlag(rest, "--title");
     const reason = parseStringFlag(rest, "--reason");
     const relatedFiles = parseRepeatedStringFlag(rest, "--related-file");
+    const supersedesMemoryId = parseStringFlag(rest, "--supersedes");
     const promote = !rest.includes("--candidate");
-    const allowedFlags = new Set(["--type", "--text", "--title", "--reason", "--related-file", "--candidate"]);
+    const allowedFlags = new Set(["--type", "--text", "--title", "--reason", "--related-file", "--candidate", "--supersedes"]);
     const unknownFlag = rest.find((arg) => arg.startsWith("--") && !allowedFlags.has(arg));
     if (unknownFlag) throw new Error(`Unknown memory remember option: ${unknownFlag}`);
+    validateFlagArguments(rest, {
+      command: "memory remember",
+      valueFlags: new Set(["--type", "--text", "--title", "--reason", "--related-file", "--supersedes"]),
+      booleanFlags: new Set(["--candidate"])
+    });
     if (!type || !text) {
       throw new Error(
-        "Usage: code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate]"
+        "Usage: code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>]"
       );
+    }
+    if (!promote && supersedesMemoryId !== undefined) {
+      throw new Error("Superseding a durable memory requires promotion");
     }
 
     const store = openMemoryStore(cwd);
@@ -342,13 +353,92 @@ async function runMemory(
           ...(title === undefined ? {} : { title }),
           ...(reason === undefined ? {} : { reason }),
           relatedFiles,
-          promote
+          promote,
+          ...(supersedesMemoryId === undefined ? {} : { supersedesMemoryId })
         },
         options.now === undefined ? {} : { now: options.now }
       );
       const memoryId = remembered.memory?.id ?? remembered.candidate.id;
       const state = remembered.memory ? "promoted" : "candidate";
       stdout(`Remembered ${type} memory ${memoryId} (${state})`);
+      return 0;
+    } finally {
+      store.close();
+    }
+  }
+
+  if (subcommand === "status") {
+    const allowedFlags = new Set(["--id", "--status", "--reason", "--replacement"]);
+    const unknownFlag = rest.find((arg) => arg.startsWith("--") && !allowedFlags.has(arg));
+    if (unknownFlag) throw new Error(`Unknown memory status option: ${unknownFlag}`);
+    validateFlagArguments(rest, {
+      command: "memory status",
+      valueFlags: allowedFlags,
+      booleanFlags: new Set()
+    });
+    const memoryId = parseStringFlag(rest, "--id");
+    const status = parseMemoryLifecycleStatusFlag(rest, "--status");
+    const rawReason = parseStringFlag(rest, "--reason");
+    const reason = rawReason?.trim();
+    const replacementMemoryId = parseStringFlag(rest, "--replacement");
+    if (!memoryId || !status || !reason) {
+      if (rawReason !== undefined && !reason) throw new Error("Lifecycle status reason is required");
+      throw new Error("Usage: code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]");
+    }
+    if (status === "superseded" && replacementMemoryId === undefined) {
+      throw new Error("Superseded status requires --replacement");
+    }
+    if (status !== "superseded" && replacementMemoryId !== undefined) {
+      throw new Error("--replacement is only allowed with superseded status");
+    }
+
+    const store = openMemoryStore(cwd);
+    store.init();
+    try {
+      const memory = updateMemoryStatus(store, {
+        memoryId,
+        status,
+        reason,
+        ...(replacementMemoryId === undefined ? {} : { replacementMemoryId }),
+        now: (options.now?.() ?? new Date()).toISOString()
+      });
+      const relationCount = store.listMemoryRelations().filter((relation) =>
+        relation.fromMemoryId === memory.id || relation.toMemoryId === memory.id
+      ).length;
+      stdout(`Memory ${memory.id} status=${memory.lifecycleStatus} replacement=${replacementMemoryId ?? "none"} relations=${relationCount}`);
+      return 0;
+    } finally {
+      store.close();
+    }
+  }
+
+  if (subcommand === "conflicts") {
+    const allowedFlags = new Set(["--fix", "--json"]);
+    const unknownFlag = rest.find((arg) => arg.startsWith("--") && !allowedFlags.has(arg));
+    if (unknownFlag) throw new Error(`Unknown memory conflicts option: ${unknownFlag}`);
+    validateFlagArguments(rest, {
+      command: "memory conflicts",
+      valueFlags: new Set(),
+      booleanFlags: allowedFlags
+    });
+    const fix = rest.includes("--fix");
+    const json = rest.includes("--json");
+    const store = openMemoryStore(cwd);
+    store.init();
+    try {
+      const result = auditMemoryConflicts(store, {
+        fix,
+        ...(options.now === undefined ? {} : { now: options.now().toISOString() })
+      });
+      if (json) {
+        stdout(JSON.stringify(result, null, 2));
+        return 0;
+      }
+      const additions = result.changes.filter((change) => change.kind === "add_relation").length;
+      const removals = result.changes.filter((change) => change.kind === "remove_relation").length;
+      const updates = result.changes.filter((change) => change.kind === "update_quality").length;
+      stdout("Memory Conflicts");
+      stdout(`scanned=${result.scannedMemories} groups=${result.scannedGroups} conflicts=${result.conflictPairs.length} add=${additions} remove=${removals} change=${updates} applied=${fix ? "yes" : "no"}`);
       return 0;
     } finally {
       store.close();
@@ -721,6 +811,30 @@ function parseMemoryTypeFlag(args: string[], flag: string): MemoryType | undefin
   throw new Error(`${flag} must be one of decision, constraint, bug_fix, rejected_approach`);
 }
 
+function parseMemoryLifecycleStatusFlag(args: string[], flag: string): MemoryLifecycleStatus | undefined {
+  const value = parseStringFlag(args, flag);
+  if (value === undefined) return undefined;
+  if (value === "current" || value === "superseded" || value === "retracted") return value;
+  throw new Error(`${flag} must be one of current, superseded, retracted`);
+}
+
+function validateFlagArguments(
+  args: string[],
+  input: { command: string; valueFlags: Set<string>; booleanFlags: Set<string> }
+): void {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index] as string;
+    if (input.booleanFlags.has(argument)) continue;
+    if (!input.valueFlags.has(argument)) {
+      if (!argument.startsWith("--")) throw new Error(`Unexpected ${input.command} argument: ${argument}`);
+      continue;
+    }
+    const value = args[index + 1];
+    if (value === undefined || value.startsWith("--")) throw new Error(`${argument} requires a value`);
+    index += 1;
+  }
+}
+
 function parseSyncSourceFlag(args: string[]): SyncSourceName | "all" {
   const source = (parseStringFlag(args, "--source") ?? "all") as SyncSourceName | "all";
   const validSources = new Set(["git", "codex", "claude", "all"]);
@@ -842,7 +956,9 @@ function usage(): string {
     "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",
     "  code-butler decision import <markdown-file>",
     "  code-butler memory audit [--fix] [--json]",
-    "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate]",
+    "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>]",
+    "  code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]",
+    "  code-butler memory conflicts [--fix] [--json]",
     "  code-butler doctor [--json] [--strict]",
     "  code-butler sync [--source <git|codex|claude|all>]",
     "  code-butler sources status",

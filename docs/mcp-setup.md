@@ -16,7 +16,7 @@ The MCP server resolves the target Git repository and creates internal project-l
 
 ## Common Tools
 
-Agents can call tools such as:
+The MCP server exposes 20 tools. Lifecycle-related calls include:
 
 - `sync_project_memory`
 - `summarize_project_brief`
@@ -25,13 +25,16 @@ Agents can call tools such as:
 - `search_project_memory`
 - `find_memories`
 - `remember_project_memory`
+- `update_memory_status`
 - `explain_code_change`
 - `investigate_project_history`
 - `summarize_recent_activity`
 
+`find_memories` accepts optional `lifecycleStatus: "current" | "superseded" | "retracted" | "all"`. When omitted, promoted results remain current-only; candidates are unchanged. `remember_project_memory` accepts `supersedesMemoryId` for promoted replacements. `update_memory_status` requires a nonempty `memoryId`, lifecycle `status`, and `reason`; `superseded` also requires `replacementMemoryId`.
+
 ## Recommended Agent Flow
 
-Start by syncing memory and reading the project brief. When the user asks to remember, save, or note a project memory, call `current_project`, then `remember_project_memory`, then verify with `find_memories`; do not inspect or write the SQLite database directly. For continuation questions, summarize active context first. For file-specific questions, use code-change explanation and project memory search before editing.
+Start by syncing memory and reading the project brief. When the user asks to remember, save, or note a project memory, call `current_project`, then `remember_project_memory`, then verify with `find_memories`; do not inspect or write the SQLite database directly. When a fact changes, supersede it with a current replacement; retract it when it was invalid and has no replacement. Use `code-butler memory conflicts` for a dry-run review of current-memory conflicts and `--fix` only when the proposed relation and quality changes are appropriate. For continuation questions, summarize active context first. For file-specific questions, use code-change explanation and project memory search before editing.
 
 ## See Also
 

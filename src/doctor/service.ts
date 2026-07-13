@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { globalConfigDir, loadExistingProjectConfig } from "../config.js";
 import { getProjectSummaryStatus } from "../project-summary/service.js";
 import { getClaudeSourceStatus, getCodexSourceStatus, type ConversationSourceStatus } from "../sources/codex.js";
+import { getMigrationStatus } from "../storage/migrations.js";
 import type { MemoryStore } from "../storage/store.js";
 import type {
   DoctorCheck,
@@ -36,6 +37,7 @@ const SYNC_SOURCES: SyncSourceName[] = ["git", "codex", "claude"];
 
 export interface DoctorRunOptions {
   now?: () => Date;
+  openDatabase?: (path: string, options: { readOnly: true }) => DatabaseSync;
 }
 
 interface DoctorStorageState {
@@ -69,6 +71,8 @@ interface MemoryQualityRow {
 
 interface MemoryHealthSummary {
   scanned: number;
+  total: number;
+  complete: boolean;
   active: number;
   needsReview: number;
   quarantined: number;
@@ -139,8 +143,9 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
     }
   }
 
-  const storage = inspectStorage(projectRoot);
+  const storage = inspectStorage(projectRoot, options.openDatabase);
   addCheck(storage.check);
+  addStorageDiagnostics(storage, addCheck, addAction);
   if (storage.check.status !== "ok") {
     addAction({
       priority: storage.check.status === "error" ? "high" : "medium",
@@ -225,7 +230,11 @@ function addProjectChecks(
   });
 }
 
-function inspectStorage(rootDir: string): DoctorStorageState & { check: DoctorCheck } {
+function inspectStorage(
+  rootDir: string,
+  openDatabase: (path: string, options: { readOnly: true }) => DatabaseSync =
+    (path, options) => new DatabaseSync(path, options)
+): DoctorStorageState & { check: DoctorCheck } {
   const databasePath = join(rootDir, ".code-butler", "memory.sqlite");
   if (!existsSync(databasePath)) {
     return {
@@ -243,8 +252,10 @@ function inspectStorage(rootDir: string): DoctorStorageState & { check: DoctorCh
     };
   }
 
+  let db: DatabaseSync | undefined;
   try {
-    const db = new DatabaseSync(databasePath, { readOnly: true });
+    db = openDatabase(databasePath, { readOnly: true });
+    db.exec("PRAGMA busy_timeout = 5000");
     const readableTables = new Set<string>();
     const missingTables: string[] = [];
     const counts: Record<string, number> = {};
@@ -259,7 +270,7 @@ function inspectStorage(rootDir: string): DoctorStorageState & { check: DoctorCh
 
     const missingQualityColumns = ["memory_candidates", "memories"].flatMap((table) => {
       if (!readableTables.has(table)) return [];
-      const columns = tableColumns(db, table);
+      const columns = tableColumns(db!, table);
       return REQUIRED_QUALITY_COLUMNS.filter((column) => !columns.has(column)).map((column) => `${table}.${column}`);
     });
 
@@ -297,6 +308,7 @@ function inspectStorage(rootDir: string): DoctorStorageState & { check: DoctorCh
       }
     };
   } catch (error) {
+    db?.close();
     return {
       databasePath,
       readable: false,
@@ -311,6 +323,96 @@ function inspectStorage(rootDir: string): DoctorStorageState & { check: DoctorCh
         metadata: { databasePath }
       }
     };
+  }
+}
+
+function addStorageDiagnostics(
+  storage: DoctorStorageState,
+  addCheck: (check: DoctorCheck) => void,
+  addAction: (action: DoctorNextAction) => void
+): void {
+  if (!storage.db) return;
+
+  try {
+    const row = storage.db.prepare("pragma quick_check").get() as { quick_check: string };
+    const result = row.quick_check;
+    addCheck({
+      id: "storage:quick_check",
+      category: "storage",
+      status: result === "ok" ? "ok" : "error",
+      title: result === "ok" ? "SQLite quick check passed" : "SQLite quick check failed",
+      detail: result,
+      metadata: { result }
+    });
+  } catch (error) {
+    addCheck({
+      id: "storage:quick_check",
+      category: "storage",
+      status: "error",
+      title: "SQLite quick check failed",
+      detail: messageFromError(error)
+    });
+  }
+
+  try {
+    const status = getMigrationStatus(storage.db, storage.databasePath);
+    const complete = status.pendingVersions.length === 0;
+    addCheck({
+      id: "storage:schema_migrations",
+      category: "storage",
+      status: complete ? "ok" : "warning",
+      title: complete ? "Database schema is current" : "Database schema has pending migrations",
+      detail: `current=${status.currentVersion} latest=${status.latestVersion} pending=${status.pendingVersions.length}`,
+      metadata: {
+        currentVersion: status.currentVersion,
+        latestVersion: status.latestVersion,
+        pendingMigrations: status.pendingVersions,
+        latestBackup: status.latestBackup ?? null
+      }
+    });
+    if (!complete) {
+      addAction({
+        priority: "medium",
+        command: "code-butler init",
+        reason: "Apply pending database schema migrations."
+      });
+    }
+  } catch (error) {
+    addCheck({
+      id: "storage:schema_migrations",
+      category: "storage",
+      status: "error",
+      title: "Database schema diagnostics failed",
+      detail: messageFromError(error)
+    });
+  }
+
+  try {
+    const journal = storage.db.prepare("pragma journal_mode").get() as { journal_mode: string };
+    const timeout = storage.db.prepare("pragma busy_timeout").get() as { timeout: number };
+    const inTransaction = storage.db.isTransaction;
+    const recoveryReady = !inTransaction && journal.journal_mode.toLowerCase() === "wal" && timeout.timeout >= 5000;
+    addCheck({
+      id: "storage:transaction_recovery",
+      category: "storage",
+      status: recoveryReady ? "ok" : "warning",
+      title: recoveryReady ? "Transaction recovery settings are ready" : "Transaction recovery settings need attention",
+      detail: `journal=${journal.journal_mode} busy_timeout=${timeout.timeout} in_transaction=${inTransaction}`,
+      metadata: {
+        inTransaction,
+        journalMode: journal.journal_mode.toLowerCase(),
+        busyTimeout: timeout.timeout,
+        recoveryReady
+      }
+    });
+  } catch (error) {
+    addCheck({
+      id: "storage:transaction_recovery",
+      category: "storage",
+      status: "error",
+      title: "Transaction recovery diagnostics failed",
+      detail: messageFromError(error)
+    });
   }
 }
 
@@ -654,6 +756,8 @@ function readMemoryHealth(db: DatabaseSync): MemoryHealthSummary {
   const reasons = rows.flatMap((row) => parseStringArray(row.quality_reasons_json));
   return {
     scanned: rows.length,
+    total: rows.length,
+    complete: true,
     active: rows.filter((row) => row.quality_status === "active").length,
     needsReview: rows.filter((row) => row.quality_status === "needs_review").length,
     quarantined: rows.filter((row) => row.quality_status === "quarantined").length,

@@ -500,7 +500,7 @@ describe("CLI", () => {
       summary: "</code></td><td>architecture.html</td>",
       reason: "Noisy import.",
       confidence: 0.9,
-      evidence: [{ sourceType: "conversation", sourceId: "conv-1" }],
+      evidence: [{ sourceType: "conversation", sourceId: "conv-1", locator: "conv-1:chunk:0" }],
       relatedFiles: [],
       dedupeKey: "bad-html"
     });
@@ -592,6 +592,201 @@ describe("CLI", () => {
     expect(errors.join("\n")).toContain("Usage: code-butler memory remember --type");
   });
 
+  it("supersedes an existing memory from memory remember", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    await runCli(["memory", "remember", "--type", "decision", "--text", "Use cache policy A."], {
+      cwd: rootDir,
+      now: () => new Date("2026-07-12T13:00:00.000Z")
+    });
+    let store = openMemoryStore(rootDir);
+    store.init();
+    const original = store.listMemories({ lifecycleStatus: "current", qualityStatus: "all" })[0]!;
+    store.close();
+
+    const output: string[] = [];
+    await expect(runCli([
+      "memory", "remember",
+      "--type", "decision",
+      "--text", "Use cache policy B.",
+      "--supersedes", original.id
+    ], {
+      cwd: rootDir,
+      stdout: (line) => output.push(line),
+      now: () => new Date("2026-07-12T13:05:00.000Z")
+    })).resolves.toBe(0);
+
+    store = openMemoryStore(rootDir);
+    store.init();
+    expect(store.readMemory(original.id)).toMatchObject({
+      lifecycleStatus: "superseded",
+      validUntil: "2026-07-12T13:05:00.000Z"
+    });
+    expect(store.listMemoryRelations({ relationType: "supersedes" })).toEqual([
+      expect.objectContaining({ toMemoryId: original.id })
+    ]);
+    store.close();
+    expect(output.join("\n")).toContain("Remembered decision memory");
+  });
+
+  it("rejects memory remember supersedes with candidate mode", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const errors: string[] = [];
+
+    await expect(runCli([
+      "memory", "remember",
+      "--type", "decision",
+      "--text", "Candidate replacement.",
+      "--candidate",
+      "--supersedes", "memory-old"
+    ], {
+      cwd: rootDir,
+      stderr: (line) => errors.push(line)
+    })).resolves.toBe(1);
+
+    expect(errors.join("\n")).toContain("Superseding a durable memory requires promotion");
+    expect(existsSync(join(rootDir, ".code-butler"))).toBe(false);
+  });
+
+  it("updates memory lifecycle status from the CLI with deterministic output", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    await runCli(["memory", "remember", "--type", "constraint", "--text", "Obsolete policy."], { cwd: rootDir });
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const memory = store.listMemories({ lifecycleStatus: "current", qualityStatus: "all" })[0]!;
+    store.close();
+    const output: string[] = [];
+
+    await expect(runCli([
+      "memory", "status",
+      "--id", memory.id,
+      "--status", "retracted",
+      "--reason", "  The policy was incorrect.  "
+    ], {
+      cwd: rootDir,
+      stdout: (line) => output.push(line),
+      now: () => new Date("2026-07-12T14:00:00.000Z")
+    })).resolves.toBe(0);
+
+    expect(output).toEqual([`Memory ${memory.id} status=retracted replacement=none relations=0`]);
+    const after = openMemoryStore(rootDir);
+    after.init();
+    expect(after.readMemory(memory.id)).toMatchObject({
+      lifecycleStatus: "retracted",
+      statusReason: "The policy was incorrect.",
+      statusChangedAt: "2026-07-12T14:00:00.000Z"
+    });
+    after.close();
+  });
+
+  it("rejects invalid memory status combinations and missing or unknown flags", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const cases = [
+      { args: ["memory", "status", "--id", "memory-1", "--status", "current", "--reason", "Restore.", "--replacement", "memory-2"], error: "--replacement is only allowed with superseded status" },
+      { args: ["memory", "status", "--id", "memory-1", "--status", "superseded", "--reason", "Replaced."], error: "Superseded status requires --replacement" },
+      { args: ["memory", "status", "--id", "memory-1", "--status", "archived", "--reason", "No."], error: "--status must be one of current, superseded, retracted" },
+      { args: ["memory", "status", "--id", "memory-1", "--status", "retracted"], error: "Usage: code-butler memory status" },
+      { args: ["memory", "status", "--bogus"], error: "Unknown memory status option: --bogus" }
+    ];
+
+    for (const testCase of cases) {
+      const errors: string[] = [];
+      await expect(runCli(testCase.args, { cwd: rootDir, stderr: (line) => errors.push(line) })).resolves.toBe(1);
+      expect(errors.join("\n")).toContain(testCase.error);
+    }
+  });
+
+  it("rejects whitespace-only lifecycle reasons without mutating memory", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    await runCli(["memory", "remember", "--type", "constraint", "--text", "Keep this policy."], { cwd: rootDir });
+    const before = openMemoryStore(rootDir);
+    before.init();
+    const memory = before.listMemories({ lifecycleStatus: "current", qualityStatus: "all" })[0]!;
+    before.close();
+    const errors: string[] = [];
+
+    await expect(runCli([
+      "memory", "status",
+      "--id", memory.id,
+      "--status", "retracted",
+      "--reason", "   "
+    ], {
+      cwd: rootDir,
+      stderr: (line) => errors.push(line)
+    })).resolves.toBe(1);
+
+    expect(errors.join("\n")).toContain("Lifecycle status reason is required");
+    const after = openMemoryStore(rootDir);
+    after.init();
+    expect(after.readMemory(memory.id)).toMatchObject({ lifecycleStatus: "current" });
+    after.close();
+  });
+
+  it("audits memory conflicts with dry-run, fix, JSON, and idempotent behavior", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    await runCli(["memory", "remember", "--type", "constraint", "--title", "Deploy port", "--text", "Use port 4100."], { cwd: rootDir });
+    await runCli(["memory", "remember", "--type", "constraint", "--title", "Deploy port", "--text", "Use port 4200."], { cwd: rootDir });
+
+    const dryRun: string[] = [];
+    await expect(runCli(["memory", "conflicts"], {
+      cwd: rootDir,
+      stdout: (line) => dryRun.push(line)
+    })).resolves.toBe(0);
+    expect(dryRun).toEqual([
+      "Memory Conflicts",
+      "scanned=2 groups=1 conflicts=1 add=1 remove=0 change=2 applied=no"
+    ]);
+    let store = openMemoryStore(rootDir);
+    store.init();
+    expect(store.listMemoryRelations({ relationType: "potentially_contradicts" })).toEqual([]);
+    store.close();
+
+    const fixed: string[] = [];
+    await expect(runCli(["memory", "conflicts", "--fix"], {
+      cwd: rootDir,
+      stdout: (line) => fixed.push(line),
+      now: () => new Date("2026-07-12T15:00:00.000Z")
+    })).resolves.toBe(0);
+    expect(fixed).toEqual([
+      "Memory Conflicts",
+      "scanned=2 groups=1 conflicts=1 add=1 remove=0 change=2 applied=yes"
+    ]);
+
+    const json: string[] = [];
+    await expect(runCli(["memory", "conflicts", "--fix", "--json"], {
+      cwd: rootDir,
+      stdout: (line) => json.push(line),
+      now: () => new Date("2026-07-12T15:01:00.000Z")
+    })).resolves.toBe(0);
+    expect(JSON.parse(json.join("\n"))).toMatchObject({
+      scannedGroups: 1,
+      scannedMemories: 2,
+      conflictPairs: [expect.objectContaining({ fromMemoryId: expect.any(String), toMemoryId: expect.any(String) })],
+      changes: [],
+      complete: true
+    });
+    store = openMemoryStore(rootDir);
+    store.init();
+    expect(store.listMemoryRelations({ relationType: "potentially_contradicts" })).toHaveLength(1);
+    store.close();
+  });
+
+  it("rejects unknown memory conflicts flags", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const errors: string[] = [];
+    await expect(runCli(["memory", "conflicts", "--bogus"], {
+      cwd: rootDir,
+      stderr: (line) => errors.push(line)
+    })).resolves.toBe(1);
+    expect(errors.join("\n")).toContain("Unknown memory conflicts option: --bogus");
+  });
+
   it("fixes memory quality audit findings when requested", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -613,7 +808,7 @@ describe("CLI", () => {
       summary: "</code></td><td>architecture.html</td>",
       reason: "Noisy import.",
       confidence: 0.9,
-      evidence: [{ sourceType: "conversation", sourceId: "conv-1" }],
+      evidence: [{ sourceType: "conversation", sourceId: "conv-1", locator: "conv-1:chunk:0" }],
       relatedFiles: [],
       dedupeKey: "bad-html"
     });

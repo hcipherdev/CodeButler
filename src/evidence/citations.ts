@@ -1,5 +1,5 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 import type { MemoryStore } from "../storage/store.js";
 import type {
@@ -21,13 +21,7 @@ export function resolveEvidenceCitations(
 ): EvidenceCitation[] {
   const citations = input.evidence.map((evidence) => resolveEvidenceCitation(store, evidence));
   for (const filePath of input.relatedFiles ?? []) {
-    citations.push({
-      kind: "file",
-      sourceId: filePath,
-      label: `file ${filePath}`,
-      summary: filePath,
-      resolved: false
-    });
+    citations.push(resolveFileCitation(store, filePath));
   }
   if (input.includeProjectSummary) {
     const summaryPath = join(store.paths.dataDir, "project-summary.md");
@@ -121,6 +115,17 @@ function resolveEvidenceCitation(store: MemoryStore, evidence: EvidenceRef): Evi
   if (!source) return missingCitation(evidence);
   if (evidence.sourceType === "conversation") {
     const chunk = readLocatedChunk(store, evidence);
+    if (source.type !== "conversation" || chunk === undefined) {
+      return {
+        kind: "conversation",
+        sourceId: evidence.sourceId,
+        locator: evidence.locator,
+        label: source.title,
+        summary: "Conversation chunk locator could not be resolved in the local store.",
+        resolved: false,
+        metadata: source.metadata
+      };
+    }
     const label = chunk?.chunkIndex !== undefined
       ? `${source.title} chunk ${chunk.chunkIndex}`
       : source.title;
@@ -144,6 +149,53 @@ function resolveEvidenceCitation(store: MemoryStore, evidence: EvidenceRef): Evi
     resolved: true,
     metadata: source.metadata
   };
+}
+
+function resolveFileCitation(store: MemoryStore, filePath: string): EvidenceCitation {
+  const rootPath = realpathSync(store.paths.rootDir);
+  const candidatePath = resolve(rootPath, filePath);
+  const lexicalRelative = normalizePath(relative(rootPath, candidatePath));
+  const displayPath = isContainedRelativePath(lexicalRelative)
+    ? lexicalRelative
+    : normalizePath(filePath);
+  if (!isContainedRelativePath(lexicalRelative) || !existsSync(candidatePath)) {
+    return unresolvedFileCitation(displayPath);
+  }
+  try {
+    const realPath = realpathSync(candidatePath);
+    const repositoryPath = normalizePath(relative(rootPath, realPath));
+    if (!isContainedRelativePath(repositoryPath) || !statSync(realPath).isFile()) {
+      return unresolvedFileCitation(displayPath);
+    }
+    return {
+      kind: "file",
+      sourceId: repositoryPath,
+      label: `file ${repositoryPath}`,
+      summary: repositoryPath,
+      resolved: true,
+      metadata: { path: realPath }
+    };
+  } catch {
+    return unresolvedFileCitation(displayPath);
+  }
+}
+
+function unresolvedFileCitation(filePath: string): EvidenceCitation {
+  return {
+    kind: "file",
+    sourceId: filePath,
+    label: `file ${filePath}`,
+    summary: filePath,
+    resolved: false
+  };
+}
+
+function isContainedRelativePath(filePath: string): boolean {
+  return filePath.length > 0 && filePath !== ".." && !filePath.startsWith("../") && !isAbsolute(filePath);
+}
+
+function normalizePath(filePath: string): string {
+  return filePath.replaceAll("\\", "/");
 }
 
 function readLocatedChunk(store: MemoryStore, evidence: EvidenceRef) {
