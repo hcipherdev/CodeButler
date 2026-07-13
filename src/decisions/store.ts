@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 
 import type { DecisionRecord, EvidenceRef } from "../types.js";
 import type { MemoryStore } from "../storage/store.js";
+import { withTransaction } from "../storage/transactions.js";
 
 export interface DecisionInput {
   topic: string;
@@ -13,68 +14,70 @@ export interface DecisionInput {
 }
 
 export function addDecision(store: MemoryStore, input: DecisionInput): DecisionRecord {
-  const id = nextDecisionId(store);
-  const createdAt = new Date().toISOString();
-  const record: DecisionRecord = {
-    id,
-    topic: input.topic,
-    decision: input.decision,
-    reason: input.reason,
-    status: input.status,
-    evidence: input.evidence,
-    createdAt
-  };
+  return withTransaction(store.db, () => {
+    const id = nextDecisionId(store);
+    const createdAt = new Date().toISOString();
+    const record: DecisionRecord = {
+      id,
+      topic: input.topic,
+      decision: input.decision,
+      reason: input.reason,
+      status: input.status,
+      evidence: input.evidence,
+      createdAt
+    };
 
-  store.db
-    .prepare(
-      `insert into decisions (id, topic, decision, reason, status, evidence_json, created_at)
+    store.db
+      .prepare(
+        `insert into decisions (id, topic, decision, reason, status, evidence_json, created_at)
+         values (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        record.id,
+        record.topic,
+        record.decision,
+        record.reason,
+        record.status,
+        JSON.stringify(record.evidence),
+        record.createdAt
+      );
+
+    store.addSourceWithChunks({
+      source: {
+        id: record.id,
+        type: "decision",
+        title: record.topic,
+        origin: "manual-decision",
+        rawContent: formatDecision(record),
+        metadata: { status: record.status }
+      },
+      chunks: [
+        {
+          text: formatDecision(record),
+          metadata: { decisionId: record.id, topic: record.topic }
+        }
+      ]
+    });
+    store.upsertManualDecisionMemory(record);
+
+    const insertRelation = store.db.prepare(
+      `insert into relations (id, from_type, from_id, relation, to_type, to_id, locator)
        values (?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      record.id,
-      record.topic,
-      record.decision,
-      record.reason,
-      record.status,
-      JSON.stringify(record.evidence),
-      record.createdAt
     );
+    for (const evidence of record.evidence) {
+      insertRelation.run(
+        randomUUID(),
+        "decision",
+        record.id,
+        "supported_by",
+        evidence.sourceType,
+        evidence.sourceId,
+        evidence.locator ?? null
+      );
+    }
 
-  store.addSourceWithChunks({
-    source: {
-      id: record.id,
-      type: "decision",
-      title: record.topic,
-      origin: "manual-decision",
-      rawContent: formatDecision(record),
-      metadata: { status: record.status }
-    },
-    chunks: [
-      {
-        text: formatDecision(record),
-        metadata: { decisionId: record.id, topic: record.topic }
-      }
-    ]
+    return record;
   });
-  store.upsertManualDecisionMemory(record);
-
-  const insertRelation = store.db.prepare(
-    `insert into relations (id, from_type, from_id, relation, to_type, to_id, locator)
-     values (?, ?, ?, ?, ?, ?, ?)`
-  );
-  for (const evidence of record.evidence) {
-    insertRelation.run(
-      randomUUID(),
-      "decision",
-      record.id,
-      "supported_by",
-      evidence.sourceType,
-      evidence.sourceId,
-      evidence.locator ?? null
-    );
-  }
-
-  return record;
 }
 
 export function findDecisions(

@@ -37,6 +37,15 @@ Check setup health:
 code-butler doctor
 ```
 
+Review durable-memory lifecycle and conflicts:
+
+```bash
+code-butler memory conflicts
+code-butler memory status --id <memory-id> --status retracted --reason "Incorrect guidance"
+```
+
+Conflict review is dry-run by default; add `--fix` to apply its proposed relation and quality changes. Promoted-memory searches use current memories by default, while superseded and retracted memories remain available for explicit historical review.
+
 Refresh the generated project summary manually:
 
 ```bash

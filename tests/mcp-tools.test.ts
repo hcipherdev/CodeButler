@@ -2,8 +2,9 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
 
-import { createProjectMemoryToolHandlers } from "../src/mcp/tools.js";
+import { createProjectMemoryToolHandlers, registerProjectMemoryTools } from "../src/mcp/tools.js";
 import type { ProjectSummaryGenerator } from "../src/project-summary/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
@@ -239,6 +240,273 @@ describe("MCP tool handlers", () => {
     ).toEqual({ count: 1 });
 
     store.close();
+  });
+
+  it("reads back a retracted canonical memory without reactivating it on repeated remember", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const handlers = createProjectMemoryToolHandlers(store, { rootDir });
+    const input = {
+      type: "constraint" as const,
+      text: "Release notes must retain the original publication date."
+    };
+    const first = handlers.remember_project_memory(input);
+    store.updateMemoryLifecycle(first.memory.id, {
+      lifecycleStatus: "retracted",
+      statusReason: "The rule was incorrect."
+    });
+
+    const second = handlers.remember_project_memory(input);
+
+    expect(second.memory).toMatchObject({
+      id: first.memory.id,
+      lifecycleStatus: "retracted",
+      statusReason: "The rule was incorrect."
+    });
+    expect(store.listMemories({ lifecycleStatus: "all", qualityStatus: "all" })).toHaveLength(1);
+    expect(store.listMemories({ qualityStatus: "all" })).toEqual([]);
+    store.close();
+  });
+
+  it("filters promoted memories by lifecycle while leaving candidates unchanged", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-07-12T10:00:00.000Z")
+    });
+    const current = handlers.remember_project_memory({ type: "constraint", text: "Current lifecycle rule." });
+    const superseded = handlers.remember_project_memory({ type: "constraint", text: "Superseded lifecycle rule." });
+    const retracted = handlers.remember_project_memory({ type: "constraint", text: "Retracted lifecycle rule." });
+    handlers.remember_project_memory({
+      type: "constraint",
+      text: "Candidate lifecycle rule.",
+      promote: false
+    });
+    store.updateMemoryLifecycle(superseded.memory.id, { lifecycleStatus: "superseded" });
+    store.updateMemoryLifecycle(retracted.memory.id, { lifecycleStatus: "retracted" });
+
+    expect(handlers.find_memories({ status: "promoted" }).results.map((memory) => memory.id)).toEqual([
+      current.memory.id
+    ]);
+    expect(handlers.find_memories({ status: "promoted", lifecycleStatus: "superseded" }).results).toEqual([
+      expect.objectContaining({ id: superseded.memory.id, lifecycleStatus: "superseded" })
+    ]);
+    expect(handlers.find_memories({ status: "promoted", lifecycleStatus: "retracted" }).results).toEqual([
+      expect.objectContaining({ id: retracted.memory.id, lifecycleStatus: "retracted" })
+    ]);
+    expect(handlers.find_memories({ status: "promoted", lifecycleStatus: "all" }).results).toHaveLength(3);
+    const candidates = handlers.find_memories({ status: "candidate", lifecycleStatus: "retracted" }).results;
+    expect(candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "candidate", summary: "Candidate lifecycle rule." })
+    ]));
+    expect(candidates.every((candidate) => candidate.lifecycleStatus === undefined)).toBe(true);
+    store.close();
+  });
+
+  it("remembers a replacement and supersedes the requested durable memory", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-07-12T11:00:00.000Z")
+    });
+    const original = handlers.remember_project_memory({ type: "decision", text: "Use the old cache policy." });
+
+    const replacement = handlers.remember_project_memory({
+      type: "decision",
+      text: "Use the new cache policy.",
+      supersedesMemoryId: original.memory.id
+    });
+
+    expect(store.readMemory(original.memory.id)).toMatchObject({
+      lifecycleStatus: "superseded",
+      validUntil: "2026-07-12T11:00:00.000Z"
+    });
+    expect(replacement.memory).toMatchObject({ lifecycleStatus: "current" });
+    expect(store.listMemoryRelations({ relationType: "supersedes" })).toEqual([
+      expect.objectContaining({ fromMemoryId: replacement.memory.id, toMemoryId: original.memory.id })
+    ]);
+    expect(() => handlers.remember_project_memory({
+      type: "decision",
+      text: "Candidate replacement.",
+      promote: false,
+      supersedesMemoryId: original.memory.id
+    })).toThrow("Superseding a durable memory requires promotion");
+    store.close();
+  });
+
+  it("updates memory lifecycle status and returns the updated memory with relevant relations", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-07-12T12:00:00.000Z")
+    });
+    const original = handlers.remember_project_memory({ type: "constraint", text: "Use policy A." });
+    const replacement = handlers.remember_project_memory({ type: "constraint", text: "Use policy B." });
+
+    const result = handlers.update_memory_status({
+      memoryId: original.memory.id,
+      status: "superseded",
+      reason: "Policy B replaces policy A.",
+      replacementMemoryId: replacement.memory.id
+    });
+
+    expect(result.memory).toMatchObject({
+      id: original.memory.id,
+      lifecycleStatus: "superseded",
+      statusReason: "Policy B replaces policy A.",
+      statusChangedAt: "2026-07-12T12:00:00.000Z"
+    });
+    expect(result.relations).toEqual([
+      expect.objectContaining({
+        fromMemoryId: replacement.memory.id,
+        toMemoryId: original.memory.id,
+        relationType: "supersedes",
+        reason: "Policy B replaces policy A."
+      })
+    ]);
+    expect(() => handlers.update_memory_status({
+      memoryId: "missing-memory",
+      status: "retracted",
+      reason: "Incorrect."
+    })).toThrow("Unknown durable memory: missing-memory");
+    const cycleTarget = handlers.remember_project_memory({ type: "constraint", text: "Cycle target." });
+    const cycleReplacement = handlers.remember_project_memory({ type: "constraint", text: "Cycle replacement." });
+    store.addMemoryRelation({
+      fromMemoryId: cycleTarget.memory.id,
+      toMemoryId: cycleReplacement.memory.id,
+      relationType: "supersedes"
+    });
+    expect(() => handlers.update_memory_status({
+      memoryId: cycleTarget.memory.id,
+      status: "superseded",
+      reason: "Would create a cycle.",
+      replacementMemoryId: cycleReplacement.memory.id
+    })).toThrow("Memory supersession cycle detected");
+    store.close();
+  });
+
+  it("registers and invokes 20 MCP tools with lifecycle validation and wiring", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      now: () => new Date("2026-07-12T16:00:00.000Z")
+    });
+    const original = handlers.remember_project_memory({ type: "decision", text: "Use lifecycle policy A." });
+    const replacement = handlers.remember_project_memory({ type: "decision", text: "Use lifecycle policy B." });
+    type Registration = {
+      name: string;
+      inputSchema: z.ZodRawShape;
+      callback: (input: Record<string, unknown>) => Promise<{ content: Array<{ type: string; text: string }> }>;
+    };
+    const registrations: Registration[] = [];
+    const server = {
+      registerTool(
+        name: string,
+        definition: { inputSchema: z.ZodRawShape },
+        callback: Registration["callback"]
+      ) {
+        registrations.push({ name, inputSchema: definition.inputSchema, callback });
+      }
+    };
+
+    registerProjectMemoryTools(server as never, store, {
+      rootDir,
+      now: () => new Date("2026-07-12T16:05:00.000Z")
+    });
+
+    expect(registrations).toHaveLength(20);
+    expect(registrations.map((registration) => registration.name)).toContain("update_memory_status");
+    const find = registrations.find((registration) => registration.name === "find_memories")!;
+    expect(find.inputSchema.lifecycleStatus!.safeParse("all")).toMatchObject({ success: true });
+    expect(find.inputSchema.lifecycleStatus!.safeParse("obsolete")).toMatchObject({ success: false });
+    const remember = registrations.find((registration) => registration.name === "remember_project_memory")!;
+    expect(remember.inputSchema.supersedesMemoryId!.safeParse("")).toMatchObject({ success: false });
+    const update = registrations.find((registration) => registration.name === "update_memory_status")!;
+    expect(update.inputSchema.memoryId!.safeParse("")).toMatchObject({ success: false });
+    expect(update.inputSchema.reason!.safeParse("")).toMatchObject({ success: false });
+    expect(update.inputSchema.reason!.safeParse("   ")).toMatchObject({ success: false });
+    expect(update.inputSchema.status!.safeParse("archived")).toMatchObject({ success: false });
+    const validated = z.object(update.inputSchema).parse({
+      memoryId: original.memory.id,
+      status: "superseded",
+      reason: "  Policy B replaces policy A.  ",
+      replacementMemoryId: replacement.memory.id
+    });
+    const response = await update.callback(validated);
+    expect(response).toEqual({
+      content: [{
+        type: "text",
+        text: expect.any(String)
+      }]
+    });
+    expect(JSON.parse(response.content[0]!.text)).toMatchObject({
+      memory: {
+        id: original.memory.id,
+        lifecycleStatus: "superseded",
+        statusReason: "Policy B replaces policy A."
+      },
+      relations: [{
+        fromMemoryId: replacement.memory.id,
+        toMemoryId: original.memory.id,
+        relationType: "supersedes",
+        reason: "Policy B replaces policy A."
+      }]
+    });
+    expect(store.readMemory(original.memory.id)).toMatchObject({
+      lifecycleStatus: "superseded",
+      statusReason: "Policy B replaces policy A."
+    });
+    store.close();
+  });
+
+  it("keeps the architecture copies consistent with the complete 20-tool list", () => {
+    const architecture = readFileSync(join(process.cwd(), "architecture.html"), "utf8");
+    const published = readFileSync(join(process.cwd(), "docs", "public", "architecture.html"), "utf8");
+    const toolNames = [...architecture.matchAll(/<div class="mcp-tool-name">([^<]+)<\/div>/g)]
+      .map((match) => match[1]);
+
+    expect(published).toBe(architecture);
+    expect(architecture).toContain("MCP Tools (20)");
+    expect(architecture).toContain("20 exposed tools");
+    expect(architecture).not.toContain("18 exposed tools");
+    expect(architecture).not.toMatch(/\b18(?:\s+MCP)?\s+tools\b/i);
+    expect(toolNames).toHaveLength(20);
+    expect([...toolNames].sort()).toEqual([
+      "cleanup_temporary_memory",
+      "current_project",
+      "explain_code_change",
+      "find_decisions",
+      "find_memories",
+      "find_related_commits",
+      "investigate_project_history",
+      "read_memory_source",
+      "refresh_project_summary",
+      "remember_project_memory",
+      "run_doctor",
+      "search_project_memory",
+      "search_temporary_memory",
+      "summarize_active_context",
+      "summarize_memory_health",
+      "summarize_project_brief",
+      "summarize_project_state",
+      "summarize_recent_activity",
+      "sync_project_memory",
+      "update_memory_status"
+    ].sort());
   });
 
   it("exposes project brief handlers without installing agent bootstrap files", async () => {

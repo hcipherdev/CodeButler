@@ -9,6 +9,8 @@ export type TemporaryMemoryKind =
   | "user_instruction";
 export type MemoryPromotionState = "candidate" | "promoted";
 export type MemoryQualityStatus = "active" | "needs_review" | "quarantined";
+export type MemoryLifecycleStatus = "current" | "superseded" | "retracted";
+export type MemoryRelationType = "supersedes" | "potentially_contradicts";
 export type SyncSourceName = "git" | "codex" | "claude";
 export type DoctorStatus = "ok" | "warning" | "error";
 export type DoctorCheckCategory = "project" | "storage" | "sources" | "sync" | "summary" | "extractor" | "memory";
@@ -127,6 +129,7 @@ export interface ExtractedMemory {
 export interface MemoryCandidate extends ExtractedMemory {
   id: string;
   promotionState: MemoryPromotionState;
+  promotedMemoryId?: string | undefined;
   qualityStatus: MemoryQualityStatus;
   qualityReasons: string[];
   lastVerifiedAt?: string | undefined;
@@ -142,6 +145,21 @@ export interface DurableMemory extends ExtractedMemory {
   qualityStatus: MemoryQualityStatus;
   qualityReasons: string[];
   lastVerifiedAt?: string | undefined;
+  subjectKey: string;
+  lifecycleStatus: MemoryLifecycleStatus;
+  validFrom: string;
+  validUntil?: string | undefined;
+  statusReason?: string | undefined;
+  statusChangedAt: string;
+}
+
+export interface MemoryRelation {
+  id: string;
+  fromMemoryId: string;
+  toMemoryId: string;
+  relationType: MemoryRelationType;
+  createdAt: string;
+  reason?: string | undefined;
 }
 
 export interface MemorySearchResult {
@@ -158,6 +176,12 @@ export interface MemorySearchResult {
   qualityStatus: MemoryQualityStatus;
   qualityReasons: string[];
   lastVerifiedAt?: string | undefined;
+  subjectKey?: string | undefined;
+  lifecycleStatus?: MemoryLifecycleStatus | undefined;
+  validFrom?: string | undefined;
+  validUntil?: string | undefined;
+  statusReason?: string | undefined;
+  statusChangedAt?: string | undefined;
   citations?: EvidenceCitation[] | undefined;
   trust?: TrustSummary | undefined;
 }

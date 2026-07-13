@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -20,6 +20,8 @@ describe("evidence citation resolution", () => {
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
     store.init();
+    mkdirSync(join(rootDir, "src"), { recursive: true });
+    writeFileSync(join(rootDir, "src", "cache.ts"), "export const cache = true;\n");
     writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Project Summary\n\nUse SQLite.\n");
     expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(true);
 
@@ -102,7 +104,8 @@ describe("evidence citation resolution", () => {
     expect(citations[4]).toMatchObject({
       kind: "file",
       sourceId: "src/cache.ts",
-      resolved: false
+      resolved: true,
+      metadata: { path: realpathSync(join(rootDir, "src", "cache.ts")) }
     });
     expect(citations[5]).toMatchObject({
       kind: "project_summary",
@@ -110,6 +113,68 @@ describe("evidence citation resolution", () => {
       resolved: true
     });
 
+    store.close();
+  });
+
+  it("requires an exact source-owned conversation chunk locator", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    for (const id of ["conv-a", "conv-b"]) {
+      store.addSourceWithChunks({
+        source: { id, type: "conversation", title: `${id}.md`, origin: "test", rawContent: id },
+        chunks: [{ text: `${id} first chunk` }]
+      });
+    }
+    store.addCommit({
+      hash: "commit-source",
+      authorName: "Test",
+      authorEmail: "test@example.com",
+      authoredAt: "2026-07-11T00:00:00Z",
+      message: "Commit source",
+      changedFiles: [],
+      diffSummary: ""
+    });
+
+    const citations = resolveEvidenceCitations(store, {
+      evidence: [
+        { sourceType: "conversation", sourceId: "conv-a", locator: "conv-a:chunk:0" },
+        { sourceType: "conversation", sourceId: "conv-a" },
+        { sourceType: "conversation", sourceId: "conv-a", locator: "conv-a:chunk:99" },
+        { sourceType: "conversation", sourceId: "conv-a", locator: "conv-b:chunk:0" },
+        { sourceType: "conversation", sourceId: "commit-source", locator: "commit-source:chunk:0" }
+      ]
+    });
+
+    expect(citations).toEqual([
+      expect.objectContaining({ kind: "conversation", locator: "conv-a:chunk:0", resolved: true }),
+      expect.objectContaining({ kind: "conversation", sourceId: "conv-a", resolved: false }),
+      expect.objectContaining({ kind: "conversation", locator: "conv-a:chunk:99", resolved: false }),
+      expect.objectContaining({ kind: "conversation", locator: "conv-b:chunk:0", resolved: false }),
+      expect.objectContaining({ kind: "conversation", sourceId: "commit-source", resolved: false })
+    ]);
+    store.close();
+  });
+
+  it("resolves only normalized real files contained by the repository", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    mkdirSync(join(rootDir, "src"), { recursive: true });
+    writeFileSync(join(rootDir, "src", "real.ts"), "export {};\n");
+
+    const citations = resolveEvidenceCitations(store, {
+      evidence: [],
+      relatedFiles: ["./src/../src/real.ts", "src/missing.ts", "../outside.ts"]
+    });
+
+    expect(citations).toEqual([
+      expect.objectContaining({ kind: "file", sourceId: "src/real.ts", resolved: true }),
+      expect.objectContaining({ kind: "file", sourceId: "src/missing.ts", resolved: false }),
+      expect.objectContaining({ kind: "file", sourceId: "../outside.ts", resolved: false })
+    ]);
     store.close();
   });
 });

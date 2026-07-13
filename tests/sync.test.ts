@@ -148,7 +148,11 @@ describe("automatic sync", () => {
               relatedFiles: ["src/cache.ts"],
               evidence: [
                 { sourceType: "commit", sourceId: context.commits[0]!.hash },
-                { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
+                {
+                  sourceType: "conversation",
+                  sourceId: context.conversations[0]!.sourceId,
+                  locator: `${context.conversations[0]!.sourceId}:chunk:0`
+                }
               ]
             }
           ],
@@ -310,7 +314,11 @@ describe("automatic sync", () => {
               relatedFiles: ["src/cache.ts"],
               evidence: [
                 { sourceType: "commit", sourceId: context.commits[0]!.hash },
-                { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
+                {
+                  sourceType: "conversation",
+                  sourceId: context.conversations[0]!.sourceId,
+                  locator: `${context.conversations[0]!.sourceId}:chunk:0`
+                }
               ]
             }
           ],
@@ -349,7 +357,11 @@ describe("automatic sync", () => {
               relatedFiles: ["src/cache.ts"],
               evidence: [
                 { sourceType: "commit", sourceId: context.commits[0]!.hash },
-                { sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }
+                {
+                  sourceType: "conversation",
+                  sourceId: context.conversations[0]!.sourceId,
+                  locator: `${context.conversations[0]!.sourceId}:chunk:0`
+                }
               ]
             },
             {
@@ -360,7 +372,13 @@ describe("automatic sync", () => {
               confidence: 0.9,
               dedupeKey: "bad-html",
               relatedFiles: [],
-              evidence: [{ sourceType: "conversation", sourceId: context.conversations[0]!.sourceId }]
+              evidence: [
+                {
+                  sourceType: "conversation",
+                  sourceId: context.conversations[0]!.sourceId,
+                  locator: `${context.conversations[0]!.sourceId}:chunk:0`
+                }
+              ]
             }
           ],
           rejected: [{ index: 2, reason: "invalid_memory_record" }]
