@@ -7,6 +7,7 @@ import { findDecisions } from "../decisions/store.js";
 import { runDoctor } from "../doctor/service.js";
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
 import { explainCodeChange, investigateProjectHistory } from "../investigate/history.js";
+import { updateMemoryStatus } from "../memory/lifecycle-service.js";
 import { summarizeMemoryHealth } from "../memory/quality.js";
 import { rememberProjectMemory } from "../memory/remember.js";
 import {
@@ -21,6 +22,7 @@ import type { MemoryStore, ProjectSummary } from "../storage/store.js";
 import { syncProjectMemory } from "../sync/service.js";
 import type {
   EvidenceRef,
+  MemoryLifecycleStatus,
   MemoryQualityStatus,
   MemoryType,
   MemorySearchResult,
@@ -133,6 +135,7 @@ export interface ProjectMemoryToolHandlers {
     type?: MemoryType;
     status?: "promoted" | "candidate";
     qualityStatus?: MemoryQualityStatus | "all";
+    lifecycleStatus?: MemoryLifecycleStatus | "all";
     limit?: number;
   }): {
     results: ReturnType<MemoryStore["searchMemoryLayer"]>;
@@ -144,9 +147,19 @@ export interface ProjectMemoryToolHandlers {
     reason?: string;
     relatedFiles?: string[];
     promote?: boolean;
+    supersedesMemoryId?: string;
   }): {
     sourceId: string;
     memory: MemorySearchResult;
+  };
+  update_memory_status(input: {
+    memoryId: string;
+    status: MemoryLifecycleStatus;
+    reason: string;
+    replacementMemoryId?: string;
+  }): {
+    memory: ReturnType<typeof updateMemoryStatus>;
+    relations: ReturnType<MemoryStore["listMemoryRelations"]>;
   };
   find_decisions(input: { topic?: string; limit?: number }): ReturnType<typeof findDecisions>;
   find_related_commits(input: {
@@ -201,6 +214,8 @@ export interface ProjectMemoryToolHandlers {
 const sourceTypeSchema = z.enum(["conversation", "commit", "decision"]);
 const memoryTypeSchema = z.enum(["decision", "bug_fix", "constraint", "rejected_approach"]);
 const memoryQualityStatusSchema = z.enum(["active", "needs_review", "quarantined", "all"]);
+const memoryLifecycleStatusSchema = z.enum(["current", "superseded", "retracted", "all"]);
+const updateMemoryLifecycleStatusSchema = z.enum(["current", "superseded", "retracted"]);
 const syncSourceSchema = z.enum(["git", "codex", "claude", "all"]);
 export function createProjectMemoryToolHandlers(
   store: MemoryStore,
@@ -254,6 +269,7 @@ export function createProjectMemoryToolHandlers(
           type: remembered.memory?.type ?? remembered.candidate.type,
           status,
           qualityStatus: "all",
+          lifecycleStatus: "all",
           limit: 100
         })
         .find((result) => result.id === memoryId);
@@ -264,6 +280,18 @@ export function createProjectMemoryToolHandlers(
         sourceId: remembered.sourceId,
         memory
       };
+    },
+    update_memory_status(input) {
+      const normalized = normalizeUpdateMemoryStatusInput(input);
+      const memory = updateMemoryStatus(store, {
+        ...normalized,
+        now: nowIso(options.now)
+      });
+      const relations = store
+        .listMemoryRelations()
+        .filter((relation) => relation.fromMemoryId === memory.id || relation.toMemoryId === memory.id)
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+      return { memory, relations };
     },
     find_decisions(input) {
       return findDecisions(store, normalizeDecisionInput(input));
@@ -380,6 +408,7 @@ export function registerProjectMemoryTools(
         type: memoryTypeSchema.optional(),
         status: z.enum(["promoted", "candidate"]).optional(),
         qualityStatus: memoryQualityStatusSchema.optional(),
+        lifecycleStatus: memoryLifecycleStatusSchema.optional(),
         limit: z.number().int().positive().max(100).optional()
       }
     },
@@ -396,10 +425,25 @@ export function registerProjectMemoryTools(
         title: z.string().min(1).optional(),
         reason: z.string().min(1).optional(),
         relatedFiles: z.array(z.string().min(1)).optional(),
-        promote: z.boolean().optional()
+        promote: z.boolean().optional(),
+        supersedesMemoryId: z.string().min(1).optional()
       }
     },
     async (input) => asJsonContent(handlers.remember_project_memory(normalizeRememberMemoryInput(input)))
+  );
+
+  server.registerTool(
+    "update_memory_status",
+    {
+      description: "Mark a durable memory current, superseded, or retracted while preserving lifecycle history.",
+      inputSchema: {
+        memoryId: z.string().min(1),
+        status: updateMemoryLifecycleStatusSchema,
+        reason: z.string().trim().min(1),
+        replacementMemoryId: z.string().min(1).optional()
+      }
+    },
+    async (input) => asJsonContent(handlers.update_memory_status(normalizeUpdateMemoryStatusInput(input)))
   );
 
   server.registerTool(
@@ -594,12 +638,14 @@ function normalizeMemorySearchInput(input: {
   type?: MemoryType | undefined;
   status?: "promoted" | "candidate" | undefined;
   qualityStatus?: MemoryQualityStatus | "all" | undefined;
+  lifecycleStatus?: MemoryLifecycleStatus | "all" | undefined;
   limit?: number | undefined;
 }): {
   query?: string;
   type?: MemoryType;
   status?: "promoted" | "candidate";
   qualityStatus?: MemoryQualityStatus | "all";
+  lifecycleStatus?: MemoryLifecycleStatus | "all";
   limit?: number;
 } {
   const normalized: {
@@ -607,12 +653,14 @@ function normalizeMemorySearchInput(input: {
     type?: MemoryType;
     status?: "promoted" | "candidate";
     qualityStatus?: MemoryQualityStatus | "all";
+    lifecycleStatus?: MemoryLifecycleStatus | "all";
     limit?: number;
   } = {};
   if (input.query !== undefined) normalized.query = input.query;
   if (input.type !== undefined) normalized.type = input.type;
   if (input.status !== undefined) normalized.status = input.status;
   if (input.qualityStatus !== undefined) normalized.qualityStatus = input.qualityStatus;
+  if (input.lifecycleStatus !== undefined) normalized.lifecycleStatus = input.lifecycleStatus;
   if (input.limit !== undefined) normalized.limit = input.limit;
   return normalized;
 }
@@ -624,6 +672,7 @@ function normalizeRememberMemoryInput(input: {
   reason?: string | undefined;
   relatedFiles?: string[] | undefined;
   promote?: boolean | undefined;
+  supersedesMemoryId?: string | undefined;
 }): {
   type: MemoryType;
   text: string;
@@ -631,6 +680,7 @@ function normalizeRememberMemoryInput(input: {
   reason?: string;
   relatedFiles?: string[];
   promote?: boolean;
+  supersedesMemoryId?: string;
 } {
   const normalized: {
     type: MemoryType;
@@ -639,6 +689,7 @@ function normalizeRememberMemoryInput(input: {
     reason?: string;
     relatedFiles?: string[];
     promote?: boolean;
+    supersedesMemoryId?: string;
   } = {
     type: input.type,
     text: input.text
@@ -647,6 +698,34 @@ function normalizeRememberMemoryInput(input: {
   if (input.reason !== undefined) normalized.reason = input.reason;
   if (input.relatedFiles !== undefined) normalized.relatedFiles = input.relatedFiles;
   if (input.promote !== undefined) normalized.promote = input.promote;
+  if (input.supersedesMemoryId !== undefined) normalized.supersedesMemoryId = input.supersedesMemoryId;
+  return normalized;
+}
+
+function normalizeUpdateMemoryStatusInput(input: {
+  memoryId: string;
+  status: MemoryLifecycleStatus;
+  reason: string;
+  replacementMemoryId?: string | undefined;
+}): {
+  memoryId: string;
+  status: MemoryLifecycleStatus;
+  reason: string;
+  replacementMemoryId?: string;
+} {
+  const reason = input.reason.trim();
+  if (!reason) throw new Error("Memory lifecycle status reason is required");
+  const normalized: {
+    memoryId: string;
+    status: MemoryLifecycleStatus;
+    reason: string;
+    replacementMemoryId?: string;
+  } = {
+    memoryId: input.memoryId,
+    status: input.status,
+    reason
+  };
+  if (input.replacementMemoryId !== undefined) normalized.replacementMemoryId = input.replacementMemoryId;
   return normalized;
 }
 

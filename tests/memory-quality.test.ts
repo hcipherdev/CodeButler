@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { assessMemoryQuality } from "../src/memory/quality.js";
+import { assessMemoryQuality, auditMemoryQuality, summarizeMemoryHealth } from "../src/memory/quality.js";
 import { openMemoryStore } from "../src/storage/store.js";
 import type { ExtractedMemory } from "../src/types.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
@@ -11,6 +11,90 @@ describe("memory quality gate", () => {
   afterEach(() => {
     for (const dir of tempDirs) cleanupTempDir(dir);
     tempDirs = [];
+  });
+
+  it("audits every logical memory when more than 100 are promoted", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({
+      source: {
+        id: "conv-many",
+        type: "conversation",
+        title: "many.md",
+        origin: "test",
+        rawContent: "Evidence for the complete audit."
+      },
+      chunks: [{ text: "Evidence for the complete audit." }]
+    });
+    for (let index = 0; index < 101; index += 1) {
+      const candidate = store.upsertMemoryCandidate({
+        type: "constraint",
+        title: `Constraint ${index}`,
+        summary: `Constraint number ${index} is durable project guidance.`,
+        reason: "Exercise whole-store quality scanning.",
+        confidence: 0.9,
+        evidence: [{ sourceType: "conversation", sourceId: "conv-many", locator: "conv-many:chunk:0" }],
+        relatedFiles: [],
+        dedupeKey: `many-${index}`
+      });
+      store.promoteMemoryCandidate(candidate.id);
+    }
+    store.upsertMemoryCandidate({
+      type: "constraint",
+      title: "Remaining candidate",
+      summary: "This unpromoted candidate must also be audited.",
+      reason: "Logical candidates exclude promoted candidate rows.",
+      confidence: 0.9,
+      evidence: [{ sourceType: "conversation", sourceId: "conv-many", locator: "conv-many:chunk:0" }],
+      relatedFiles: [],
+      dedupeKey: "remaining-candidate"
+    });
+
+    expect(summarizeMemoryHealth(store)).toMatchObject({ scanned: 102, total: 102, complete: true });
+    expect(auditMemoryQuality(store, { now: "2026-07-11T00:00:00Z" })).toMatchObject({
+      scanned: 102,
+      total: 102,
+      complete: true
+    });
+    store.close();
+  });
+
+  it("includes current, superseded, and retracted durable memories in maintenance totals", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const ids = ["current", "superseded", "retracted"].map((suffix) => {
+      const candidate = store.upsertMemoryCandidate({
+        type: "constraint",
+        title: `Maintenance ${suffix}`,
+        summary: `Maintenance scans include the ${suffix} lifecycle state.`,
+        reason: "Health totals cover all durable memories.",
+        confidence: 0.9,
+        evidence: [],
+        relatedFiles: [],
+        dedupeKey: `maintenance-${suffix}`
+      }, { qualityStatus: "active", qualityReasons: [] });
+      return store.promoteMemoryCandidate(candidate.id).id;
+    });
+    store.updateMemoryLifecycle(ids[1] as string, { lifecycleStatus: "superseded" });
+    store.updateMemoryLifecycle(ids[2] as string, { lifecycleStatus: "retracted" });
+
+    expect(summarizeMemoryHealth(store)).toMatchObject({
+      scanned: 3,
+      total: 3,
+      active: 3,
+      needsReview: 0,
+      quarantined: 0
+    });
+    expect(auditMemoryQuality(store, { now: "2026-07-12T00:00:00Z" })).toMatchObject({
+      scanned: 3,
+      total: 3,
+      quarantined: 3
+    });
+    store.close();
   });
 
   function createStore() {
@@ -100,6 +184,20 @@ describe("memory quality gate", () => {
       rejected: true,
       reasons: expect.arrayContaining(["missing_evidence"])
     });
+
+    for (const evidence of [
+      [{ sourceType: "conversation" as const, sourceId: "conv-1" }],
+      [{ sourceType: "conversation" as const, sourceId: "conv-1", locator: "other-source:chunk:0" }],
+      [{ sourceType: "conversation" as const, sourceId: "abc123", locator: "abc123:chunk:0" }]
+    ]) {
+      expect(assessMemoryQuality(store, memory({ evidence }))).toMatchObject({
+        status: "quarantined",
+        rejected: true,
+        resolvedEvidenceCount: 0,
+        unresolvedEvidenceCount: 1,
+        reasons: expect.arrayContaining(["unresolved_evidence"])
+      });
+    }
     expect(
       assessMemoryQuality(store, memory({ evidence: [{ sourceType: "conversation", sourceId: "missing" }] }))
     ).toMatchObject({

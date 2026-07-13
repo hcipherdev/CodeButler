@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import type { DatabaseSync } from "node:sqlite";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runDoctor } from "../src/doctor/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
@@ -91,7 +92,32 @@ describe("doctor service", () => {
         expect.objectContaining({ id: "config:load", status: "ok" }),
         expect.objectContaining({ id: "storage:sqlite", status: "ok" }),
         expect.objectContaining({ id: "summary:freshness", status: "ok" }),
-        expect.objectContaining({ id: "extractor:credentials", status: "ok" })
+        expect.objectContaining({ id: "extractor:credentials", status: "ok" }),
+        expect.objectContaining({ id: "storage:quick_check", status: "ok", metadata: { result: "ok" } }),
+        expect.objectContaining({
+          id: "storage:schema_migrations",
+          status: "ok",
+          metadata: expect.objectContaining({
+            currentVersion: expect.any(Number),
+            latestVersion: expect.any(Number),
+            pendingMigrations: [],
+            latestBackup: null
+          })
+        }),
+        expect.objectContaining({
+          id: "storage:transaction_recovery",
+          status: "ok",
+          metadata: expect.objectContaining({
+            inTransaction: false,
+            journalMode: "wal",
+            busyTimeout: 5000,
+            recoveryReady: true
+          })
+        }),
+        expect.objectContaining({
+          id: "memory:quality",
+          metadata: expect.objectContaining({ total: 0, scanned: 0, complete: true })
+        })
       ])
     );
     expect(report.nextActions).toEqual([]);
@@ -169,6 +195,62 @@ describe("doctor service", () => {
         })
       ])
     );
+  });
+
+  it("reports a future migration ledger as incompatible", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir);
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.db.prepare("insert into schema_migrations values (99, 'future', '2026-07-11T00:00:00Z')").run();
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+    expect(report.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "storage:schema_migrations",
+          status: "error",
+          detail: expect.stringContaining("newer schema version")
+        })
+      ])
+    );
+  });
+
+  it("recommends initialization when a readable database has pending migrations", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir);
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.db.prepare("delete from schema_migrations where version = (select max(version) from schema_migrations)").run();
+    store.close();
+
+    const report = runDoctor(rootDir);
+    expect(report.nextActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ command: "code-butler init" })
+    ]));
+  });
+
+  it("closes the database when storage inspection throws after opening", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeConfig(rootDir);
+    writeFileSync(join(rootDir, ".code-butler", "memory.sqlite"), "");
+    const close = vi.fn();
+    const fake = {
+      exec() {},
+      prepare() { throw new Error("injected inspection failure"); },
+      close
+    } as unknown as DatabaseSync;
+
+    runDoctor(rootDir, { openDatabase: () => fake });
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("reports sync errors, stale sync, missing summary, and memory health actions", () => {

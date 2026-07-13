@@ -150,7 +150,12 @@ describe("AnthropicAWS provider", () => {
       httpMock
     );
     const result = await extractor.extract({
-      conversations: [],
+      conversations: [{
+        sourceId: "anthropic-session",
+        title: "session",
+        rawContent: "provider context",
+        chunks: [{ chunkIndex: 0, text: "provider context" }]
+      }],
       commits: [
         {
           hash: "abc123",
@@ -170,8 +175,14 @@ describe("AnthropicAWS provider", () => {
     const [, init] = httpMock.mock.calls[0] as [string, { method: string; headers: Record<string, string>; body: string }];
     const body = JSON.parse(init.body as string);
     expect(body.system).toContain("Extract durable project memories");
+    expect(body.system).toContain("exact supplied chunk ID");
     expect(body.messages).toHaveLength(1);
     expect(body.messages[0]?.role).toBe("user");
+    const providerContext = JSON.parse(body.messages[0].content);
+    expect(providerContext.conversations[0].chunks[0]).toMatchObject({
+      id: "anthropic-session:chunk:0",
+      sourceId: "anthropic-session"
+    });
   });
 
   it("parses fenced JSON extractor responses", async () => {

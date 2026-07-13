@@ -30,7 +30,11 @@ describe("OpenAI-compatible extractor", () => {
                     dedupeKey: "cache-stale-reads",
                     relatedFiles: ["src/cache.ts"],
                     evidence: [
-                      { sourceType: "conversation", sourceId: "codex:session-1" },
+                      {
+                        sourceType: "conversation",
+                        sourceId: "codex:session-1",
+                        locator: "codex:session-1:chunk:0"
+                      },
                       { sourceType: "commit", sourceId: "abc123" }
                     ]
                   }
@@ -53,7 +57,12 @@ describe("OpenAI-compatible extractor", () => {
     );
 
     const result = await extractor.extract({
-      conversations: [{ sourceId: "codex:session-1", title: "session", rawContent: "cache stale read" }],
+      conversations: [{
+        sourceId: "codex:session-1",
+        title: "session",
+        rawContent: "cache stale read",
+        chunks: [{ chunkIndex: 0, text: "cache stale read" }]
+      }],
       commits: [
         {
           hash: "abc123",
@@ -75,13 +84,28 @@ describe("OpenAI-compatible extractor", () => {
       confidence: 0.92,
       relatedFiles: ["src/cache.ts"]
     });
+    const request = JSON.parse(fetchMock.mock.calls[0]![1]!.body as string);
+    expect(request.messages[0].content).toContain("exact supplied chunk ID");
+    const providerContext = JSON.parse(request.messages[1].content);
+    expect(providerContext.conversations[0].chunks[0]).toMatchObject({
+      id: "codex:session-1:chunk:0",
+      sourceId: "codex:session-1"
+    });
   });
 
   it("skips invalid individual memories and reports rejection reasons", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({
-        choices: [{ message: { content: "{\"memories\":[{\"title\":\"missing fields\"}]}" } }]
+        choices: [{ message: { content: JSON.stringify({ memories: [
+          { title: "missing fields" },
+          {
+            type: "constraint", title: "Missing locator", summary: "A valid-looking memory.",
+            reason: "Conversation evidence omitted its chunk.", confidence: 0.9,
+            dedupeKey: "missing-locator", relatedFiles: [],
+            evidence: [{ sourceType: "conversation", sourceId: "conv-1" }]
+          }
+        ] }) } }]
       })
     });
 
@@ -97,7 +121,10 @@ describe("OpenAI-compatible extractor", () => {
 
     await expect(extractor.extract({ conversations: [], commits: [] })).resolves.toEqual({
       memories: [],
-      rejected: [{ index: 0, reason: "invalid_memory_record" }]
+      rejected: [
+        { index: 0, reason: "invalid_memory_record" },
+        { index: 1, reason: "conversation_evidence_requires_exact_chunk_locator" }
+      ]
     });
   });
 

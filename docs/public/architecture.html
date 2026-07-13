@@ -545,7 +545,7 @@
     <div class="logo">code<span>butler</span></div>
     <div class="subtitle">Local-First Project Memory System — Architecture Overview</div>
   </div>
-  <div class="badge">SQLite · MCP · TypeScript · <b>9 layers</b> · <b>18 tools</b></div>
+  <div class="badge">SQLite · MCP · TypeScript · <b>9 layers</b> · <b>20 tools</b></div>
 </header>
 
 <main>
@@ -681,7 +681,7 @@
           <div class="stage-title">MCP / CLI</div>
         </div>
         <div class="stage-body" style="border-radius:0 0 8px 0">
-          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>18 MCP tools exposed</div>
+          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>20 MCP tools exposed</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Memory health + doctor</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Project narrative summaries</div>
@@ -925,7 +925,7 @@
               <div class="layer-toggle">▼</div>
             </summary>
             <div class="layer-body">
-              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>18 exposed tools</div>
+              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>20 exposed tools</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Global launcher via code-butler mcp</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate, summarize</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Memory health, doctor, project briefs</div>
@@ -952,7 +952,7 @@
 
       <!-- RIGHT: MCP Tools -->
       <div>
-        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (18)</div>
+        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (20)</div>
         <div class="mcp-col">
           <div class="mcp-group-label">Search & Read</div>
           <div class="mcp-card">
@@ -970,6 +970,14 @@
           <div class="mcp-card">
             <div class="mcp-tool-name">find_memories</div>
             <div class="mcp-tool-desc">Find promoted or candidate durable memories</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">remember_project_memory</div>
+            <div class="mcp-tool-desc">Capture durable memory with optional supersession</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">update_memory_status</div>
+            <div class="mcp-tool-desc">Set current, superseded, or retracted lifecycle status</div>
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">find_decisions</div>
@@ -1355,7 +1363,7 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/mcp/tools.ts</div>
-        <div class="file-desc">MCP tool registration and handlers (18 tools)</div>
+        <div class="file-desc">MCP tool registration and handlers (20 tools)</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/sync/service.ts</div>

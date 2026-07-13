@@ -27,6 +27,8 @@ export interface MemoryAuditChange {
 
 export interface MemoryAuditResult {
   scanned: number;
+  total: number;
+  complete: boolean;
   active: number;
   needsReview: number;
   quarantined: number;
@@ -45,6 +47,7 @@ export function assessMemoryQuality(
     now?: string | undefined;
     source?: DurableMemory["source"] | undefined;
     currentStatus?: MemoryQualityStatus | undefined;
+    potentialConflict?: boolean | undefined;
   } = {}
 ): MemoryQualityAssessment {
   const reasons = new Set<string>();
@@ -73,6 +76,7 @@ export function assessMemoryQuality(
   if (parts.some(isTableFragment)) reasons.add("table_fragment_content");
   if (hasVeryLowProseRatio(text)) reasons.add("low_prose_ratio");
   if (hasNewerRelatedCommits(store, memory, options.source)) reasons.add("stale_related_file_evidence");
+  if (options.potentialConflict ?? hasPotentialConflict(store, memory)) reasons.add("potential_conflict");
 
   const hardReasons = [
     "invalid_confidence",
@@ -102,12 +106,14 @@ export function assessMemoryQuality(
 }
 
 export function summarizeMemoryHealth(store: MemoryStore): Omit<MemoryAuditResult, "updated" | "changes"> {
-  const candidates = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: 100 });
-  const promoted = store.listMemories({ qualityStatus: "all", limit: 100 });
+  const candidates = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: null });
+  const promoted = store.listMemories({ lifecycleStatus: "all", qualityStatus: "all", limit: null });
   const all = [...candidates, ...promoted];
   const reasons = all.flatMap((memory) => memory.qualityReasons);
   return {
     scanned: all.length,
+    total: all.length,
+    complete: true,
     active: all.filter((memory) => memory.qualityStatus === "active").length,
     needsReview: all.filter((memory) => memory.qualityStatus === "needs_review").length,
     quarantined: all.filter((memory) => memory.qualityStatus === "quarantined").length,
@@ -121,8 +127,8 @@ export function auditMemoryQuality(
   options: { fix?: boolean | undefined; now?: string | undefined } = {}
 ): MemoryAuditResult {
   const now = options.now ?? new Date().toISOString();
-  const candidates = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: 100 });
-  const promoted = store.listMemories({ qualityStatus: "all", limit: 100 });
+  const candidates = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: null });
+  const promoted = store.listMemories({ lifecycleStatus: "all", qualityStatus: "all", limit: null });
   const changes: MemoryAuditChange[] = [];
   const all = [
     ...candidates.map((memory) => ({ kind: "candidate" as const, memory })),
@@ -178,6 +184,8 @@ function summarizeProjectedHealth(
   });
   return {
     scanned: all.length,
+    total: all.length,
+    complete: true,
     active: statuses.filter((status) => status === "active").length,
     needsReview: statuses.filter((status) => status === "needs_review").length,
     quarantined: statuses.filter((status) => status === "quarantined").length,
@@ -188,6 +196,11 @@ function summarizeProjectedHealth(
 
 function evidenceExists(store: MemoryStore, evidence: EvidenceRef): boolean {
   if (evidence.sourceType === "commit") return store.readCommit(evidence.sourceId) !== undefined;
+  if (evidence.sourceType === "conversation") {
+    if (evidence.locator === undefined) return false;
+    if (store.readSource(evidence.sourceId)?.type !== "conversation") return false;
+    return store.readConversationWindow(evidence.sourceId, evidence.locator, 0, 0).length === 1;
+  }
   return store.readSource(evidence.sourceId) !== undefined;
 }
 
@@ -245,6 +258,17 @@ function hasNewerRelatedCommits(
       return Number.isFinite(authoredAt) && authoredAt > latestEvidenceCommit;
     })
   );
+}
+
+function hasPotentialConflict(store: MemoryStore, memory: AuditableMemory): boolean {
+  if (!("lifecycleStatus" in memory)) return false;
+  return store.listMemoryRelations({
+    fromMemoryId: memory.id,
+    relationType: "potentially_contradicts"
+  }).length > 0 || store.listMemoryRelations({
+    toMemoryId: memory.id,
+    relationType: "potentially_contradicts"
+  }).length > 0;
 }
 
 function topReasons(reasons: string[]): Array<{ reason: string; count: number }> {

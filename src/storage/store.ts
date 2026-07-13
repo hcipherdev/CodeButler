@@ -4,6 +4,10 @@ import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
+import { createEvidenceSignature } from "../memory/evidence-signature.js";
+import { createMemorySubjectKey } from "../memory/lifecycle.js";
+import { initializeSchema } from "./migrations.js";
+import { withTransaction } from "./transactions.js";
 import type {
   CommitRecord,
   DecisionRecord,
@@ -14,8 +18,11 @@ import type {
   InvestigationEntityRef,
   MemoryCandidate,
   MemoryChunk,
+  MemoryLifecycleStatus,
   MemoryPromotionState,
   MemoryQualityStatus,
+  MemoryRelation,
+  MemoryRelationType,
   MemorySearchResult,
   MemorySource,
   MemoryType,
@@ -56,6 +63,7 @@ export interface ProjectSummary {
 }
 
 export type MemoryQualityStatusFilter = MemoryQualityStatus | "all";
+export type MemoryLifecycleStatusFilter = MemoryLifecycleStatus | "all";
 
 export interface MemoryStore {
   init(): void;
@@ -87,19 +95,44 @@ export interface MemoryStore {
   ): MemoryCandidate;
   promoteMemoryCandidate(candidateId: string, source?: DurableMemory["source"]): DurableMemory;
   upsertManualDecisionMemory(decision: DecisionRecord): DurableMemory;
+  readMemory(id: string): DurableMemory | undefined;
+  updateMemoryLifecycle(
+    id: string,
+    lifecycle: {
+      lifecycleStatus: MemoryLifecycleStatus;
+      validFrom?: string;
+      validUntil?: string | null;
+      statusReason?: string | null;
+      statusChangedAt?: string;
+    }
+  ): DurableMemory;
+  addMemoryRelation(input: {
+    fromMemoryId: string;
+    toMemoryId: string;
+    relationType: MemoryRelationType;
+    createdAt?: string;
+    reason?: string;
+  }): MemoryRelation;
+  listMemoryRelations(input?: {
+    fromMemoryId?: string;
+    toMemoryId?: string;
+    relationType?: MemoryRelationType;
+  }): MemoryRelation[];
+  deleteMemoryRelation(id: string): boolean;
   listMemoryCandidates(input?: {
     type?: MemoryType;
     promotionState?: MemoryPromotionState;
     qualityStatus?: MemoryQualityStatusFilter;
     query?: string;
-    limit?: number;
+    limit?: number | null;
   }): MemoryCandidate[];
   listMemories(input?: {
     type?: MemoryType;
     status?: "promoted" | "candidate";
+    lifecycleStatus?: MemoryLifecycleStatusFilter;
     qualityStatus?: MemoryQualityStatusFilter;
     query?: string;
-    limit?: number;
+    limit?: number | null;
   }): DurableMemory[];
   updateMemoryQuality(
     kind: "candidate" | "promoted",
@@ -130,6 +163,7 @@ export interface MemoryStore {
     query?: string;
     type?: MemoryType;
     status?: "promoted" | "candidate";
+    lifecycleStatus?: MemoryLifecycleStatusFilter;
     qualityStatus?: MemoryQualityStatusFilter;
     limit?: number;
   }): MemorySearchResult[];
@@ -208,6 +242,7 @@ interface MemoryCandidateRow {
   related_files_json: string;
   dedupe_key: string;
   promotion_state: MemoryPromotionState;
+  promoted_memory_id: string | null;
   quality_status: MemoryQualityStatus;
   quality_reasons_json: string;
   last_verified_at: string | null;
@@ -229,6 +264,12 @@ interface MemoryRow {
   quality_status: MemoryQualityStatus;
   quality_reasons_json: string;
   last_verified_at: string | null;
+  subject_key: string;
+  lifecycle_status: MemoryLifecycleStatus;
+  valid_from: string;
+  valid_until: string | null;
+  status_reason: string | null;
+  status_changed_at: string;
   created_at: string;
   promoted_at: string;
 }
@@ -264,6 +305,15 @@ interface RelationRow {
   locator: string | null;
 }
 
+interface MemoryRelationRow {
+  id: string;
+  from_memory_id: string;
+  to_memory_id: string;
+  relation_type: MemoryRelationType;
+  created_at: string;
+  reason: string | null;
+}
+
 const TEMPORARY_MEMORY_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 const TEMPORARY_MEMORY_MAX_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 
@@ -275,6 +325,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
   mkdirSync(dataDir, { recursive: true });
 
   const db = new DatabaseSync(databasePath);
+  db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA journal_mode = WAL");
 
@@ -290,60 +341,62 @@ export function openMemoryStore(rootDir: string): MemoryStore {
     init() {
       mkdirSync(conversationsDir, { recursive: true });
       mkdirSync(decisionsDir, { recursive: true });
-      runMigrations(db);
+      initializeSchema(db, databasePath);
     },
     close() {
       db.close();
     },
     addSourceWithChunks(input) {
-      const sourceId = input.source.id ?? createId(input.source.type);
-      const metadataJson = JSON.stringify(input.source.metadata ?? {});
-      db.prepare(
-        `insert into sources (id, type, title, origin, raw_content, metadata_json, created_at)
-         values (?, ?, ?, ?, ?, ?, ?)
-         on conflict(id) do update set
-           type = excluded.type,
-           title = excluded.title,
-           origin = excluded.origin,
-           raw_content = excluded.raw_content,
-           metadata_json = excluded.metadata_json`
-      ).run(
-        sourceId,
-        input.source.type,
-        input.source.title,
-        input.source.origin,
-        input.source.rawContent,
-        metadataJson,
-        new Date().toISOString()
-      );
-
-      db.prepare("delete from chunks_fts where source_id = ?").run(sourceId);
-      db.prepare("delete from chunks where source_id = ?").run(sourceId);
-
-      const insertChunk = db.prepare(
-        `insert into chunks (id, source_id, chunk_index, text, metadata_json)
-         values (?, ?, ?, ?, ?)`
-      );
-      const insertFts = db.prepare(
-        `insert into chunks_fts (chunk_id, source_id, source_type, title, text)
-         values (?, ?, ?, ?, ?)`
-      );
-
-      for (const [index, chunk] of input.chunks.entries()) {
-        const chunkId = `${sourceId}:chunk:${index}`;
-        insertChunk.run(
-          chunkId,
+      return withTransaction(db, () => {
+        const sourceId = input.source.id ?? createId(input.source.type);
+        const metadataJson = JSON.stringify(input.source.metadata ?? {});
+        db.prepare(
+          `insert into sources (id, type, title, origin, raw_content, metadata_json, created_at)
+           values (?, ?, ?, ?, ?, ?, ?)
+           on conflict(id) do update set
+             type = excluded.type,
+             title = excluded.title,
+             origin = excluded.origin,
+             raw_content = excluded.raw_content,
+             metadata_json = excluded.metadata_json`
+        ).run(
           sourceId,
-          index,
-          chunk.text,
-          JSON.stringify(chunk.metadata ?? {})
+          input.source.type,
+          input.source.title,
+          input.source.origin,
+          input.source.rawContent,
+          metadataJson,
+          new Date().toISOString()
         );
-        insertFts.run(chunkId, sourceId, input.source.type, input.source.title, chunk.text);
-      }
 
-      rebuildSourceRelations(db, sourceId, input.source, input.chunks);
+        db.prepare("delete from chunks_fts where source_id = ?").run(sourceId);
+        db.prepare("delete from chunks where source_id = ?").run(sourceId);
 
-      return sourceId;
+        const insertChunk = db.prepare(
+          `insert into chunks (id, source_id, chunk_index, text, metadata_json)
+           values (?, ?, ?, ?, ?)`
+        );
+        const insertFts = db.prepare(
+          `insert into chunks_fts (chunk_id, source_id, source_type, title, text)
+           values (?, ?, ?, ?, ?)`
+        );
+
+        for (const [index, chunk] of input.chunks.entries()) {
+          const chunkId = `${sourceId}:chunk:${index}`;
+          insertChunk.run(
+            chunkId,
+            sourceId,
+            index,
+            chunk.text,
+            JSON.stringify(chunk.metadata ?? {})
+          );
+          insertFts.run(chunkId, sourceId, input.source.type, input.source.title, chunk.text);
+        }
+
+        rebuildSourceRelations(db, sourceId, input.source, input.chunks);
+
+        return sourceId;
+      });
     },
     readSource(sourceId) {
       const row = db
@@ -430,50 +483,52 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       }));
     },
     addCommit(commit) {
-      db.prepare(
-        `insert into commits
-           (hash, author_name, author_email, authored_at, message, changed_files_json, diff_summary)
-         values (?, ?, ?, ?, ?, ?, ?)
-         on conflict(hash) do update set
-           author_name = excluded.author_name,
-           author_email = excluded.author_email,
-           authored_at = excluded.authored_at,
-           message = excluded.message,
-           changed_files_json = excluded.changed_files_json,
-           diff_summary = excluded.diff_summary`
-      ).run(
-        commit.hash,
-        commit.authorName,
-        commit.authorEmail,
-        commit.authoredAt,
-        commit.message,
-        JSON.stringify(commit.changedFiles),
-        commit.diffSummary
-      );
-      const sourceId = store.addSourceWithChunks({
-        source: {
-          id: commit.hash,
-          type: "commit",
-          title: commit.message,
-          origin: "git",
-          rawContent: formatCommitRawContent(commit),
-          metadata: {
-            hash: commit.hash,
-            authorName: commit.authorName,
-            authorEmail: commit.authorEmail,
-            authoredAt: commit.authoredAt,
-            changedFiles: commit.changedFiles
-          }
-        },
-        chunks: [
-          {
-            text: formatCommitSearchText(commit),
-            metadata: { hash: commit.hash, changedFiles: commit.changedFiles }
-          }
-        ]
+      return withTransaction(db, () => {
+        db.prepare(
+          `insert into commits
+             (hash, author_name, author_email, authored_at, message, changed_files_json, diff_summary)
+           values (?, ?, ?, ?, ?, ?, ?)
+           on conflict(hash) do update set
+             author_name = excluded.author_name,
+             author_email = excluded.author_email,
+             authored_at = excluded.authored_at,
+             message = excluded.message,
+             changed_files_json = excluded.changed_files_json,
+             diff_summary = excluded.diff_summary`
+        ).run(
+          commit.hash,
+          commit.authorName,
+          commit.authorEmail,
+          commit.authoredAt,
+          commit.message,
+          JSON.stringify(commit.changedFiles),
+          commit.diffSummary
+        );
+        const sourceId = store.addSourceWithChunks({
+          source: {
+            id: commit.hash,
+            type: "commit",
+            title: commit.message,
+            origin: "git",
+            rawContent: formatCommitRawContent(commit),
+            metadata: {
+              hash: commit.hash,
+              authorName: commit.authorName,
+              authorEmail: commit.authorEmail,
+              authoredAt: commit.authoredAt,
+              changedFiles: commit.changedFiles
+            }
+          },
+          chunks: [
+            {
+              text: formatCommitSearchText(commit),
+              metadata: { hash: commit.hash, changedFiles: commit.changedFiles }
+            }
+          ]
+        });
+        rebuildCommitRelations(db, commit);
+        return sourceId;
       });
-      rebuildCommitRelations(db, commit);
-      return sourceId;
     },
     readCommit(hash) {
       const row = db
@@ -721,108 +776,113 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       return rows.map(syncStatusFromRow);
     },
     upsertMemoryCandidate(memory, options) {
-      const now = new Date().toISOString();
-      const existing = db
-        .prepare(
-          `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, quality_status, quality_reasons_json, last_verified_at,
-                  created_at, updated_at
-           from memory_candidates
-           where dedupe_key = ?`
-        )
-        .get(memory.dedupeKey) as MemoryCandidateRow | undefined;
-      const candidateId = existing?.id ?? `candidate-${randomUUID()}`;
-      const promotionState = options?.promotionState ?? existing?.promotion_state ?? "candidate";
-      const qualityStatus = options?.qualityStatus ?? existing?.quality_status ?? "active";
-      const qualityReasons = options?.qualityReasons ?? parseJsonArray(existing?.quality_reasons_json ?? "[]");
-      const lastVerifiedAt = options?.lastVerifiedAt ?? existing?.last_verified_at ?? null;
-      db.prepare(
-        `insert into memory_candidates
-           (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-            dedupe_key, promotion_state, evidence_signature, quality_status, quality_reasons_json,
-            last_verified_at, created_at, updated_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         on conflict(dedupe_key) do update set
-           type = excluded.type,
-           title = excluded.title,
-           summary = excluded.summary,
-           reason = excluded.reason,
-           confidence = excluded.confidence,
-           evidence_json = excluded.evidence_json,
-           related_files_json = excluded.related_files_json,
-           promotion_state = excluded.promotion_state,
-           evidence_signature = excluded.evidence_signature,
-           quality_status = excluded.quality_status,
-           quality_reasons_json = excluded.quality_reasons_json,
-           last_verified_at = excluded.last_verified_at,
-           updated_at = excluded.updated_at`
-      ).run(
-        candidateId,
-        memory.type,
-        memory.title,
-        memory.summary,
-        memory.reason,
-        memory.confidence,
-        JSON.stringify(memory.evidence),
-        JSON.stringify(memory.relatedFiles),
-        memory.dedupeKey,
-        promotionState,
-        normalizeEvidenceSignature(memory.evidence),
-        qualityStatus,
-        JSON.stringify(qualityReasons),
-        lastVerifiedAt,
-        existing?.created_at ?? now,
-        now
-      );
-      rebuildMemoryLinks(db, "candidate", candidateId, memory.evidence, memory.relatedFiles);
-      const row = db
-        .prepare(
-          `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, quality_status, quality_reasons_json, last_verified_at,
-                  created_at, updated_at
-           from memory_candidates
-           where id = ?`
-        )
-        .get(candidateId) as unknown as MemoryCandidateRow;
-      return memoryCandidateFromRow(row);
+      return withTransaction(db, () => {
+        const now = new Date().toISOString();
+        const existing = db
+          .prepare(
+            `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                    dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
+                    created_at, updated_at
+             from memory_candidates
+             where dedupe_key = ?`
+          )
+          .get(memory.dedupeKey) as MemoryCandidateRow | undefined;
+        const candidateId = existing?.id ?? `candidate-${randomUUID()}`;
+        const promotionState = options?.promotionState ?? existing?.promotion_state ?? "candidate";
+        const qualityStatus = options?.qualityStatus ?? existing?.quality_status ?? "active";
+        const qualityReasons = options?.qualityReasons ?? parseJsonArray(existing?.quality_reasons_json ?? "[]");
+        const lastVerifiedAt = options?.lastVerifiedAt ?? existing?.last_verified_at ?? null;
+        db.prepare(
+          `insert into memory_candidates
+             (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+              dedupe_key, promotion_state, evidence_signature, quality_status, quality_reasons_json,
+              last_verified_at, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(dedupe_key) do update set
+             type = excluded.type,
+             title = excluded.title,
+             summary = excluded.summary,
+             reason = excluded.reason,
+             confidence = excluded.confidence,
+             evidence_json = excluded.evidence_json,
+             related_files_json = excluded.related_files_json,
+             promotion_state = excluded.promotion_state,
+             evidence_signature = excluded.evidence_signature,
+             quality_status = excluded.quality_status,
+             quality_reasons_json = excluded.quality_reasons_json,
+             last_verified_at = excluded.last_verified_at,
+             updated_at = excluded.updated_at`
+        ).run(
+          candidateId,
+          memory.type,
+          memory.title,
+          memory.summary,
+          memory.reason,
+          memory.confidence,
+          JSON.stringify(memory.evidence),
+          JSON.stringify(memory.relatedFiles),
+          memory.dedupeKey,
+          promotionState,
+          createEvidenceSignature(memory.evidence),
+          qualityStatus,
+          JSON.stringify(qualityReasons),
+          lastVerifiedAt,
+          existing?.created_at ?? now,
+          now
+        );
+        rebuildMemoryLinks(db, "candidate", candidateId, memory.evidence, memory.relatedFiles);
+        const row = db
+          .prepare(
+            `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                    dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
+                    created_at, updated_at
+             from memory_candidates
+             where id = ?`
+          )
+          .get(candidateId) as unknown as MemoryCandidateRow;
+        return memoryCandidateFromRow(row);
+      });
     },
     promoteMemoryCandidate(candidateId, source = "auto") {
-      const candidate = db
-        .prepare(
-          `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, quality_status, quality_reasons_json, last_verified_at,
-                  created_at, updated_at
-           from memory_candidates
+      return withTransaction(db, () => {
+        const candidate = db
+          .prepare(
+            `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                    dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
+                    created_at, updated_at
+             from memory_candidates
+             where id = ?`
+          )
+          .get(candidateId) as MemoryCandidateRow | undefined;
+        if (!candidate) {
+          throw new Error(`Unknown memory candidate: ${candidateId}`);
+        }
+        const memory = upsertMemoryRow(db, {
+          id: candidate.promoted_memory_id ?? undefined,
+          type: candidate.type,
+          title: candidate.title,
+          summary: candidate.summary,
+          reason: candidate.reason,
+          confidence: candidate.confidence,
+          evidence: parseEvidenceJson(candidate.evidence_json),
+          relatedFiles: parseJsonArray(candidate.related_files_json),
+          dedupeKey: candidate.dedupe_key,
+          source,
+          qualityStatus: candidate.quality_status,
+          qualityReasons: parseJsonArray(candidate.quality_reasons_json),
+          lastVerifiedAt: candidate.last_verified_at ?? undefined,
+          createdAt: candidate.created_at
+        });
+        db.prepare(
+          `update memory_candidates
+           set promotion_state = 'promoted', promoted_memory_id = ?, updated_at = ?
            where id = ?`
-        )
-        .get(candidateId) as MemoryCandidateRow | undefined;
-      if (!candidate) {
-        throw new Error(`Unknown memory candidate: ${candidateId}`);
-      }
-      const memory = upsertMemoryRow(db, {
-        type: candidate.type,
-        title: candidate.title,
-        summary: candidate.summary,
-        reason: candidate.reason,
-        confidence: candidate.confidence,
-        evidence: parseEvidenceJson(candidate.evidence_json),
-        relatedFiles: parseJsonArray(candidate.related_files_json),
-        dedupeKey: candidate.dedupe_key,
-        source,
-        qualityStatus: candidate.quality_status,
-        qualityReasons: parseJsonArray(candidate.quality_reasons_json),
-        lastVerifiedAt: candidate.last_verified_at ?? undefined,
-        createdAt: candidate.created_at
+        ).run(memory.id, new Date().toISOString(), candidateId);
+        return memory;
       });
-      db.prepare(
-        `update memory_candidates
-         set promotion_state = 'promoted', updated_at = ?
-         where id = ?`
-      ).run(new Date().toISOString(), candidateId);
-      return memory;
     },
     upsertManualDecisionMemory(decision) {
-      return upsertMemoryRow(db, {
+      return withTransaction(db, () => upsertMemoryRow(db, {
         id: `memory-manual-${decision.id}`,
         type: "decision",
         title: decision.topic,
@@ -836,16 +896,96 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         qualityStatus: "active",
         qualityReasons: [],
         createdAt: decision.createdAt
+      }));
+    },
+    readMemory(id) {
+      return readMemoryRow(db, id);
+    },
+    updateMemoryLifecycle(id, lifecycle) {
+      return withTransaction(db, () => {
+        const existing = readMemoryRow(db, id);
+        if (!existing) throw new Error(`Unknown durable memory: ${id}`);
+        db.prepare(
+          `update memories
+           set lifecycle_status = ?, valid_from = ?, valid_until = ?, status_reason = ?, status_changed_at = ?
+           where id = ?`
+        ).run(
+          lifecycle.lifecycleStatus,
+          lifecycle.validFrom ?? existing.validFrom,
+          lifecycle.validUntil === undefined ? existing.validUntil ?? null : lifecycle.validUntil,
+          lifecycle.statusReason === undefined ? existing.statusReason ?? null : lifecycle.statusReason,
+          lifecycle.statusChangedAt ?? new Date().toISOString(),
+          id
+        );
+        return readMemoryRow(db, id) as DurableMemory;
       });
+    },
+    addMemoryRelation(input) {
+      return withTransaction(db, () => {
+        if (input.fromMemoryId === input.toMemoryId) {
+          throw new Error("Memory relations cannot relate a memory to itself");
+        }
+        if (!readMemoryRow(db, input.fromMemoryId)) {
+          throw new Error(`Unknown durable memory: ${input.fromMemoryId}`);
+        }
+        if (!readMemoryRow(db, input.toMemoryId)) {
+          throw new Error(`Unknown durable memory: ${input.toMemoryId}`);
+        }
+        const id = `memory-relation-${randomUUID()}`;
+        db.prepare(
+          `insert into memory_relations (id, from_memory_id, to_memory_id, relation_type, created_at, reason)
+           values (?, ?, ?, ?, ?, ?)
+           on conflict(from_memory_id, to_memory_id, relation_type) do nothing`
+        ).run(
+          id,
+          input.fromMemoryId,
+          input.toMemoryId,
+          input.relationType,
+          input.createdAt ?? new Date().toISOString(),
+          input.reason ?? null
+        );
+        const row = db.prepare(
+          `select id, from_memory_id, to_memory_id, relation_type, created_at, reason
+           from memory_relations
+           where from_memory_id = ? and to_memory_id = ? and relation_type = ?`
+        ).get(input.fromMemoryId, input.toMemoryId, input.relationType) as unknown as MemoryRelationRow;
+        return memoryRelationFromRow(row);
+      });
+    },
+    listMemoryRelations(input = {}) {
+      const predicates: string[] = [];
+      const parameters: string[] = [];
+      if (input.fromMemoryId !== undefined) {
+        predicates.push("from_memory_id = ?");
+        parameters.push(input.fromMemoryId);
+      }
+      if (input.toMemoryId !== undefined) {
+        predicates.push("to_memory_id = ?");
+        parameters.push(input.toMemoryId);
+      }
+      if (input.relationType !== undefined) {
+        predicates.push("relation_type = ?");
+        parameters.push(input.relationType);
+      }
+      const where = predicates.length > 0 ? `where ${predicates.join(" and ")}` : "";
+      const rows = db.prepare(
+        `select id, from_memory_id, to_memory_id, relation_type, created_at, reason
+         from memory_relations ${where}
+         order by created_at asc, id asc`
+      ).all(...parameters) as unknown as MemoryRelationRow[];
+      return rows.map(memoryRelationFromRow);
+    },
+    deleteMemoryRelation(id) {
+      return withTransaction(db, () => db.prepare("delete from memory_relations where id = ?").run(id).changes > 0);
     },
     listMemoryCandidates(input = {}) {
       const rows = db
         .prepare(
           `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, quality_status, quality_reasons_json, last_verified_at,
+                  dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                   created_at, updated_at
            from memory_candidates
-           order by updated_at desc, created_at desc`
+           order by updated_at desc, created_at desc, rowid desc`
         )
         .all() as unknown as MemoryCandidateRow[];
       return rows
@@ -856,7 +996,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
           if (!matchesQualityStatus(candidate.qualityStatus, input.qualityStatus)) return false;
           return matchesMemoryQuery(candidate, input.query);
         })
-        .slice(0, normalizeLimit(input.limit));
+        .slice(0, input.limit === null ? undefined : normalizeLimit(input.limit));
     },
     listMemories(input = {}) {
       if (input.status === "candidate") return [];
@@ -864,6 +1004,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .prepare(
           `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                   dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+                  subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                   created_at, promoted_at
            from memories
            order by promoted_at desc, created_at desc`
@@ -873,10 +1014,11 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .map(memoryFromRow)
         .filter((memory) => {
           if (input.type && memory.type !== input.type) return false;
+          if (!matchesLifecycleStatus(memory.lifecycleStatus, input.lifecycleStatus)) return false;
           if (!matchesQualityStatus(memory.qualityStatus, input.qualityStatus)) return false;
           return matchesMemoryQuery(memory, input.query);
         })
-        .slice(0, normalizeLimit(input.limit));
+        .slice(0, input.limit === null ? undefined : normalizeLimit(input.limit));
     },
     updateMemoryQuality(kind, id, quality) {
       const table = kind === "candidate" ? "memory_candidates" : "memories";
@@ -892,86 +1034,88 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       );
     },
     upsertTemporaryMemory(input) {
-      const now = input.updatedAt ?? new Date().toISOString();
-      const existing = input.id
-        ? db
-            .prepare(
-              `select id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
-                      related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
-               from temporary_memories
-               where id = ?`
-            )
-            .get(input.id) as TemporaryMemoryRow | undefined
-        : undefined;
-      const id = input.id ?? `temporary-${randomUUID()}`;
-      const projectId = input.projectId ?? existing?.project_id ?? store.paths.rootDir;
-      const createdAt = input.createdAt ?? existing?.created_at ?? now;
-      const defaultExpiresAt = new Date(Date.parse(now) + TEMPORARY_MEMORY_DEFAULT_TTL_MS).toISOString();
-      const expiresAt = capTemporaryMemoryExpiry(createdAt, input.expiresAt ?? defaultExpiresAt);
-      const details = input.details ?? existing?.details ?? input.summary;
-      const relatedFiles = input.relatedFiles ?? parseJsonArray(existing?.related_files_json ?? "[]");
-      const evidence = input.evidence ?? parseEvidenceJson(existing?.evidence_json ?? "[]");
-      const confidence = input.confidence ?? existing?.confidence ?? 0.7;
+      return withTransaction(db, () => {
+        const now = input.updatedAt ?? new Date().toISOString();
+        const existing = input.id
+          ? db
+              .prepare(
+                `select id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+                        related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
+                 from temporary_memories
+                 where id = ?`
+              )
+              .get(input.id) as TemporaryMemoryRow | undefined
+          : undefined;
+        const id = input.id ?? `temporary-${randomUUID()}`;
+        const projectId = input.projectId ?? existing?.project_id ?? store.paths.rootDir;
+        const createdAt = input.createdAt ?? existing?.created_at ?? now;
+        const defaultExpiresAt = new Date(Date.parse(now) + TEMPORARY_MEMORY_DEFAULT_TTL_MS).toISOString();
+        const expiresAt = capTemporaryMemoryExpiry(createdAt, input.expiresAt ?? defaultExpiresAt);
+        const details = input.details ?? existing?.details ?? input.summary;
+        const relatedFiles = input.relatedFiles ?? parseJsonArray(existing?.related_files_json ?? "[]");
+        const evidence = input.evidence ?? parseEvidenceJson(existing?.evidence_json ?? "[]");
+        const confidence = input.confidence ?? existing?.confidence ?? 0.7;
 
-      db.prepare(
-        `insert into temporary_memories
-           (id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
-            related_files_json, evidence_json, confidence, created_at, updated_at, expires_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         on conflict(id) do update set
-           project_id = excluded.project_id,
-           thread_id = excluded.thread_id,
-           session_id = excluded.session_id,
-           source_adapter = excluded.source_adapter,
-           kind = excluded.kind,
-           title = excluded.title,
-           summary = excluded.summary,
-           details = excluded.details,
-           related_files_json = excluded.related_files_json,
-           evidence_json = excluded.evidence_json,
-           confidence = excluded.confidence,
-           updated_at = excluded.updated_at,
-           expires_at = excluded.expires_at`
-      ).run(
-        id,
-        projectId,
-        input.threadId ?? existing?.thread_id ?? null,
-        input.sessionId ?? existing?.session_id ?? null,
-        input.sourceAdapter ?? existing?.source_adapter ?? null,
-        input.kind,
-        input.title,
-        input.summary,
-        details,
-        JSON.stringify(relatedFiles),
-        JSON.stringify(evidence),
-        confidence,
-        createdAt,
-        now,
-        expiresAt
-      );
-      rebuildTemporaryMemoryLinks(db, id, evidence, relatedFiles);
-      const ftsInput: Parameters<typeof rebuildTemporaryMemoryFts>[1] = {
-        id,
-        projectId,
-        kind: input.kind,
-        title: input.title,
-        summary: input.summary,
-        details
-      };
-      const threadId = input.threadId ?? existing?.thread_id ?? undefined;
-      const sessionId = input.sessionId ?? existing?.session_id ?? undefined;
-      if (threadId !== undefined) ftsInput.threadId = threadId;
-      if (sessionId !== undefined) ftsInput.sessionId = sessionId;
-      rebuildTemporaryMemoryFts(db, ftsInput);
-      const row = db
-        .prepare(
-          `select id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
-                  related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
-           from temporary_memories
-           where id = ?`
-        )
-        .get(id) as unknown as TemporaryMemoryRow;
-      return temporaryMemoryFromRow(row);
+        db.prepare(
+          `insert into temporary_memories
+             (id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+              related_files_json, evidence_json, confidence, created_at, updated_at, expires_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(id) do update set
+             project_id = excluded.project_id,
+             thread_id = excluded.thread_id,
+             session_id = excluded.session_id,
+             source_adapter = excluded.source_adapter,
+             kind = excluded.kind,
+             title = excluded.title,
+             summary = excluded.summary,
+             details = excluded.details,
+             related_files_json = excluded.related_files_json,
+             evidence_json = excluded.evidence_json,
+             confidence = excluded.confidence,
+             updated_at = excluded.updated_at,
+             expires_at = excluded.expires_at`
+        ).run(
+          id,
+          projectId,
+          input.threadId ?? existing?.thread_id ?? null,
+          input.sessionId ?? existing?.session_id ?? null,
+          input.sourceAdapter ?? existing?.source_adapter ?? null,
+          input.kind,
+          input.title,
+          input.summary,
+          details,
+          JSON.stringify(relatedFiles),
+          JSON.stringify(evidence),
+          confidence,
+          createdAt,
+          now,
+          expiresAt
+        );
+        rebuildTemporaryMemoryLinks(db, id, evidence, relatedFiles);
+        const ftsInput: Parameters<typeof rebuildTemporaryMemoryFts>[1] = {
+          id,
+          projectId,
+          kind: input.kind,
+          title: input.title,
+          summary: input.summary,
+          details
+        };
+        const threadId = input.threadId ?? existing?.thread_id ?? undefined;
+        const sessionId = input.sessionId ?? existing?.session_id ?? undefined;
+        if (threadId !== undefined) ftsInput.threadId = threadId;
+        if (sessionId !== undefined) ftsInput.sessionId = sessionId;
+        rebuildTemporaryMemoryFts(db, ftsInput);
+        const row = db
+          .prepare(
+            `select id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+                    related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
+             from temporary_memories
+             where id = ?`
+          )
+          .get(id) as unknown as TemporaryMemoryRow;
+        return temporaryMemoryFromRow(row);
+      });
     },
     searchTemporaryMemory(input) {
       const query = toFtsQuery(input.query);
@@ -1030,25 +1174,27 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       return rankTemporaryMemoryRows(rows, rankInput).map(({ score: _score, rank: _rank, ...memory }) => memory);
     },
     deleteExpiredTemporaryMemories(input = {}) {
-      const expiredOnly = input.expiredOnly ?? true;
-      if (!expiredOnly) {
-        const count = countRows(db, "temporary_memories");
-        db.prepare("delete from temporary_memories_fts").run();
-        db.prepare("delete from temporary_memory_links").run();
-        db.prepare("delete from temporary_memories").run();
-        return count;
-      }
+      return withTransaction(db, () => {
+        const expiredOnly = input.expiredOnly ?? true;
+        if (!expiredOnly) {
+          const count = countRows(db, "temporary_memories");
+          db.prepare("delete from temporary_memories_fts").run();
+          db.prepare("delete from temporary_memory_links").run();
+          db.prepare("delete from temporary_memories").run();
+          return count;
+        }
 
-      const now = input.now ?? new Date().toISOString();
-      const rows = db
-        .prepare("select id from temporary_memories where expires_at <= ?")
-        .all(now) as Array<{ id: string }>;
-      for (const row of rows) {
-        db.prepare("delete from temporary_memories_fts where memory_id = ?").run(row.id);
-        db.prepare("delete from temporary_memory_links where memory_id = ?").run(row.id);
-        db.prepare("delete from temporary_memories where id = ?").run(row.id);
-      }
-      return rows.length;
+        const now = input.now ?? new Date().toISOString();
+        const rows = db
+          .prepare("select id from temporary_memories where expires_at <= ?")
+          .all(now) as Array<{ id: string }>;
+        for (const row of rows) {
+          db.prepare("delete from temporary_memories_fts where memory_id = ?").run(row.id);
+          db.prepare("delete from temporary_memory_links where memory_id = ?").run(row.id);
+          db.prepare("delete from temporary_memories where id = ?").run(row.id);
+        }
+        return rows.length;
+      });
     },
     searchMemoryLayer(input = {}) {
       const limit = normalizeLimit(input.limit);
@@ -1059,6 +1205,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       if (input.type !== undefined) promotedInput.type = input.type;
       if (input.query !== undefined) promotedInput.query = input.query;
       if (input.qualityStatus !== undefined) promotedInput.qualityStatus = input.qualityStatus;
+      if (input.lifecycleStatus !== undefined) promotedInput.lifecycleStatus = input.lifecycleStatus;
       const promoted =
         input.status === "candidate"
           ? []
@@ -1109,193 +1256,10 @@ export function openMemoryStore(rootDir: string): MemoryStore {
   return store;
 }
 
-function runMigrations(db: DatabaseSync): void {
-  db.exec(`
-    create table if not exists sources (
-      id text primary key,
-      type text not null check (type in ('conversation', 'commit', 'decision')),
-      title text not null,
-      origin text not null,
-      raw_content text not null,
-      metadata_json text not null default '{}',
-      created_at text not null
-    );
-
-    create table if not exists chunks (
-      id text primary key,
-      source_id text not null references sources(id) on delete cascade,
-      chunk_index integer not null,
-      text text not null,
-      metadata_json text not null default '{}'
-    );
-
-    create virtual table if not exists chunks_fts using fts5(
-      chunk_id unindexed,
-      source_id unindexed,
-      source_type unindexed,
-      title,
-      text
-    );
-
-    create table if not exists commits (
-      hash text primary key,
-      author_name text not null,
-      author_email text not null,
-      authored_at text not null,
-      message text not null,
-      changed_files_json text not null,
-      diff_summary text not null
-    );
-
-    create table if not exists decisions (
-      id text primary key,
-      topic text not null,
-      decision text not null,
-      reason text not null,
-      status text not null,
-      evidence_json text not null,
-      created_at text not null
-    );
-
-    create table if not exists relations (
-      id text primary key,
-      from_type text not null,
-      from_id text not null,
-      relation text not null,
-      to_type text not null,
-      to_id text not null,
-      locator text
-    );
-
-    create table if not exists sync_sources (
-      source text primary key check (source in ('git', 'codex', 'claude')),
-      enabled integer not null,
-      last_sync_at text,
-      last_success_at text,
-      last_error text,
-      metadata_json text not null default '{}'
-    );
-
-    create table if not exists sync_cursors (
-      source text not null check (source in ('git', 'codex', 'claude')),
-      cursor_key text not null,
-      cursor_value text not null,
-      updated_at text not null,
-      primary key (source, cursor_key)
-    );
-
-    create table if not exists memory_candidates (
-      id text primary key,
-      type text not null check (type in ('decision', 'bug_fix', 'constraint', 'rejected_approach')),
-      title text not null,
-      summary text not null,
-      reason text not null,
-      confidence real not null,
-      evidence_json text not null,
-      related_files_json text not null,
-      dedupe_key text not null unique,
-      promotion_state text not null check (promotion_state in ('candidate', 'promoted')),
-      evidence_signature text not null,
-      quality_status text not null default 'active' check (quality_status in ('active', 'needs_review', 'quarantined')),
-      quality_reasons_json text not null default '[]',
-      last_verified_at text,
-      created_at text not null,
-      updated_at text not null
-    );
-
-    create table if not exists memories (
-      id text primary key,
-      type text not null check (type in ('decision', 'bug_fix', 'constraint', 'rejected_approach')),
-      title text not null,
-      summary text not null,
-      reason text not null,
-      confidence real not null,
-      evidence_json text not null,
-      related_files_json text not null,
-      dedupe_key text not null,
-      evidence_signature text not null,
-      source text not null check (source in ('auto', 'manual')),
-      quality_status text not null default 'active' check (quality_status in ('active', 'needs_review', 'quarantined')),
-      quality_reasons_json text not null default '[]',
-      last_verified_at text,
-      created_at text not null,
-      promoted_at text not null,
-      unique (dedupe_key, evidence_signature, source)
-    );
-
-    create table if not exists memory_links (
-      id text primary key,
-      owner_kind text not null check (owner_kind in ('candidate', 'memory')),
-      owner_id text not null,
-      target_type text not null,
-      target_id text not null,
-      locator text,
-      metadata_json text not null default '{}'
-    );
-
-    create table if not exists temporary_memories (
-      id text primary key,
-      project_id text not null,
-      thread_id text,
-      session_id text,
-      source_adapter text,
-      kind text not null check (kind in (
-        'task_state',
-        'open_question',
-        'working_hypothesis',
-        'recent_test',
-        'file_context',
-        'user_instruction'
-      )),
-      title text not null,
-      summary text not null,
-      details text not null,
-      related_files_json text not null,
-      evidence_json text not null,
-      confidence real not null,
-      created_at text not null,
-      updated_at text not null,
-      expires_at text not null
-    );
-
-    create table if not exists temporary_memory_links (
-      id text primary key,
-      memory_id text not null references temporary_memories(id) on delete cascade,
-      target_type text not null,
-      target_id text not null,
-      locator text,
-      metadata_json text not null default '{}'
-    );
-
-    create virtual table if not exists temporary_memories_fts using fts5(
-      memory_id unindexed,
-      project_id unindexed,
-      thread_id unindexed,
-      session_id unindexed,
-      kind unindexed,
-      title,
-      summary,
-      details
-    );
-  `);
-  ensureColumn(db, "memory_candidates", "quality_status", "text not null default 'active'");
-  ensureColumn(db, "memory_candidates", "quality_reasons_json", "text not null default '[]'");
-  ensureColumn(db, "memory_candidates", "last_verified_at", "text");
-  ensureColumn(db, "memories", "quality_status", "text not null default 'active'");
-  ensureColumn(db, "memories", "quality_reasons_json", "text not null default '[]'");
-  ensureColumn(db, "memories", "last_verified_at", "text");
-}
-
-function ensureColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
-  const columns = db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
-  if (columns.some((row) => row.name === column)) return;
-  db.prepare(`alter table ${table} add column ${column} ${definition}`).run();
-}
-
 function upsertMemoryRow(
   db: DatabaseSync,
   input: {
-    id?: string;
+    id?: string | undefined;
     type: MemoryType;
     title: string;
     summary: string;
@@ -1311,63 +1275,65 @@ function upsertMemoryRow(
     createdAt: string;
   }
 ): DurableMemory {
-  const evidenceSignature = normalizeEvidenceSignature(input.evidence);
-  const existing = db
-    .prepare(
-      `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-              dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
-              created_at, promoted_at
-       from memories
-       where dedupe_key = ? and evidence_signature = ? and source = ?`
-    )
-    .get(input.dedupeKey, evidenceSignature, input.source) as MemoryRow | undefined;
-  const id = input.id ?? existing?.id ?? `memory-${randomUUID()}`;
-  const promotedAt = existing?.promoted_at ?? new Date().toISOString();
-  db.prepare(
-    `insert into memories
-       (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-        dedupe_key, evidence_signature, source, quality_status, quality_reasons_json,
-        last_verified_at, created_at, promoted_at)
-     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     on conflict(dedupe_key, evidence_signature, source) do update set
-       title = excluded.title,
-       summary = excluded.summary,
-       reason = excluded.reason,
-       confidence = excluded.confidence,
-       evidence_json = excluded.evidence_json,
-       related_files_json = excluded.related_files_json,
-       quality_status = excluded.quality_status,
-       quality_reasons_json = excluded.quality_reasons_json,
-       last_verified_at = excluded.last_verified_at`
-  ).run(
-    id,
-    input.type,
-    input.title,
-    input.summary,
-    input.reason,
-    input.confidence,
-    JSON.stringify(input.evidence),
-    JSON.stringify(input.relatedFiles),
-    input.dedupeKey,
-    evidenceSignature,
-    input.source,
-    input.qualityStatus,
-    JSON.stringify(input.qualityReasons),
-    input.lastVerifiedAt ?? null,
-    input.createdAt,
-    promotedAt
-  );
-  rebuildMemoryLinks(db, "memory", id, input.evidence, input.relatedFiles);
-  const row = db
-    .prepare(
-      `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-              dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
-              created_at, promoted_at
-       from memories
+  const evidenceSignature = createEvidenceSignature(input.evidence);
+  const existing = input.id
+    ? readMemoryRowRaw(db, input.id)
+    : db.prepare(
+        `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+                subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
+                created_at, promoted_at
+         from memories
+         where dedupe_key = ? and evidence_signature = ? and source = ?`
+      ).get(input.dedupeKey, evidenceSignature, input.source) as MemoryRow | undefined;
+  const id = existing?.id ?? input.id ?? `memory-${randomUUID()}`;
+  const subjectKey = createMemorySubjectKey(input.type, input.title);
+  if (existing) {
+    db.prepare(
+      `update memories set
+         type = ?, title = ?, summary = ?, reason = ?, confidence = ?, evidence_json = ?,
+         related_files_json = ?, dedupe_key = ?, evidence_signature = ?, source = ?, subject_key = ?,
+         quality_status = ?, quality_reasons_json = ?, last_verified_at = ?
        where id = ?`
-    )
-    .get(id) as unknown as MemoryRow;
-  return memoryFromRow(row);
+    ).run(
+      input.type, input.title, input.summary, input.reason, input.confidence,
+      JSON.stringify(input.evidence), JSON.stringify(input.relatedFiles), input.dedupeKey,
+      evidenceSignature, input.source, subjectKey, input.qualityStatus,
+      JSON.stringify(input.qualityReasons), input.lastVerifiedAt ?? null, id
+    );
+  } else {
+    const promotedAt = new Date().toISOString();
+    db.prepare(
+      `insert into memories
+         (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          dedupe_key, evidence_signature, source, quality_status, quality_reasons_json,
+          last_verified_at, subject_key, lifecycle_status, valid_from, valid_until,
+          status_reason, status_changed_at, created_at, promoted_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?)`
+    ).run(
+      id, input.type, input.title, input.summary, input.reason, input.confidence,
+      JSON.stringify(input.evidence), JSON.stringify(input.relatedFiles), input.dedupeKey,
+      evidenceSignature, input.source, input.qualityStatus, JSON.stringify(input.qualityReasons),
+      input.lastVerifiedAt ?? null, subjectKey, input.createdAt, promotedAt, input.createdAt, promotedAt
+    );
+  }
+  rebuildMemoryLinks(db, "memory", id, input.evidence, input.relatedFiles);
+  return readMemoryRow(db, id) as DurableMemory;
+}
+
+function readMemoryRowRaw(db: DatabaseSync, id: string): MemoryRow | undefined {
+  return db.prepare(
+    `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+            dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+            subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
+            created_at, promoted_at
+     from memories where id = ?`
+  ).get(id) as MemoryRow | undefined;
+}
+
+function readMemoryRow(db: DatabaseSync, id: string): DurableMemory | undefined {
+  const row = readMemoryRowRaw(db, id);
+  return row ? memoryFromRow(row) : undefined;
 }
 
 function rebuildMemoryLinks(
@@ -1611,6 +1577,7 @@ function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
     relatedFiles: parseJsonArray(row.related_files_json),
     dedupeKey: row.dedupe_key,
     promotionState: row.promotion_state,
+    promotedMemoryId: row.promoted_memory_id ?? undefined,
     qualityStatus: normalizeQualityStatus(row.quality_status),
     qualityReasons: parseJsonArray(row.quality_reasons_json),
     lastVerifiedAt: row.last_verified_at ?? undefined,
@@ -1634,6 +1601,12 @@ function memoryFromRow(row: MemoryRow): DurableMemory {
     qualityStatus: normalizeQualityStatus(row.quality_status),
     qualityReasons: parseJsonArray(row.quality_reasons_json),
     lastVerifiedAt: row.last_verified_at ?? undefined,
+    subjectKey: row.subject_key,
+    lifecycleStatus: row.lifecycle_status,
+    validFrom: row.valid_from,
+    validUntil: row.valid_until ?? undefined,
+    statusReason: row.status_reason ?? undefined,
+    statusChangedAt: row.status_changed_at,
     createdAt: row.created_at,
     promotedAt: row.promoted_at
   };
@@ -1648,7 +1621,7 @@ function memorySearchResult(
     evidence: memory.evidence,
     relatedFiles: memory.relatedFiles
   });
-  return {
+  const result: MemorySearchResult = {
     kind,
     id: memory.id,
     type: memory.type,
@@ -1671,6 +1644,26 @@ function memorySearchResult(
       reasons: memory.qualityReasons,
       lastVerifiedAt: memory.lastVerifiedAt
     })
+  };
+  if ("lifecycleStatus" in memory) {
+    result.subjectKey = memory.subjectKey;
+    result.lifecycleStatus = memory.lifecycleStatus;
+    result.validFrom = memory.validFrom;
+    result.validUntil = memory.validUntil;
+    result.statusReason = memory.statusReason;
+    result.statusChangedAt = memory.statusChangedAt;
+  }
+  return result;
+}
+
+function memoryRelationFromRow(row: MemoryRelationRow): MemoryRelation {
+  return {
+    id: row.id,
+    fromMemoryId: row.from_memory_id,
+    toMemoryId: row.to_memory_id,
+    relationType: row.relation_type,
+    createdAt: row.created_at,
+    reason: row.reason ?? undefined
   };
 }
 
@@ -1706,13 +1699,6 @@ function temporaryMemorySearchResultFromRow(
   };
 }
 
-function normalizeEvidenceSignature(evidence: EvidenceRef[]): string {
-  return evidence
-    .map((item) => `${item.sourceType}:${item.sourceId}:${item.locator ?? ""}`)
-    .sort()
-    .join("|");
-}
-
 function normalizeQualityStatus(status: string | undefined): MemoryQualityStatus {
   if (status === "needs_review" || status === "quarantined") return status;
   return "active";
@@ -1724,6 +1710,14 @@ function matchesQualityStatus(
 ): boolean {
   if (filter === "all") return true;
   return status === (filter ?? "active");
+}
+
+function matchesLifecycleStatus(
+  status: MemoryLifecycleStatus,
+  filter: MemoryLifecycleStatusFilter | undefined
+): boolean {
+  if (filter === "all") return true;
+  return status === (filter ?? "current");
 }
 
 function relationToEntityLink(
