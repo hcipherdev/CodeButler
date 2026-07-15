@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { runDoctor } from "../src/doctor/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
+import { createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey, encodeFloat32Vector } from "../src/embeddings/fingerprint.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("doctor service", () => {
@@ -121,6 +122,172 @@ describe("doctor service", () => {
       ])
     );
     expect(report.nextActions).toEqual([]);
+  });
+
+  it("reports disabled embeddings in FTS mode as healthy without network access", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir);
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "retrieval:mode", status: "ok", metadata: { mode: "fts" } }),
+      expect.objectContaining({ id: "embeddings:config", status: "ok", metadata: expect.objectContaining({ enabled: false, local: true, remoteAllowed: false }) }),
+      expect.objectContaining({ id: "embeddings:queue", status: "ok", metadata: expect.objectContaining({ pending: 0, complete: 0, failed: 0, attempts: 0 }) }),
+      expect.objectContaining({ id: "embeddings:coverage", status: "ok", metadata: expect.objectContaining({ eligible: 0, vectors: 0 }) })
+    ]));
+  });
+
+  it("warns when hybrid retrieval has no usable remote provider or vectors", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir, {
+      retrieval: { mode: "hybrid", rrfK: 60 },
+      embeddings: { enabled: true, provider: "openai-compatible", baseUrl: "https://embedding.example/v1", model: "embed-test", batchSize: 16 },
+      privacy: { allowRemoteEmbeddings: false }
+    });
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "retrieval:mode", status: "warning" }),
+      expect.objectContaining({ id: "embeddings:config", status: "warning", detail: expect.not.stringContaining("https://") }),
+      expect.objectContaining({ id: "embeddings:coverage", status: "warning" })
+    ]));
+    expect(report.nextActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ command: "code-butler embeddings build" })
+    ]));
+  });
+
+  it("excludes stale content generations and scopes queue diagnostics to the configured provider", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir, {
+      retrieval: { mode: "hybrid", rrfK: 60 },
+      embeddings: { enabled: true, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "embed-test", batchSize: 16 }
+    });
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({ source: { id: "changing", type: "conversation", title: "change", origin: "test", rawContent: "old text" }, chunks: [{ text: "old text" }] });
+    const owner = store.listEmbeddingOwners()[0]!;
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const providerKey = createProviderKey(endpointHash, "embed-test");
+    store.upsertEmbeddingVector({ ...owner, endpointHash, providerKey, model: "embed-test", providerFingerprint: createProviderFingerprint(endpointHash, "embed-test", 2), dimension: 2, vectorBlob: encodeFloat32Vector([1, 0]) });
+    store.reconcileEmbeddingJobs({ providerKey, endpointHash, model: "embed-test" });
+    const otherEndpoint = createEmbeddingEndpointHash("http://127.0.0.1:9999/v1");
+    const otherKey = createProviderKey(otherEndpoint, "other-model");
+    store.reconcileEmbeddingJobs({ providerKey: otherKey, endpointHash: otherEndpoint, model: "other-model" });
+    store.db.prepare("update embedding_jobs set state = 'failed', attempts = 2, last_error = 'old provider failed' where provider_key = ?").run(otherKey);
+    store.addSourceWithChunks({ source: { id: "changing", type: "conversation", title: "change", origin: "test", rawContent: "new text" }, chunks: [{ text: "new text" }] });
+    store.close();
+
+    const report = runDoctor(rootDir);
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "embeddings:queue", metadata: expect.objectContaining({ pending: 0, failed: 0, attempts: 0, staleJobs: 2 }) }),
+      expect.objectContaining({ id: "embeddings:coverage", status: "warning", metadata: expect.objectContaining({ eligible: 1, vectors: 0, staleVectors: 1, configuredIndexes: [] }) }),
+      expect.objectContaining({ id: "retrieval:mode", status: "warning" })
+    ]));
+  });
+
+  it("warns for partial vector coverage and pending configured work", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir, { retrieval: { mode: "hybrid", rrfK: 60 }, embeddings: { enabled: true, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "embed-test", batchSize: 16 } });
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({ source: { id: "partial", type: "conversation", title: "partial", origin: "test", rawContent: "one two" }, chunks: [{ text: "one" }, { text: "two" }] });
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const providerKey = createProviderKey(endpointHash, "embed-test");
+    const owners = store.listEmbeddingOwners();
+    store.upsertEmbeddingVector({ ...owners[0]!, endpointHash, providerKey, model: "embed-test", providerFingerprint: createProviderFingerprint(endpointHash, "embed-test", 2), dimension: 2, vectorBlob: encodeFloat32Vector([1, 0]) });
+    store.reconcileEmbeddingJobs({ providerKey, endpointHash, model: "embed-test" });
+    store.close();
+
+    const report = runDoctor(rootDir);
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "embeddings:queue", status: "warning", metadata: expect.objectContaining({ pending: 2, failed: 0 }) }),
+      expect.objectContaining({ id: "embeddings:coverage", status: "warning", metadata: expect.objectContaining({ eligible: 2, vectors: 1 }) }),
+      expect.objectContaining({ id: "retrieval:mode", status: "warning" })
+    ]));
+    expect(report.nextActions).toEqual(expect.arrayContaining([expect.objectContaining({ command: "code-butler embeddings build" })]));
+  });
+
+  it("reports complete configured vector coverage as healthy", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir, { retrieval: { mode: "hybrid", rrfK: 60 }, embeddings: { enabled: true, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "embed-test", batchSize: 16 } });
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({ source: { id: "complete", type: "conversation", title: "complete", origin: "test", rawContent: "one two" }, chunks: [{ text: "one" }, { text: "two" }] });
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const providerKey = createProviderKey(endpointHash, "embed-test");
+    for (const owner of store.listEmbeddingOwners()) store.upsertEmbeddingVector({ ...owner, endpointHash, providerKey, model: "embed-test", providerFingerprint: createProviderFingerprint(endpointHash, "embed-test", 2), dimension: 2, vectorBlob: encodeFloat32Vector([1, 0]) });
+    store.close();
+
+    const report = runDoctor(rootDir);
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "embeddings:coverage", status: "ok", metadata: expect.objectContaining({ eligible: 2, vectors: 2 }) }),
+      expect.objectContaining({ id: "retrieval:mode", status: "ok" })
+    ]));
+  });
+
+  it("rejects malformed configured vector metadata without exposing content", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir, {
+      retrieval: { mode: "hybrid", rrfK: 60 },
+      embeddings: { enabled: true, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "embed-test", batchSize: 16 }
+    });
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({ source: { id: "secret-owner", type: "conversation", title: "secret", origin: "test", rawContent: "never expose this content" }, chunks: [{ text: "never expose this content" }] });
+    const owner = store.listEmbeddingOwners()[0]!;
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const providerKey = createProviderKey(endpointHash, "embed-test");
+    store.upsertEmbeddingVector({ ...owner, endpointHash, providerKey, model: "embed-test", providerFingerprint: createProviderFingerprint(endpointHash, "embed-test", 2), dimension: 2, vectorBlob: encodeFloat32Vector([1, 0]) });
+    store.db.prepare("update embedding_vectors set endpoint_hash = 'wrong', model = 'wrong', provider_fingerprint = 'wrong', dimension = 3").run();
+    store.close();
+
+    const report = runDoctor(rootDir);
+    const coverage = report.checks.find((check) => check.id === "embeddings:coverage")!;
+    expect(coverage).toMatchObject({ status: "warning", metadata: { eligible: 1, vectors: 0, staleVectors: 1, configuredIndexes: [] } });
+    expect(JSON.stringify(coverage)).not.toContain("never expose this content");
+  });
+
+  it("handles partial embedding schemas as a warning instead of throwing", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir, { retrieval: { mode: "hybrid", rrfK: 60 }, embeddings: { enabled: true, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "embed-test", batchSize: 16 } });
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.db.exec("drop table embedding_vectors; create table embedding_vectors (owner_id text)");
+    store.close();
+
+    const report = runDoctor(rootDir);
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "embeddings:schema", status: "warning" }),
+      expect.objectContaining({ id: "retrieval:mode", status: "warning" })
+    ]));
+    expect(report.nextActions).toEqual(expect.arrayContaining([expect.objectContaining({ command: "code-butler init" })]));
   });
 
   it("reports missing and invalid config as errors without throwing", () => {

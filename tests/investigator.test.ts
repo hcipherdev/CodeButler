@@ -48,6 +48,15 @@ describe("native RLM investigation", () => {
       sync: {
         autoSyncOnServerStart: true
       },
+      retrieval: { mode: "fts", rrfK: 60 },
+      embeddings: {
+        enabled: false,
+        provider: "openai-compatible",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "nomic-embed-text",
+        batchSize: 16
+      },
+      privacy: { allowRemoteEmbeddings: false },
       deterministic: {
         enabled: true,
         promoteStrongSignals: true,

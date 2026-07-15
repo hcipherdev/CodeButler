@@ -4,14 +4,25 @@ import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
+import {
+  createEmbeddingContentHash,
+  createProviderFingerprint,
+  createProviderKey
+} from "../embeddings/fingerprint.js";
 import { createEvidenceSignature } from "../memory/evidence-signature.js";
 import { createMemorySubjectKey } from "../memory/lifecycle.js";
+import { redactSensitiveText } from "../privacy/redaction.js";
 import { initializeSchema } from "./migrations.js";
 import { withTransaction } from "./transactions.js";
 import type {
   CommitRecord,
   DecisionRecord,
   DurableMemory,
+  EmbeddingJob,
+  EmbeddingJobState,
+  EmbeddingOwner,
+  EmbeddingOwnerKind,
+  EmbeddingVector,
   EvidenceRef,
   ExtractedMemory,
   InvestigationEntityLink,
@@ -73,6 +84,7 @@ export interface MemoryStore {
   readChunkWindow(sourceId: string, chunkIndex: number, before: number, after: number): MemoryChunk[];
   readConversationWindow(sourceId: string, anchorChunkId: string, before: number, after: number): MemoryChunk[];
   search(input: { query: string; sourceTypes?: string[]; limit?: number }): SearchResult[];
+  readSearchResultsByChunkIds(chunkIds: string[]): SearchResult[];
   addCommit(commit: CommitRecord): string;
   readCommit(hash: string): CommitRecord | undefined;
   findCommits(input: { query?: string; filePath?: string; limit?: number }): CommitRecord[];
@@ -84,6 +96,62 @@ export interface MemoryStore {
   recordSyncStatus(status: SyncStatus): void;
   getSyncStatus(source: SyncSourceName): SyncStatus | undefined;
   listSyncStatuses(): SyncStatus[];
+  listEmbeddingOwners(): EmbeddingOwner[];
+  reconcileEmbeddingJobs(input: {
+    providerKey: string;
+    endpointHash: string;
+    model: string;
+  }): { enqueued: number; removedJobs: number; removedVectors: number };
+  beginEmbeddingIndexRebuild(input: {
+    providerKey: string;
+    endpointHash: string;
+    model: string;
+  }): { removedVectors: number; requeued: number; rebuildToken: string };
+  activateEmbeddingIndexRebuild(input: {
+    providerKey: string;
+    rebuildToken: string;
+    providerFingerprint: string;
+  }): number;
+  listEmbeddingJobs(input?: {
+    providerKey?: string;
+    state?: EmbeddingJobState;
+    ownerKind?: EmbeddingOwnerKind;
+    ownerId?: string;
+  }): EmbeddingJob[];
+  recordEmbeddingJobAttempts(inputs: ReadonlyArray<Pick<
+    EmbeddingJob,
+    "ownerKind" | "ownerId" | "contentHash" | "ownerVersion" | "providerKey" | "indexGeneration" | "targetFingerprint"
+  >>): void;
+  completeEmbeddingJob(input: Omit<EmbeddingVector, "createdAt" | "updatedAt"> & {
+    indexGeneration?: string | undefined;
+  }): void;
+  markEmbeddingJobFailed(input: {
+    ownerKind: EmbeddingOwnerKind;
+    ownerId: string;
+    contentHash: string;
+    ownerVersion: string;
+    providerKey: string;
+    indexGeneration?: string | undefined;
+    targetFingerprint?: string | undefined;
+    error: string;
+  }): void;
+  upsertEmbeddingVector(input: Omit<EmbeddingVector, "createdAt" | "updatedAt">): void;
+  listEmbeddingVectors(input?: {
+    providerKey?: string;
+    providerFingerprint?: string;
+    ownerKind?: EmbeddingOwnerKind;
+    ownerId?: string;
+  }): EmbeddingVector[];
+  listActiveEmbeddingVectors(input?: {
+    providerKey?: string;
+    providerFingerprint?: string;
+    ownerKind?: EmbeddingOwnerKind;
+    ownerId?: string;
+  }): EmbeddingVector[];
+  deleteStaleEmbeddingJobsForMemory(memoryId: string): number;
+  deleteStaleEmbeddingVectorsForMemory(memoryId: string): number;
+  deleteEmbeddingJobsForOwner(ownerKind: EmbeddingOwnerKind, ownerId: string): number;
+  deleteEmbeddingVectorsForOwner(ownerKind: EmbeddingOwnerKind, ownerId: string): number;
   upsertMemoryCandidate(
     memory: ExtractedMemory,
     options?: {
@@ -167,6 +235,7 @@ export interface MemoryStore {
     qualityStatus?: MemoryQualityStatusFilter;
     limit?: number;
   }): MemorySearchResult[];
+  readMemorySearchResultsByIds(memoryIds: string[]): MemorySearchResult[];
   getProjectSummary(): ProjectSummary;
   db: DatabaseSync;
   paths: {
@@ -270,6 +339,7 @@ interface MemoryRow {
   valid_until: string | null;
   status_reason: string | null;
   status_changed_at: string;
+  lifecycle_generation: string;
   created_at: string;
   promoted_at: string;
 }
@@ -314,8 +384,50 @@ interface MemoryRelationRow {
   reason: string | null;
 }
 
+interface EmbeddingJobRow {
+  owner_kind: EmbeddingOwnerKind;
+  owner_id: string;
+  content_hash: string;
+  owner_version: string;
+  provider_key: string;
+  endpoint_hash: string;
+  model: string;
+  index_generation: string;
+  target_fingerprint: string | null;
+  provider_fingerprint: string | null;
+  state: EmbeddingJobState;
+  attempts: number;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+interface EmbeddingVectorRow {
+  owner_kind: EmbeddingOwnerKind;
+  owner_id: string;
+  content_hash: string;
+  owner_version: string;
+  provider_key: string;
+  endpoint_hash: string;
+  model: string;
+  provider_fingerprint: string;
+  dimension: number;
+  vector_blob: Uint8Array;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ActiveEmbeddingVectorRow extends EmbeddingVectorRow {
+  current_chunk_text: string | null;
+  current_memory_title: string | null;
+  current_memory_summary: string | null;
+  current_memory_reason: string | null;
+}
+
 const TEMPORARY_MEMORY_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 const TEMPORARY_MEMORY_MAX_TTL_MS = 3 * 24 * 60 * 60 * 1000;
+const SQLITE_READ_BATCH_SIZE = 500;
 
 export function openMemoryStore(rootDir: string): MemoryStore {
   const dataDir = basename(rootDir) === ".code-butler" ? rootDir : join(rootDir, ".code-butler");
@@ -481,6 +593,30 @@ export function openMemoryStore(rootDir: string): MemoryStore {
           locator: row.chunk_id
         }
       }));
+    },
+    readSearchResultsByChunkIds(chunkIds) {
+      if (chunkIds.length === 0) return [];
+      const rows = chunked(chunkIds, SQLITE_READ_BATCH_SIZE).flatMap((batch) =>
+        db.prepare(
+          `select c.id as chunk_id, c.source_id, s.type as source_type, s.title, c.text, c.metadata_json
+           from chunks c join sources s on s.id = c.source_id
+           where c.id in (${batch.map(() => "?").join(", ")})`
+        ).all(...batch) as unknown as Array<Omit<SearchRow, "score">>
+      );
+      const byId = new Map(rows.map((row) => [row.chunk_id, row]));
+      return chunkIds.flatMap((chunkId) => {
+        const row = byId.get(chunkId);
+        return row ? [{
+          chunkId: row.chunk_id,
+          sourceId: row.source_id,
+          sourceType: row.source_type,
+          title: row.title,
+          text: row.text,
+          score: 0,
+          metadata: parseJsonObject(row.metadata_json),
+          evidence: { sourceType: row.source_type, sourceId: row.source_id, locator: row.chunk_id }
+        }] : [];
+      });
     },
     addCommit(commit) {
       return withTransaction(db, () => {
@@ -775,6 +911,502 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .all() as unknown as SyncStatusRow[];
       return rows.map(syncStatusFromRow);
     },
+    listEmbeddingOwners() {
+      const chunks = db.prepare(
+        `select id, text from chunks order by id asc`
+      ).all() as Array<{ id: string; text: string }>;
+      const memories = db.prepare(
+        `select id, title, summary, reason, lifecycle_generation
+         from memories
+         where lifecycle_status = 'current'
+         order by id asc`
+      ).all() as Array<{
+        id: string;
+        title: string;
+        summary: string;
+        reason: string;
+        lifecycle_generation: string;
+      }>;
+      return [
+        ...chunks.map<EmbeddingOwner>((row) => ({
+          ownerKind: "chunk",
+          ownerId: row.id,
+          text: row.text,
+          contentHash: createEmbeddingContentHash(row.text),
+          ownerVersion: ""
+        })),
+        ...memories.map<EmbeddingOwner>((row) => {
+          const text = [row.title, row.summary, row.reason].join("\n\n");
+          return {
+            ownerKind: "memory",
+            ownerId: row.id,
+            text,
+            contentHash: createEmbeddingContentHash(text),
+            ownerVersion: row.lifecycle_generation
+          };
+        })
+      ];
+    },
+    reconcileEmbeddingJobs(input) {
+      validateProviderKey(input);
+      return withTransaction(db, () => {
+        const owners = store.listEmbeddingOwners();
+        const eligible = new Map(
+          owners.map((owner) => [
+            embeddingOwnerIdentity(owner.ownerKind, owner.ownerId, owner.contentHash),
+            owner.ownerVersion
+          ])
+        );
+        let removedJobs = 0;
+        const jobs = db.prepare(
+          `select owner_kind, owner_id, content_hash, owner_version
+           from embedding_jobs where provider_key = ?`
+        ).all(input.providerKey) as Array<{
+          owner_kind: EmbeddingOwnerKind;
+          owner_id: string;
+          content_hash: string;
+          owner_version: string;
+        }>;
+        const deleteJob = db.prepare(
+          `delete from embedding_jobs
+           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_key = ?`
+        );
+        for (const job of jobs) {
+          const identity = embeddingOwnerIdentity(job.owner_kind, job.owner_id, job.content_hash);
+          if (eligible.get(identity) === job.owner_version) continue;
+          removedJobs += Number(deleteJob.run(
+            job.owner_kind,
+            job.owner_id,
+            job.content_hash,
+            input.providerKey
+          ).changes);
+        }
+
+        let removedVectors = 0;
+        const vectors = db.prepare(
+          `select owner_kind, owner_id, content_hash, owner_version, provider_fingerprint
+           from embedding_vectors where provider_key = ?`
+        ).all(input.providerKey) as Array<{
+          owner_kind: EmbeddingOwnerKind;
+          owner_id: string;
+          content_hash: string;
+          owner_version: string;
+          provider_fingerprint: string;
+        }>;
+        const deleteVector = db.prepare(
+          `delete from embedding_vectors
+           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_fingerprint = ?`
+        );
+        for (const vector of vectors) {
+          const identity = embeddingOwnerIdentity(vector.owner_kind, vector.owner_id, vector.content_hash);
+          if (eligible.get(identity) === vector.owner_version) continue;
+          removedVectors += Number(deleteVector.run(
+            vector.owner_kind,
+            vector.owner_id,
+            vector.content_hash,
+            vector.provider_fingerprint
+          ).changes);
+        }
+
+        const now = new Date().toISOString();
+        const insert = db.prepare(
+          `insert into embedding_jobs
+             (owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model,
+              state, attempts, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+           on conflict(owner_kind, owner_id, content_hash, provider_key) do nothing`
+        );
+        let enqueued = 0;
+        for (const owner of owners) {
+          enqueued += Number(insert.run(
+            owner.ownerKind,
+            owner.ownerId,
+            owner.contentHash,
+            owner.ownerVersion,
+            input.providerKey,
+            input.endpointHash,
+            input.model,
+            now,
+            now
+          ).changes);
+        }
+        return { enqueued, removedJobs, removedVectors };
+      });
+    },
+    beginEmbeddingIndexRebuild(input) {
+      validateProviderKey(input);
+      return withTransaction(db, () => {
+        const rebuildToken = randomUUID();
+        const removedVectors = Number(db.prepare(
+          "delete from embedding_vectors where provider_key = ?"
+        ).run(input.providerKey).changes);
+        const now = new Date().toISOString();
+        const requeue = db.prepare(
+          `insert into embedding_jobs
+             (owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model,
+              index_generation, target_fingerprint, state, attempts, provider_fingerprint,
+              last_error, created_at, updated_at, completed_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, null, 'pending', 0, null, null, ?, ?, null)
+           on conflict(owner_kind, owner_id, content_hash, provider_key) do update set
+             owner_version = excluded.owner_version,
+             endpoint_hash = excluded.endpoint_hash,
+             model = excluded.model,
+             index_generation = excluded.index_generation,
+             target_fingerprint = null,
+             state = 'pending',
+             provider_fingerprint = null,
+             last_error = null,
+             updated_at = excluded.updated_at,
+             completed_at = null`
+        );
+        let requeued = 0;
+        for (const owner of store.listEmbeddingOwners()) {
+          requeued += Number(requeue.run(
+            owner.ownerKind,
+            owner.ownerId,
+            owner.contentHash,
+            owner.ownerVersion,
+            input.providerKey,
+            input.endpointHash,
+            input.model,
+            rebuildToken,
+            now,
+            now
+          ).changes);
+        }
+        return { removedVectors, requeued, rebuildToken };
+      });
+    },
+    activateEmbeddingIndexRebuild(input) {
+      if (!input.rebuildToken.trim()) throw new Error("Embedding rebuild token is required");
+      if (!/^[a-f0-9]{64}$/.test(input.providerFingerprint)) {
+        throw new Error("Embedding rebuild target fingerprint is invalid");
+      }
+      return withTransaction(db, () => {
+        const rows = db.prepare(
+          `select distinct target_fingerprint
+           from embedding_jobs
+           where provider_key = ? and index_generation = ?`
+        ).all(input.providerKey, input.rebuildToken) as Array<{ target_fingerprint: string | null }>;
+        if (rows.length === 0) throw new Error("Embedding rebuild generation is no longer active");
+        if (rows.some((row) => row.target_fingerprint !== null && row.target_fingerprint !== input.providerFingerprint)) {
+          throw new Error("Embedding rebuild generation already has a different target fingerprint");
+        }
+        return Number(db.prepare(
+          `update embedding_jobs set target_fingerprint = ?, updated_at = ?
+           where provider_key = ? and index_generation = ?`
+        ).run(
+          input.providerFingerprint,
+          new Date().toISOString(),
+          input.providerKey,
+          input.rebuildToken
+        ).changes);
+      });
+    },
+    listEmbeddingJobs(input = {}) {
+      const predicates: string[] = [];
+      const parameters: string[] = [];
+      if (input.providerKey !== undefined) {
+        predicates.push("provider_key = ?");
+        parameters.push(input.providerKey);
+      }
+      if (input.state !== undefined) {
+        predicates.push("state = ?");
+        parameters.push(input.state);
+      }
+      if (input.ownerKind !== undefined) {
+        predicates.push("owner_kind = ?");
+        parameters.push(input.ownerKind);
+      }
+      if (input.ownerId !== undefined) {
+        predicates.push("owner_id = ?");
+        parameters.push(input.ownerId);
+      }
+      const where = predicates.length > 0 ? `where ${predicates.join(" and ")}` : "";
+      const rows = db.prepare(
+        `select owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model,
+                index_generation, target_fingerprint, provider_fingerprint, state, attempts,
+                last_error, created_at, updated_at, completed_at
+         from embedding_jobs ${where}
+         order by owner_kind asc, owner_id asc, content_hash asc, provider_key asc`
+      ).all(...parameters) as unknown as EmbeddingJobRow[];
+      return rows.map(embeddingJobFromRow);
+    },
+    recordEmbeddingJobAttempts(inputs) {
+      withTransaction(db, () => {
+        const readJob = db.prepare(
+          `select owner_version, index_generation, target_fingerprint, state from embedding_jobs
+           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_key = ?`
+        );
+        const recordAttempt = db.prepare(
+          `update embedding_jobs
+           set attempts = attempts + 1, updated_at = ?
+           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_key = ?
+             and owner_version = ? and index_generation = ? and state in ('pending', 'failed')`
+        );
+        const now = new Date().toISOString();
+        for (const input of inputs) {
+          const job = readJob.get(
+            input.ownerKind,
+            input.ownerId,
+            input.contentHash,
+            input.providerKey
+          ) as { owner_version: string; index_generation: string; target_fingerprint: string | null; state: EmbeddingJobState } | undefined;
+          if (!job) throw new Error("Embedding job not found");
+          if (job.owner_version !== input.ownerVersion) {
+            throw new Error("Embedding job owner generation does not match attempt generation");
+          }
+          if (job.index_generation !== input.indexGeneration) {
+            throw new Error("Embedding job index generation does not match attempt generation");
+          }
+          if (job.target_fingerprint !== (input.targetFingerprint ?? null)) {
+            throw new Error("Embedding job rebuild target does not match attempt target");
+          }
+          if (job.state !== "pending" && job.state !== "failed") {
+            throw new Error("Embedding job must be pending or failed");
+          }
+          if (!isCurrentEmbeddingOwner(db, input)) {
+            throw new Error("Embedding owner generation is no longer eligible");
+          }
+          const result = recordAttempt.run(
+            now,
+            input.ownerKind,
+            input.ownerId,
+            input.contentHash,
+            input.providerKey,
+            input.ownerVersion,
+            input.indexGeneration
+          );
+          if (result.changes === 0) throw new Error("Embedding job must be pending or failed");
+        }
+      });
+    },
+    completeEmbeddingJob(input) {
+      validateEmbeddingVectorInput(input);
+      withTransaction(db, () => {
+        const job = db.prepare(
+          `select endpoint_hash, model, owner_version, index_generation, target_fingerprint, state
+           from embedding_jobs
+           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_key = ?`
+        ).get(
+          input.ownerKind,
+          input.ownerId,
+          input.contentHash,
+          input.providerKey
+        ) as {
+          endpoint_hash: string;
+          model: string;
+          owner_version: string;
+          index_generation: string;
+          target_fingerprint: string | null;
+          state: EmbeddingJobState;
+        } | undefined;
+        if (!job) throw new Error("Embedding job not found");
+        if (job.owner_version !== input.ownerVersion) {
+          throw new Error("Embedding job owner generation does not match completion generation");
+        }
+        if (job.index_generation !== (input.indexGeneration ?? "")) {
+          throw new Error("Embedding job index generation does not match completion generation");
+        }
+        if (job.index_generation !== "" && job.target_fingerprint === null) {
+          throw new Error("Embedding rebuild target fingerprint is not active");
+        }
+        if (job.target_fingerprint !== null && job.target_fingerprint !== input.providerFingerprint) {
+          throw new Error("Embedding completion fingerprint does not match rebuild target");
+        }
+        if (job.endpoint_hash !== input.endpointHash || job.model !== input.model) {
+          throw new Error("Embedding job provider metadata does not match completion metadata");
+        }
+        if (job.state !== "pending" && job.state !== "failed") {
+          throw new Error("Embedding job must be pending or failed");
+        }
+        if (!isCurrentEmbeddingOwner(db, input)) {
+          throw new Error("Embedding owner generation is no longer eligible");
+        }
+
+        const now = new Date().toISOString();
+        upsertEmbeddingVectorRow(db, input, now);
+        const result = db.prepare(
+          `update embedding_jobs
+           set state = 'complete', provider_fingerprint = ?,
+               last_error = null, updated_at = ?, completed_at = ?
+           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_key = ?
+             and owner_version = ? and index_generation = ? and state in ('pending', 'failed')`
+        ).run(
+          input.providerFingerprint,
+          now,
+          now,
+          input.ownerKind,
+          input.ownerId,
+          input.contentHash,
+          input.providerKey,
+          input.ownerVersion,
+          input.indexGeneration ?? ""
+        );
+        if (result.changes === 0) throw new Error("Embedding job must be pending or failed");
+      });
+    },
+    markEmbeddingJobFailed(input) {
+      withTransaction(db, () => {
+        const job = db.prepare(
+          `select owner_version, index_generation, target_fingerprint, state from embedding_jobs
+           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_key = ?`
+        ).get(
+          input.ownerKind,
+          input.ownerId,
+          input.contentHash,
+          input.providerKey
+        ) as { owner_version: string; index_generation: string; target_fingerprint: string | null; state: EmbeddingJobState } | undefined;
+        if (!job) throw new Error("Embedding job not found");
+        if (job.owner_version !== input.ownerVersion) {
+          throw new Error("Embedding job owner generation does not match failure generation");
+        }
+        if (job.index_generation !== (input.indexGeneration ?? "")) {
+          throw new Error("Embedding job index generation does not match failure generation");
+        }
+        if (job.target_fingerprint !== (input.targetFingerprint ?? null)) {
+          throw new Error("Embedding job rebuild target does not match failure target");
+        }
+        if (job.state !== "pending" && job.state !== "failed") {
+          throw new Error("Embedding job must be pending or failed");
+        }
+        if (!isCurrentEmbeddingOwner(db, input)) {
+          throw new Error("Embedding owner generation is no longer eligible");
+        }
+        const result = db.prepare(
+          `update embedding_jobs
+           set state = 'failed', provider_fingerprint = null,
+               last_error = ?, updated_at = ?, completed_at = null
+           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_key = ?
+             and owner_version = ? and index_generation = ? and state in ('pending', 'failed')`
+        ).run(
+          sanitizeStoredEmbeddingError(input.error),
+          new Date().toISOString(),
+          input.ownerKind,
+          input.ownerId,
+          input.contentHash,
+          input.providerKey,
+          input.ownerVersion,
+          input.indexGeneration ?? ""
+        );
+        if (result.changes === 0) throw new Error("Embedding job must be pending or failed");
+      });
+    },
+    upsertEmbeddingVector(input) {
+      validateEmbeddingVectorInput(input);
+      upsertEmbeddingVectorRow(db, input, new Date().toISOString());
+    },
+    listEmbeddingVectors(input = {}) {
+      const predicates: string[] = [];
+      const parameters: string[] = [];
+      if (input.providerKey !== undefined) {
+        predicates.push("provider_key = ?");
+        parameters.push(input.providerKey);
+      }
+      if (input.providerFingerprint !== undefined) {
+        predicates.push("provider_fingerprint = ?");
+        parameters.push(input.providerFingerprint);
+      }
+      if (input.ownerKind !== undefined) {
+        predicates.push("owner_kind = ?");
+        parameters.push(input.ownerKind);
+      }
+      if (input.ownerId !== undefined) {
+        predicates.push("owner_id = ?");
+        parameters.push(input.ownerId);
+      }
+      const where = predicates.length > 0 ? `where ${predicates.join(" and ")}` : "";
+      const rows = db.prepare(
+        `select owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model,
+                provider_fingerprint, dimension, vector_blob, created_at, updated_at
+         from embedding_vectors ${where}
+         order by owner_kind asc, owner_id asc, content_hash asc, provider_fingerprint asc`
+      ).all(...parameters) as unknown as EmbeddingVectorRow[];
+      return rows.map(embeddingVectorFromRow);
+    },
+    listActiveEmbeddingVectors(input = {}) {
+      const predicates: string[] = [];
+      const parameters: string[] = [];
+      if (input.providerKey !== undefined) {
+        predicates.push("ev.provider_key = ?");
+        parameters.push(input.providerKey);
+      }
+      if (input.providerFingerprint !== undefined) {
+        predicates.push("ev.provider_fingerprint = ?");
+        parameters.push(input.providerFingerprint);
+      }
+      if (input.ownerKind !== undefined) {
+        predicates.push("ev.owner_kind = ?");
+        parameters.push(input.ownerKind);
+      }
+      if (input.ownerId !== undefined) {
+        predicates.push("ev.owner_id = ?");
+        parameters.push(input.ownerId);
+      }
+      predicates.push(`(
+        (ev.owner_kind = 'chunk' and ev.owner_version = '' and c.id is not null)
+        or
+        (ev.owner_kind = 'memory' and m.id is not null)
+      )`);
+      const rows = db.prepare(
+        `select ev.owner_kind, ev.owner_id, ev.content_hash, ev.owner_version, ev.provider_key,
+                ev.endpoint_hash, ev.model, ev.provider_fingerprint, ev.dimension, ev.vector_blob,
+                ev.created_at, ev.updated_at,
+                c.text as current_chunk_text,
+                m.title as current_memory_title, m.summary as current_memory_summary,
+                m.reason as current_memory_reason
+         from embedding_vectors ev
+         left join chunks c on ev.owner_kind = 'chunk' and c.id = ev.owner_id
+         left join memories m on ev.owner_kind = 'memory' and m.id = ev.owner_id
+           and m.lifecycle_status = 'current' and m.lifecycle_generation = ev.owner_version
+         where ${predicates.join(" and ")}
+         order by ev.owner_kind asc, ev.owner_id asc, ev.content_hash asc, ev.provider_fingerprint asc`
+      ).all(...parameters) as unknown as ActiveEmbeddingVectorRow[];
+      return rows.flatMap((row) => {
+        const text = row.owner_kind === "chunk"
+          ? row.current_chunk_text
+          : row.current_memory_title === null || row.current_memory_summary === null || row.current_memory_reason === null
+            ? null
+            : [row.current_memory_title, row.current_memory_summary, row.current_memory_reason].join("\n\n");
+        return text !== null && createEmbeddingContentHash(text) === row.content_hash
+          ? [embeddingVectorFromRow(row)]
+          : [];
+      });
+    },
+    deleteStaleEmbeddingJobsForMemory(memoryId) {
+      return Number(db.prepare(
+        `delete from embedding_jobs
+         where owner_kind = 'memory' and owner_id = ?
+           and not exists (
+             select 1 from memories
+             where memories.id = embedding_jobs.owner_id
+               and memories.lifecycle_status = 'current'
+               and memories.lifecycle_generation = embedding_jobs.owner_version
+           )`
+      ).run(memoryId).changes);
+    },
+    deleteStaleEmbeddingVectorsForMemory(memoryId) {
+      return Number(db.prepare(
+        `delete from embedding_vectors
+         where owner_kind = 'memory' and owner_id = ?
+           and not exists (
+             select 1 from memories
+             where memories.id = embedding_vectors.owner_id
+               and memories.lifecycle_status = 'current'
+               and memories.lifecycle_generation = embedding_vectors.owner_version
+           )`
+      ).run(memoryId).changes);
+    },
+    deleteEmbeddingJobsForOwner(ownerKind, ownerId) {
+      return Number(db.prepare(
+        "delete from embedding_jobs where owner_kind = ? and owner_id = ?"
+      ).run(ownerKind, ownerId).changes);
+    },
+    deleteEmbeddingVectorsForOwner(ownerKind, ownerId) {
+      return Number(db.prepare(
+        "delete from embedding_vectors where owner_kind = ? and owner_id = ?"
+      ).run(ownerKind, ownerId).changes);
+    },
     upsertMemoryCandidate(memory, options) {
       return withTransaction(db, () => {
         const now = new Date().toISOString();
@@ -907,7 +1539,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         if (!existing) throw new Error(`Unknown durable memory: ${id}`);
         db.prepare(
           `update memories
-           set lifecycle_status = ?, valid_from = ?, valid_until = ?, status_reason = ?, status_changed_at = ?
+           set lifecycle_status = ?, valid_from = ?, valid_until = ?, status_reason = ?,
+               status_changed_at = ?, lifecycle_generation = ?
            where id = ?`
         ).run(
           lifecycle.lifecycleStatus,
@@ -915,6 +1548,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
           lifecycle.validUntil === undefined ? existing.validUntil ?? null : lifecycle.validUntil,
           lifecycle.statusReason === undefined ? existing.statusReason ?? null : lifecycle.statusReason,
           lifecycle.statusChangedAt ?? new Date().toISOString(),
+          randomUUID(),
           id
         );
         return readMemoryRow(db, id) as DurableMemory;
@@ -1005,6 +1639,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
           `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                   dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
                   subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
+                  lifecycle_generation,
                   created_at, promoted_at
            from memories
            order by promoted_at desc, created_at desc`
@@ -1224,6 +1859,24 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         ...candidates.map<MemorySearchResult>((candidate) => memorySearchResult(store, "candidate", candidate))
       ].slice(0, limit);
     },
+    readMemorySearchResultsByIds(memoryIds) {
+      if (memoryIds.length === 0) return [];
+      const rows = chunked(memoryIds, SQLITE_READ_BATCH_SIZE).flatMap((batch) =>
+        db.prepare(
+          `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                  dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+                  subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
+                  lifecycle_generation, created_at, promoted_at
+           from memories where lifecycle_status = 'current'
+             and id in (${batch.map(() => "?").join(", ")})`
+        ).all(...batch) as unknown as MemoryRow[]
+      );
+      const byId = new Map(rows.map((row) => [row.id, memoryFromRow(row)]));
+      return memoryIds.flatMap((memoryId) => {
+        const memory = byId.get(memoryId);
+        return memory ? [memorySearchResult(store, "promoted", memory)] : [];
+      });
+    },
     getProjectSummary() {
       const syncSources = store.listSyncStatuses().reduce<Partial<Record<SyncSourceName, SyncStatus>>>(
         (accumulator, status) => {
@@ -1282,6 +1935,7 @@ function upsertMemoryRow(
         `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                 dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
                 subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
+                lifecycle_generation,
                 created_at, promoted_at
          from memories
          where dedupe_key = ? and evidence_signature = ? and source = ?`
@@ -1303,18 +1957,20 @@ function upsertMemoryRow(
     );
   } else {
     const promotedAt = new Date().toISOString();
+    const lifecycleGeneration = randomUUID();
     db.prepare(
       `insert into memories
          (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
           dedupe_key, evidence_signature, source, quality_status, quality_reasons_json,
           last_verified_at, subject_key, lifecycle_status, valid_from, valid_until,
-          status_reason, status_changed_at, created_at, promoted_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?)`
+          status_reason, status_changed_at, lifecycle_generation, created_at, promoted_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?, ?)`
     ).run(
       id, input.type, input.title, input.summary, input.reason, input.confidence,
       JSON.stringify(input.evidence), JSON.stringify(input.relatedFiles), input.dedupeKey,
       evidenceSignature, input.source, input.qualityStatus, JSON.stringify(input.qualityReasons),
-      input.lastVerifiedAt ?? null, subjectKey, input.createdAt, promotedAt, input.createdAt, promotedAt
+      input.lastVerifiedAt ?? null, subjectKey, input.createdAt, promotedAt, lifecycleGeneration,
+      input.createdAt, promotedAt
     );
   }
   rebuildMemoryLinks(db, "memory", id, input.evidence, input.relatedFiles);
@@ -1326,6 +1982,7 @@ function readMemoryRowRaw(db: DatabaseSync, id: string): MemoryRow | undefined {
     `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
             dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
             subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
+            lifecycle_generation,
             created_at, promoted_at
      from memories where id = ?`
   ).get(id) as MemoryRow | undefined;
@@ -1463,6 +2120,139 @@ function rankTemporaryMemoryRows(
     .map((memory, index) => ({ ...memory, rank: index + 1 }));
 }
 
+function embeddingOwnerIdentity(ownerKind: EmbeddingOwnerKind, ownerId: string, contentHash: string): string {
+  return `${ownerKind}\0${ownerId}\0${contentHash}`;
+}
+
+function isCurrentEmbeddingOwner(
+  db: DatabaseSync,
+  input: Pick<EmbeddingOwner, "ownerKind" | "ownerId" | "contentHash" | "ownerVersion">
+): boolean {
+  if (input.ownerKind === "chunk") {
+    const chunk = db.prepare("select text from chunks where id = ?").get(input.ownerId) as
+      | { text: string }
+      | undefined;
+    return chunk !== undefined
+      && input.ownerVersion === ""
+      && createEmbeddingContentHash(chunk.text) === input.contentHash;
+  }
+  const memory = db.prepare(
+    `select title, summary, reason, lifecycle_generation
+     from memories where id = ? and lifecycle_status = 'current'`
+  ).get(input.ownerId) as
+    | { title: string; summary: string; reason: string; lifecycle_generation: string }
+    | undefined;
+  if (!memory || memory.lifecycle_generation !== input.ownerVersion) return false;
+  const text = [memory.title, memory.summary, memory.reason].join("\n\n");
+  return createEmbeddingContentHash(text) === input.contentHash;
+}
+
+function validateProviderKey(input: { providerKey: string; endpointHash: string; model: string }): void {
+  if (input.providerKey !== createProviderKey(input.endpointHash, input.model)) {
+    throw new Error("providerKey does not match endpointHash and model");
+  }
+}
+
+function validateEmbeddingVectorInput(
+  input: Omit<EmbeddingVector, "createdAt" | "updatedAt">
+): void {
+  validateProviderKey(input);
+  if (!Number.isInteger(input.dimension) || input.dimension <= 0) {
+    throw new Error("Embedding vector dimension must be a positive integer");
+  }
+  if (input.providerFingerprint !== createProviderFingerprint(input.endpointHash, input.model, input.dimension)) {
+    throw new Error("providerFingerprint does not match endpointHash, model, and dimension");
+  }
+  if (input.vectorBlob.byteLength !== input.dimension * Float32Array.BYTES_PER_ELEMENT) {
+    throw new Error(
+      `Float32 vector byte length ${input.vectorBlob.byteLength} does not match dimension ${input.dimension}`
+    );
+  }
+}
+
+function upsertEmbeddingVectorRow(
+  db: DatabaseSync,
+  input: Omit<EmbeddingVector, "createdAt" | "updatedAt">,
+  now: string
+): void {
+  db.prepare(
+    `insert into embedding_vectors
+       (owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model,
+        provider_fingerprint, dimension, vector_blob, created_at, updated_at)
+     values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     on conflict(owner_kind, owner_id, content_hash, provider_fingerprint) do update set
+       owner_version = excluded.owner_version,
+       provider_key = excluded.provider_key,
+       endpoint_hash = excluded.endpoint_hash,
+       model = excluded.model,
+       dimension = excluded.dimension,
+       vector_blob = excluded.vector_blob,
+       updated_at = excluded.updated_at`
+  ).run(
+    input.ownerKind,
+    input.ownerId,
+    input.contentHash,
+    input.ownerVersion,
+    input.providerKey,
+    input.endpointHash,
+    input.model,
+    input.providerFingerprint,
+    input.dimension,
+    Buffer.from(input.vectorBlob),
+    now,
+    now
+  );
+}
+
+function embeddingJobFromRow(row: EmbeddingJobRow): EmbeddingJob {
+  return {
+    ownerKind: row.owner_kind,
+    ownerId: row.owner_id,
+    contentHash: row.content_hash,
+    ownerVersion: row.owner_version,
+    providerKey: row.provider_key,
+    endpointHash: row.endpoint_hash,
+    model: row.model,
+    indexGeneration: row.index_generation,
+    state: row.state,
+    attempts: row.attempts,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    providerFingerprint: row.provider_fingerprint ?? undefined,
+    targetFingerprint: row.target_fingerprint ?? undefined,
+    lastError: row.last_error ?? undefined,
+    completedAt: row.completed_at ?? undefined
+  };
+}
+
+function embeddingVectorFromRow(row: EmbeddingVectorRow): EmbeddingVector {
+  const blob = row.vector_blob;
+  if (blob.byteLength !== row.dimension * Float32Array.BYTES_PER_ELEMENT) {
+    throw new Error(
+      `Float32 vector byte length ${blob.byteLength} does not match dimension ${row.dimension}`
+    );
+  }
+  return {
+    ownerKind: row.owner_kind,
+    ownerId: row.owner_id,
+    contentHash: row.content_hash,
+    ownerVersion: row.owner_version,
+    providerKey: row.provider_key,
+    endpointHash: row.endpoint_hash,
+    model: row.model,
+    providerFingerprint: row.provider_fingerprint,
+    dimension: row.dimension,
+    vectorBlob: new Uint8Array(blob),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function sanitizeStoredEmbeddingError(error: string): string {
+  const normalized = redactSensitiveText(error).text.replace(/\s+/g, " ").trim();
+  return (normalized || "Embedding request failed").slice(0, 1_000);
+}
+
 function countRows(db: DatabaseSync, table: string): number {
   const row = db.prepare(`select count(*) as count from ${table}`).get() as { count: number };
   return row.count;
@@ -1483,6 +2273,14 @@ function countMemoryHealth(db: DatabaseSync): { active: number; needsReview: num
 function normalizeLimit(limit: number | undefined): number {
   if (!limit || !Number.isFinite(limit)) return 10;
   return Math.max(1, Math.min(Math.floor(limit), 100));
+}
+
+function chunked<T>(items: T[], size: number): T[][] {
+  const batches: T[][] = [];
+  for (let offset = 0; offset < items.length; offset += size) {
+    batches.push(items.slice(offset, offset + size));
+  }
+  return batches;
 }
 
 function createId(type: SourceType): string {
@@ -1607,6 +2405,7 @@ function memoryFromRow(row: MemoryRow): DurableMemory {
     validUntil: row.valid_until ?? undefined,
     statusReason: row.status_reason ?? undefined,
     statusChangedAt: row.status_changed_at,
+    lifecycleGeneration: row.lifecycle_generation,
     createdAt: row.created_at,
     promotedAt: row.promoted_at
   };

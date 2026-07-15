@@ -1,9 +1,17 @@
 import { afterEach, describe, expect, it } from "vitest";
 
+import {
+  createEmbeddingEndpointHash,
+  createProviderFingerprint,
+  createProviderKey,
+  encodeFloat32Vector
+} from "../src/embeddings/fingerprint.js";
+import { buildEmbeddings } from "../src/embeddings/service.js";
 import { updateMemoryStatus } from "../src/memory/lifecycle-service.js";
 import { rememberProjectMemory } from "../src/memory/remember.js";
 import { openMemoryStore } from "../src/storage/store.js";
-import type { ExtractedMemory, MemoryLifecycleStatus } from "../src/types.js";
+import { withTransaction } from "../src/storage/transactions.js";
+import type { EmbeddingProvider, ExtractedMemory, MemoryLifecycleStatus } from "../src/types.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("memory lifecycle orchestration", () => {
@@ -391,6 +399,78 @@ describe("memory lifecycle orchestration", () => {
     store.close();
   });
 
+  it("runs remember supersession cleanup after the outer commit and isolates independent cleanup failures", () => {
+    const store = createStore();
+    const old = rememberProjectMemory(store, {
+      type: "constraint",
+      text: "Deployments use the pre-commit cleanup queue.",
+      title: "Cleanup commit boundary"
+    }, { now: () => new Date("2026-07-12T20:07:00.000Z") });
+    const observations: Array<{ kind: string; inTransaction: boolean }> = [];
+    store.deleteStaleEmbeddingJobsForMemory = () => {
+      observations.push({ kind: "jobs", inTransaction: store.db.isTransaction });
+      throw new Error("injected job cleanup failure");
+    };
+    store.deleteStaleEmbeddingVectorsForMemory = () => {
+      observations.push({ kind: "vectors", inTransaction: store.db.isTransaction });
+      throw new Error("injected vector cleanup failure");
+    };
+
+    const replacement = rememberProjectMemory(store, {
+      type: "constraint",
+      text: "Deployments use the post-commit cleanup queue.",
+      title: "Cleanup commit boundary",
+      supersedesMemoryId: old.memory?.id
+    }, { now: () => new Date("2026-07-12T20:08:00.000Z") });
+
+    expect(observations).toEqual([
+      { kind: "jobs", inTransaction: false },
+      { kind: "vectors", inTransaction: false }
+    ]);
+    expect(store.readSource(replacement.sourceId)).toBeTruthy();
+    expect(store.listMemoryCandidates({ qualityStatus: "all" })).toHaveLength(2);
+    expect(replacement.memory).toMatchObject({ lifecycleStatus: "current" });
+    expect(store.readMemory(old.memory?.id ?? "")).toMatchObject({ lifecycleStatus: "superseded" });
+    expect(store.listMemoryRelations({ relationType: "supersedes" })).toEqual([
+      expect.objectContaining({ fromMemoryId: replacement.memory?.id, toMemoryId: old.memory?.id })
+    ]);
+    store.close();
+  });
+
+  it("discards remember supersession cleanup when an enclosing transaction rolls back", () => {
+    const store = createStore();
+    const old = rememberProjectMemory(store, {
+      type: "constraint",
+      text: "Use the original outer rollback queue.",
+      title: "Outer rollback cleanup"
+    });
+    let cleanupCalls = 0;
+    store.deleteStaleEmbeddingJobsForMemory = () => {
+      cleanupCalls += 1;
+      return 0;
+    };
+    store.deleteStaleEmbeddingVectorsForMemory = () => {
+      cleanupCalls += 1;
+      return 0;
+    };
+
+    expect(() => withTransaction(store.db, () => {
+      rememberProjectMemory(store, {
+        type: "constraint",
+        text: "Use the replacement outer rollback queue.",
+        title: "Outer rollback cleanup",
+        supersedesMemoryId: old.memory?.id
+      });
+      throw new Error("injected outer rollback");
+    })).toThrow("injected outer rollback");
+
+    expect(cleanupCalls).toBe(0);
+    expect(store.readMemory(old.memory?.id ?? "")).toMatchObject({ lifecycleStatus: "current" });
+    expect(store.listMemoryRelations()).toEqual([]);
+    expect(store.listMemoryCandidates({ qualityStatus: "all" })).toHaveLength(1);
+    store.close();
+  });
+
   it("rejects candidate-only supersession before writing any remember artifacts", () => {
     const store = createStore();
     const old = promote(store, "candidate-only-old");
@@ -436,6 +516,309 @@ describe("memory lifecycle orchestration", () => {
     expect(store.db.prepare("select count(*) as count from memories").get()).toEqual(before.memories);
     expect(store.readMemory(old.memory?.id ?? "")).toMatchObject({ lifecycleStatus: "current" });
     expect(store.listMemoryRelations()).toEqual([]);
+    store.close();
+  });
+
+  it("atomically invalidates inactive embedding state and queues fresh work only after reactivation reconciliation", () => {
+    const store = createStore();
+    const memory = promote(store, "embedding-lifecycle");
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const provider = {
+      endpointHash,
+      model: "model",
+      providerKey: createProviderKey(endpointHash, "model")
+    };
+    store.reconcileEmbeddingJobs(provider);
+    const owner = store.listEmbeddingOwners().find((item) => item.ownerId === memory.id)!;
+    store.recordEmbeddingJobAttempts([
+      store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })[0]!
+    ]);
+    store.completeEmbeddingJob({
+      ...owner,
+      ...provider,
+      providerFingerprint: createProviderFingerprint(endpointHash, "model", 1),
+      dimension: 1,
+      vectorBlob: encodeFloat32Vector([1])
+    });
+
+    updateMemoryStatus(store, {
+      memoryId: memory.id,
+      status: "retracted",
+      reason: "No longer trusted",
+      now: "2026-07-12T20:09:00.000Z"
+    });
+    expect(store.listEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toEqual([]);
+    expect(store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })).toEqual([]);
+
+    updateMemoryStatus(store, {
+      memoryId: memory.id,
+      status: "current",
+      reason: "Verified again",
+      now: "2026-07-12T20:10:00.000Z"
+    });
+    expect(store.listEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toEqual([]);
+    expect(store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })).toEqual([]);
+    store.reconcileEmbeddingJobs(provider);
+    expect(store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })).toEqual([
+      expect.objectContaining({ state: "pending", attempts: 0 })
+    ]);
+    store.close();
+  });
+
+  it("commits lifecycle changes when embedding cleanup fails and never reactivates stale vectors", () => {
+    const store = createStore();
+    const memory = promote(store, "embedding-cleanup-failure");
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const provider = {
+      endpointHash,
+      model: "model",
+      providerKey: createProviderKey(endpointHash, "model")
+    };
+    store.reconcileEmbeddingJobs(provider);
+    const owner = store.listEmbeddingOwners().find((item) => item.ownerId === memory.id)!;
+    store.recordEmbeddingJobAttempts([
+      store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })[0]!
+    ]);
+    store.completeEmbeddingJob({
+      ...owner,
+      ...provider,
+      providerFingerprint: createProviderFingerprint(endpointHash, "model", 1),
+      dimension: 1,
+      vectorBlob: encodeFloat32Vector([1])
+    });
+    store.db.prepare(
+      "update embedding_jobs set updated_at = ?, completed_at = ? where owner_kind = 'memory' and owner_id = ?"
+    ).run("2026-07-12T19:00:00.000Z", "2026-07-12T19:00:00.000Z", memory.id);
+    store.db.prepare(
+      "update embedding_vectors set created_at = ?, updated_at = ? where owner_kind = 'memory' and owner_id = ?"
+    ).run("2026-07-12T19:00:00.000Z", "2026-07-12T19:00:00.000Z", memory.id);
+    store.db.exec(`
+      create trigger fail_embedding_job_cleanup
+      before delete on embedding_jobs when old.owner_kind = 'memory' and old.owner_id = '${memory.id}'
+      begin select raise(abort, 'injected embedding cleanup failure'); end;
+      create trigger fail_embedding_vector_cleanup
+      before delete on embedding_vectors when old.owner_kind = 'memory' and old.owner_id = '${memory.id}'
+      begin select raise(abort, 'injected embedding cleanup failure'); end;
+    `);
+
+    expect(updateMemoryStatus(store, {
+      memoryId: memory.id,
+      status: "retracted",
+      reason: "No longer trusted",
+      now: "2026-07-12T20:09:00.000Z"
+    })).toMatchObject({ lifecycleStatus: "retracted" });
+    expect(store.readMemory(memory.id)).toMatchObject({ lifecycleStatus: "retracted" });
+    expect(store.listEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toHaveLength(1);
+    expect(store.listActiveEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toEqual([]);
+
+    expect(updateMemoryStatus(store, {
+      memoryId: memory.id,
+      status: "current",
+      reason: "Verified again",
+      now: "2026-07-12T20:10:00.000Z"
+    })).toMatchObject({ lifecycleStatus: "current" });
+    expect(store.listEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toHaveLength(1);
+    expect(store.listActiveEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toEqual([]);
+
+    store.db.exec("drop trigger fail_embedding_job_cleanup; drop trigger fail_embedding_vector_cleanup");
+    expect(store.reconcileEmbeddingJobs(provider)).toMatchObject({
+      enqueued: 1,
+      removedJobs: 1,
+      removedVectors: 1
+    });
+    expect(store.listEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toEqual([]);
+    expect(store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })).toEqual([
+      expect.objectContaining({ state: "pending", attempts: 0 })
+    ]);
+    store.close();
+  });
+
+  it("preserves a fresh generation created by another connection before stale cleanup runs", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const staleStore = openMemoryStore(rootDir);
+    staleStore.init();
+    const freshStore = openMemoryStore(rootDir);
+    freshStore.init();
+    const memory = promote(staleStore, "cleanup-interleaving");
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const provider = {
+      endpointHash,
+      model: "model",
+      providerKey: createProviderKey(endpointHash, "model")
+    };
+    staleStore.reconcileEmbeddingJobs(provider);
+    const staleOwner = staleStore.listEmbeddingOwners().find((owner) => owner.ownerId === memory.id)!;
+    staleStore.recordEmbeddingJobAttempts([
+      staleStore.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })[0]!
+    ]);
+    staleStore.completeEmbeddingJob({
+      ...staleOwner,
+      ...provider,
+      providerFingerprint: createProviderFingerprint(endpointHash, "model", 1),
+      dimension: 1,
+      vectorBlob: encodeFloat32Vector([1])
+    });
+
+    const deleteJobs = staleStore.deleteStaleEmbeddingJobsForMemory.bind(staleStore);
+    let freshGeneration = "";
+    staleStore.deleteStaleEmbeddingJobsForMemory = (memoryId) => {
+      const reactivated = freshStore.updateMemoryLifecycle(memory.id, {
+        lifecycleStatus: "current",
+        validUntil: null,
+        statusReason: "Reactivated concurrently",
+        statusChangedAt: "2026-07-12T20:10:00.000Z"
+      });
+      freshGeneration = reactivated.lifecycleGeneration;
+      freshStore.reconcileEmbeddingJobs(provider);
+      const freshOwner = freshStore.listEmbeddingOwners().find((owner) => owner.ownerId === memory.id)!;
+      freshStore.recordEmbeddingJobAttempts([
+        freshStore.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })[0]!
+      ]);
+      freshStore.completeEmbeddingJob({
+        ...freshOwner,
+        ...provider,
+        providerFingerprint: createProviderFingerprint(endpointHash, "model", 1),
+        dimension: 1,
+        vectorBlob: encodeFloat32Vector([2])
+      });
+      return deleteJobs(memoryId);
+    };
+
+    updateMemoryStatus(staleStore, {
+      memoryId: memory.id,
+      status: "retracted",
+      reason: "Trigger stale post-commit cleanup",
+      now: "2026-07-12T20:09:00.000Z"
+    });
+
+    expect(freshStore.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })).toEqual([
+      expect.objectContaining({ ownerVersion: freshGeneration, state: "complete", attempts: 1 })
+    ]);
+    expect(freshStore.listActiveEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toEqual([
+      expect.objectContaining({ ownerVersion: freshGeneration })
+    ]);
+    freshStore.close();
+    staleStore.close();
+  });
+
+  it("rejects an in-flight completion from an old lifecycle generation", async () => {
+    const store = createStore();
+    const memory = promote(store, "deferred-embedding-generation");
+    const collidingTimestamp = memory.statusChangedAt;
+    store.updateMemoryLifecycle(memory.id, {
+      lifecycleStatus: "current",
+      statusChangedAt: collidingTimestamp
+    });
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    let calls = 0;
+    let releaseRequest!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const provider: EmbeddingProvider = {
+      endpointHash,
+      providerKey: createProviderKey(endpointHash, "model"),
+      isRemote: false,
+      embed(inputs) {
+        calls += 1;
+        const result = {
+          vectors: inputs.map(() => [1]),
+          dimension: 1,
+          providerFingerprint: createProviderFingerprint(endpointHash, "model", 1)
+        };
+        if (calls > 1) return Promise.resolve(result);
+        markStarted();
+        return new Promise((resolve) => {
+          releaseRequest = () => resolve(result);
+        });
+      }
+    };
+    const config = {
+      embeddings: {
+        enabled: true,
+        provider: "openai-compatible" as const,
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "model",
+        batchSize: 16
+      },
+      privacy: { allowRemoteEmbeddings: false }
+    };
+
+    const staleBuild = buildEmbeddings(store, config, { provider });
+    await started;
+    const staleJob = store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })[0]!;
+    store.db.exec(`
+      create trigger fail_deferred_job_cleanup
+      before delete on embedding_jobs when old.owner_kind = 'memory' and old.owner_id = '${memory.id}'
+      begin select raise(abort, 'injected deferred cleanup failure'); end;
+      create trigger fail_deferred_vector_cleanup
+      before delete on embedding_vectors when old.owner_kind = 'memory' and old.owner_id = '${memory.id}'
+      begin select raise(abort, 'injected deferred cleanup failure'); end;
+    `);
+    updateMemoryStatus(store, {
+      memoryId: memory.id,
+      status: "retracted",
+      reason: "Temporarily invalid",
+      now: collidingTimestamp
+    });
+    updateMemoryStatus(store, {
+      memoryId: memory.id,
+      status: "current",
+      reason: "Verified in a new generation",
+      now: collidingTimestamp
+    });
+
+    releaseRequest();
+    await staleBuild;
+
+    expect(store.listActiveEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toEqual([]);
+    expect(store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })).toEqual([
+      expect.objectContaining({ ownerVersion: staleJob.ownerVersion, state: "pending", attempts: 1 })
+    ]);
+
+    store.db.exec("drop trigger fail_deferred_job_cleanup; drop trigger fail_deferred_vector_cleanup");
+    const currentOwner = store.listEmbeddingOwners().find((owner) => owner.ownerId === memory.id)!;
+    expect(currentOwner.ownerVersion).not.toBe(staleJob.ownerVersion);
+    expect(store.reconcileEmbeddingJobs({
+      providerKey: provider.providerKey,
+      endpointHash: provider.endpointHash,
+      model: "model"
+    })).toMatchObject({ enqueued: 1, removedJobs: 1 });
+    expect(() => store.completeEmbeddingJob({
+      ownerKind: staleJob.ownerKind,
+      ownerId: staleJob.ownerId,
+      contentHash: staleJob.contentHash,
+      ownerVersion: staleJob.ownerVersion,
+      providerKey: provider.providerKey,
+      endpointHash: provider.endpointHash,
+      model: "model",
+      providerFingerprint: createProviderFingerprint(endpointHash, "model", 1),
+      dimension: 1,
+      vectorBlob: encodeFloat32Vector([1])
+    })).toThrow("owner generation");
+    expect(() => store.markEmbeddingJobFailed({
+      ownerKind: staleJob.ownerKind,
+      ownerId: staleJob.ownerId,
+      contentHash: staleJob.contentHash,
+      ownerVersion: staleJob.ownerVersion,
+      providerKey: provider.providerKey,
+      error: "late old-generation failure"
+    })).toThrow("owner generation");
+    expect(store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })).toEqual([
+      expect.objectContaining({ ownerVersion: currentOwner.ownerVersion, state: "pending", attempts: 0 })
+    ]);
+
+    const freshBuild = await buildEmbeddings(store, config, { provider });
+    expect(freshBuild).toMatchObject({ built: 1, pending: 0, failed: 0 });
+    expect(calls).toBe(2);
+    expect(store.listEmbeddingJobs({ ownerKind: "memory", ownerId: memory.id })).toEqual([
+      expect.objectContaining({ ownerVersion: currentOwner.ownerVersion, state: "complete", attempts: 1 })
+    ]);
+    expect(store.listActiveEmbeddingVectors({ ownerKind: "memory", ownerId: memory.id })).toEqual([
+      expect.objectContaining({ ownerVersion: currentOwner.ownerVersion })
+    ]);
     store.close();
   });
 });

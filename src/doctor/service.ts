@@ -6,6 +6,8 @@ import { globalConfigDir, loadExistingProjectConfig } from "../config.js";
 import { getProjectSummaryStatus } from "../project-summary/service.js";
 import { getClaudeSourceStatus, getCodexSourceStatus, type ConversationSourceStatus } from "../sources/codex.js";
 import { getMigrationStatus } from "../storage/migrations.js";
+import { isLoopbackEmbeddingEndpoint } from "../embeddings/provider.js";
+import { createEmbeddingContentHash, createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey } from "../embeddings/fingerprint.js";
 import type { MemoryStore } from "../storage/store.js";
 import type {
   DoctorCheck,
@@ -160,6 +162,7 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
       addSourceChecks(config, storage, addCheck, addAction);
       addSyncChecks(config, storage, now, addCheck, addAction);
       addExtractorChecks(config, addCheck, addAction);
+      addEmbeddingChecks(config, storage, addCheck, addAction);
     }
     addSummaryCheck(projectRoot, now, addCheck, addAction);
     addMemoryCheck(storage, addCheck, addAction);
@@ -174,6 +177,185 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
     checks,
     nextActions: sortActions(nextActions)
   };
+}
+
+function addEmbeddingChecks(
+  config: ProjectConfig,
+  storage: DoctorStorageState,
+  addCheck: (check: DoctorCheck) => void,
+  addAction: (action: DoctorNextAction) => void
+): void {
+  let local = false;
+  let configuredEndpointHash: string | undefined;
+  let configuredProviderKey: string | undefined;
+  try {
+    local = isLoopbackEmbeddingEndpoint(config.embeddings.baseUrl);
+    configuredEndpointHash = createEmbeddingEndpointHash(config.embeddings.baseUrl);
+    configuredProviderKey = createProviderKey(configuredEndpointHash, config.embeddings.model);
+  } catch {
+    // Config parsing normally rejects this; keep Doctor read-only and diagnostic.
+  }
+  const remoteBlocked = config.embeddings.enabled && !local && !config.privacy.allowRemoteEmbeddings;
+  let schema: { available: boolean; missing: string[] };
+  let schemaInspectionFailed = false;
+  try {
+    schema = inspectEmbeddingSchema(storage.db);
+  } catch {
+    schema = { available: false, missing: [] };
+    schemaInspectionFailed = true;
+  }
+  let diagnostics = emptyEmbeddingDiagnostics();
+  let diagnosticsError = schemaInspectionFailed;
+  if (schema.available && storage.db && configuredEndpointHash && configuredProviderKey) {
+    try {
+      diagnostics = readEmbeddingDiagnostics(storage.db, configuredEndpointHash, configuredProviderKey, config.embeddings.model);
+    } catch {
+      diagnosticsError = true;
+    }
+  }
+
+  addCheck({
+    id: "embeddings:schema",
+    category: "retrieval",
+    status: schema.available && !diagnosticsError ? "ok" : "warning",
+    title: schema.available && !diagnosticsError ? "Embedding schema is readable" : "Embedding schema needs migration",
+    detail: schema.available && !diagnosticsError ? "Required embedding and owner columns are available." : `missing_or_unreadable_columns=${schema.missing.length}`,
+    metadata: { available: schema.available && !diagnosticsError, missing: schema.missing }
+  });
+  if ((!schema.available || diagnosticsError) && config.embeddings.enabled) {
+    addAction({ priority: "medium", command: "code-butler init", reason: "Apply or repair the embedding schema before building vectors." });
+  }
+
+  const usable = config.embeddings.enabled && !remoteBlocked && schema.available && !diagnosticsError
+    && diagnostics.vectors > 0 && diagnostics.vectors === diagnostics.eligible && diagnostics.configuredIndexes.length === 1;
+  const hybridWarning = config.retrieval.mode === "hybrid" && !usable;
+  addCheck({
+    id: "retrieval:mode",
+    category: "retrieval",
+    status: hybridWarning ? "warning" : "ok",
+    title: hybridWarning ? "Hybrid retrieval will use exact FTS fallback" : `Retrieval mode is ${config.retrieval.mode}`,
+    detail: hybridWarning ? "No single usable embedding index is available; lexical retrieval remains active." : `mode=${config.retrieval.mode}`,
+    metadata: { mode: config.retrieval.mode }
+  });
+  addCheck({
+    id: "embeddings:config",
+    category: "retrieval",
+    status: remoteBlocked ? "warning" : "ok",
+    title: remoteBlocked ? "Remote embedding privacy permission is disabled" : "Embedding configuration is safe",
+    detail: `enabled=${config.embeddings.enabled} provider=${config.embeddings.provider} model=${config.embeddings.model} endpoint=${local ? "local" : "remote"} remote_allowed=${config.privacy.allowRemoteEmbeddings}`,
+    metadata: { enabled: config.embeddings.enabled, provider: config.embeddings.provider, model: config.embeddings.model, local, remoteAllowed: config.privacy.allowRemoteEmbeddings }
+  });
+  addCheck({
+    id: "embeddings:queue",
+    category: "retrieval",
+    status: !config.embeddings.enabled || (schema.available && !diagnosticsError && diagnostics.queue.failed === 0 && diagnostics.queue.pending === 0) ? "ok" : "warning",
+    title: schema.available && !diagnosticsError ? "Configured embedding queue is readable" : "Embedding schema is unavailable",
+    detail: `pending=${diagnostics.queue.pending} complete=${diagnostics.queue.complete} failed=${diagnostics.queue.failed} attempts=${diagnostics.queue.attempts} stale_jobs=${diagnostics.staleJobs}`,
+    metadata: { schemaAvailable: schema.available && !diagnosticsError, ...diagnostics.queue, staleJobs: diagnostics.staleJobs }
+  });
+  const mixed = diagnostics.configuredIndexes.length > 1;
+  const incomplete = config.embeddings.enabled && diagnostics.vectors < diagnostics.eligible;
+  addCheck({
+    id: "embeddings:coverage",
+    category: "retrieval",
+    status: hybridWarning || mixed || incomplete || (config.embeddings.enabled && diagnostics.staleVectors > 0) ? "warning" : "ok",
+    title: mixed ? "Active embedding dimensions or fingerprints are mixed" : incomplete ? "Embedding coverage is incomplete" : diagnostics.staleVectors > 0 ? "Stale embedding index data exists" : "Embedding coverage inspected",
+    detail: `eligible=${diagnostics.eligible} vectors=${diagnostics.vectors} active_indexes=${diagnostics.configuredIndexes.length} stale_vectors=${diagnostics.staleVectors}`,
+    metadata: {
+      eligible: diagnostics.eligible,
+      vectors: diagnostics.vectors,
+      staleVectors: diagnostics.staleVectors,
+      configuredIndexes: diagnostics.configuredIndexes,
+      staleIndexes: diagnostics.staleIndexes
+    }
+  });
+  if (hybridWarning || diagnostics.queue.failed > 0 || diagnostics.queue.pending > 0) {
+    addAction({ priority: "medium", command: "code-butler embeddings build", reason: "Build or retry the configured embedding index; FTS remains available." });
+  }
+}
+
+const EMBEDDING_REQUIRED_COLUMNS = {
+  embedding_jobs: ["owner_kind", "owner_id", "content_hash", "owner_version", "provider_key", "endpoint_hash", "model", "provider_fingerprint", "state", "attempts", "last_error", "created_at", "updated_at", "completed_at"],
+  embedding_vectors: ["owner_kind", "owner_id", "content_hash", "owner_version", "provider_key", "endpoint_hash", "model", "provider_fingerprint", "dimension", "vector_blob", "created_at", "updated_at"],
+  chunks: ["id", "text"],
+  memories: ["id", "title", "summary", "reason", "lifecycle_status", "lifecycle_generation"]
+} as const;
+
+function inspectEmbeddingSchema(db: DatabaseSync | undefined): { available: boolean; missing: string[] } {
+  if (!db) return { available: false, missing: Object.keys(EMBEDDING_REQUIRED_COLUMNS) };
+  const missing: string[] = [];
+  for (const [table, required] of Object.entries(EMBEDDING_REQUIRED_COLUMNS)) {
+    if (!tableExists(db, table)) {
+      missing.push(table);
+      continue;
+    }
+    const columns = tableColumns(db, table);
+    for (const column of required) if (!columns.has(column)) missing.push(`${table}.${column}`);
+  }
+  return { available: missing.length === 0, missing };
+}
+
+interface EmbeddingDoctorDiagnostics {
+  eligible: number;
+  vectors: number;
+  staleVectors: number;
+  staleJobs: number;
+  queue: { pending: number; complete: number; failed: number; attempts: number };
+  configuredIndexes: Array<{ fingerprint: string; model: string; dimension: number; count: number }>;
+  staleIndexes: Array<{ fingerprint: string; model: string; dimension: number; count: number }>;
+}
+
+function emptyEmbeddingDiagnostics(): EmbeddingDoctorDiagnostics {
+  return { eligible: 0, vectors: 0, staleVectors: 0, staleJobs: 0, queue: { pending: 0, complete: 0, failed: 0, attempts: 0 }, configuredIndexes: [], staleIndexes: [] };
+}
+
+function readEmbeddingDiagnostics(db: DatabaseSync, endpointHash: string, providerKey: string, model: string): EmbeddingDoctorDiagnostics {
+  const result = emptyEmbeddingDiagnostics();
+  const owners = new Map<string, { contentHash: string; ownerVersion: string }>();
+  const chunks = db.prepare("select id, text from chunks").all() as Array<{ id: string; text: string }>;
+  for (const chunk of chunks) owners.set(`chunk\0${chunk.id}`, { contentHash: createEmbeddingContentHash(chunk.text), ownerVersion: "" });
+  const memories = db.prepare("select id, title, summary, reason, lifecycle_generation from memories where lifecycle_status = 'current'").all() as Array<{ id: string; title: string; summary: string; reason: string; lifecycle_generation: string }>;
+  for (const memory of memories) owners.set(`memory\0${memory.id}`, { contentHash: createEmbeddingContentHash([memory.title, memory.summary, memory.reason].join("\n\n")), ownerVersion: memory.lifecycle_generation });
+  result.eligible = owners.size;
+
+  const jobs = db.prepare("select owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model, state, attempts from embedding_jobs").all() as Array<{ owner_kind: "chunk" | "memory"; owner_id: string; content_hash: string; owner_version: string; provider_key: string; endpoint_hash: string; model: string; state: "pending" | "complete" | "failed"; attempts: number }>;
+  for (const job of jobs) {
+    const owner = owners.get(`${job.owner_kind}\0${job.owner_id}`);
+    if (job.provider_key !== providerKey || job.endpoint_hash !== endpointHash || job.model !== model
+      || owner?.contentHash !== job.content_hash || owner.ownerVersion !== job.owner_version) {
+      result.staleJobs += 1;
+      continue;
+    }
+    result.queue[job.state] += 1;
+    result.queue.attempts += job.attempts;
+  }
+
+  const vectors = db.prepare("select owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model, provider_fingerprint, dimension, vector_blob from embedding_vectors").all() as Array<{ owner_kind: "chunk" | "memory"; owner_id: string; content_hash: string; owner_version: string; provider_key: string; endpoint_hash: string; model: string; provider_fingerprint: string; dimension: number; vector_blob: Uint8Array }>;
+  const validOwners = new Set<string>();
+  const configured = new Map<string, { fingerprint: string; model: string; dimension: number; count: number }>();
+  const stale = new Map<string, { fingerprint: string; model: string; dimension: number; count: number }>();
+  for (const vector of vectors) {
+    const owner = owners.get(`${vector.owner_kind}\0${vector.owner_id}`);
+    const dimensionValid = Number.isInteger(vector.dimension) && vector.dimension > 0 && vector.vector_blob.byteLength === vector.dimension * 4;
+    const expectedFingerprint = dimensionValid ? createProviderFingerprint(endpointHash, model, vector.dimension) : undefined;
+    const valid = owner !== undefined
+      && owner.contentHash === vector.content_hash
+      && owner.ownerVersion === vector.owner_version
+      && vector.provider_key === providerKey
+      && vector.endpoint_hash === endpointHash
+      && vector.model === model
+      && vector.provider_fingerprint === expectedFingerprint;
+    const key = `${vector.provider_fingerprint}\0${vector.model}\0${vector.dimension}`;
+    const target = valid ? configured : stale;
+    const existing = target.get(key);
+    target.set(key, existing ? { ...existing, count: existing.count + 1 } : { fingerprint: vector.provider_fingerprint, model: vector.model, dimension: vector.dimension, count: 1 });
+    if (valid) validOwners.add(`${vector.owner_kind}\0${vector.owner_id}`);
+    else result.staleVectors += 1;
+  }
+  result.vectors = validOwners.size;
+  result.configuredIndexes = [...configured.values()].sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
+  result.staleIndexes = [...stale.values()].sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
+  return result;
 }
 
 function addProjectChecks(

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 
 import { createProjectMemoryToolHandlers, registerProjectMemoryTools } from "../src/mcp/tools.js";
+import { createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey, encodeFloat32Vector } from "../src/embeddings/fingerprint.js";
 import type { ProjectSummaryGenerator } from "../src/project-summary/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
@@ -43,7 +44,7 @@ describe("MCP tool handlers", () => {
 
     const handlers = createProjectMemoryToolHandlers(store);
 
-    expect(handlers.search_project_memory({ query: "stale reads", limit: 5 }).results[0]?.sourceId).toBe(
+    expect((await handlers.search_project_memory({ query: "stale reads", limit: 5 })).results[0]?.sourceId).toBe(
       sourceId
     );
     expect(handlers.read_memory_source({ sourceId })?.title).toBe("cache.md");
@@ -85,7 +86,51 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("returns citation and trust fields and exposes memory health", () => {
+  it("preserves citation and trust decoration on hybrid raw results", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({
+      retrieval: { mode: "hybrid" },
+      embeddings: { enabled: true, baseUrl: "http://127.0.0.1:11434/v1", model: "model" }
+    }));
+    store.addSourceWithChunks({
+      source: { type: "conversation", title: "semantic", origin: "test", rawContent: "semantic result" },
+      chunks: [{ text: "semantic result" }]
+    });
+    store.addSourceWithChunks({
+      source: { type: "conversation", title: "lexical", origin: "test", rawContent: "needle result" },
+      chunks: [{ text: "needle result" }]
+    });
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const providerKey = createProviderKey(endpointHash, "model");
+    const fingerprint = createProviderFingerprint(endpointHash, "model", 2);
+    for (const owner of store.listEmbeddingOwners()) {
+      store.upsertEmbeddingVector({
+        ...owner, providerKey, endpointHash, model: "model", providerFingerprint: fingerprint,
+        dimension: 2, vectorBlob: encodeFloat32Vector(owner.text.includes("semantic") ? [1, 0] : [0, 1])
+      });
+    }
+    const handlers = createProjectMemoryToolHandlers(store, {
+      rootDir,
+      searchService: {
+        provider: {
+          endpointHash, providerKey, isRemote: false,
+          async embed() { return { vectors: [[1, 0]], dimension: 2, providerFingerprint: fingerprint }; }
+        }
+      }
+    });
+    const result = await handlers.search_project_memory({ query: "needle", limit: 5 });
+    expect(result.results.find((item) => item.title === "semantic")).toMatchObject({
+      ranking: { semanticRank: 1 },
+      citations: [expect.objectContaining({ kind: "conversation", resolved: true })],
+      trust: expect.objectContaining({ status: "active", resolvedEvidenceCount: 1 })
+    });
+    store.close();
+  });
+
+  it("returns citation and trust fields and exposes memory health", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
@@ -129,8 +174,8 @@ describe("MCP tool handlers", () => {
     );
 
     const handlers = createProjectMemoryToolHandlers(store, { rootDir });
-    const found = handlers.find_memories({ query: "SQLite", status: "promoted", limit: 5 });
-    const all = handlers.find_memories({ qualityStatus: "all", limit: 10 });
+    const found = await handlers.find_memories({ query: "SQLite", status: "promoted", limit: 5 });
+    const all = await handlers.find_memories({ qualityStatus: "all", limit: 10 });
     const state = handlers.summarize_project_state();
     const health = handlers.summarize_memory_health();
 
@@ -166,7 +211,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("remembers project memory with resolvable evidence through the MCP handler", () => {
+  it("remembers project memory with resolvable evidence through the MCP handler", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
@@ -208,7 +253,7 @@ describe("MCP tool handlers", () => {
     });
     expect(remembered.sourceId).toMatch(/^manual-memory:/);
     expect(store.readSource(remembered.sourceId)?.rawContent).toContain("Article templates must update datePublished");
-    expect(handlers.find_memories({ query: "datePublished", status: "promoted", limit: 5 }).results[0]).toMatchObject({
+    expect((await handlers.find_memories({ query: "datePublished", status: "promoted", limit: 5 })).results[0]).toMatchObject({
       id: remembered.memory.id,
       kind: "promoted"
     });
@@ -270,7 +315,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("filters promoted memories by lifecycle while leaving candidates unchanged", () => {
+  it("filters promoted memories by lifecycle while leaving candidates unchanged", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
@@ -290,17 +335,17 @@ describe("MCP tool handlers", () => {
     store.updateMemoryLifecycle(superseded.memory.id, { lifecycleStatus: "superseded" });
     store.updateMemoryLifecycle(retracted.memory.id, { lifecycleStatus: "retracted" });
 
-    expect(handlers.find_memories({ status: "promoted" }).results.map((memory) => memory.id)).toEqual([
+    expect((await handlers.find_memories({ status: "promoted" })).results.map((memory) => memory.id)).toEqual([
       current.memory.id
     ]);
-    expect(handlers.find_memories({ status: "promoted", lifecycleStatus: "superseded" }).results).toEqual([
+    expect((await handlers.find_memories({ status: "promoted", lifecycleStatus: "superseded" })).results).toEqual([
       expect.objectContaining({ id: superseded.memory.id, lifecycleStatus: "superseded" })
     ]);
-    expect(handlers.find_memories({ status: "promoted", lifecycleStatus: "retracted" }).results).toEqual([
+    expect((await handlers.find_memories({ status: "promoted", lifecycleStatus: "retracted" })).results).toEqual([
       expect.objectContaining({ id: retracted.memory.id, lifecycleStatus: "retracted" })
     ]);
-    expect(handlers.find_memories({ status: "promoted", lifecycleStatus: "all" }).results).toHaveLength(3);
-    const candidates = handlers.find_memories({ status: "candidate", lifecycleStatus: "retracted" }).results;
+    expect((await handlers.find_memories({ status: "promoted", lifecycleStatus: "all" })).results).toHaveLength(3);
+    const candidates = (await handlers.find_memories({ status: "candidate", lifecycleStatus: "retracted" })).results;
     expect(candidates).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "candidate", summary: "Candidate lifecycle rule." })
     ]));

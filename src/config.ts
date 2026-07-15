@@ -14,6 +14,9 @@ interface ProjectConfigFile {
   investigator?: InvestigatorConfigInput;
   promotion?: Partial<ProjectConfig["promotion"]>;
   sync?: Partial<ProjectConfig["sync"]>;
+  retrieval?: Partial<ProjectConfig["retrieval"]>;
+  embeddings?: Partial<ProjectConfig["embeddings"]>;
+  privacy?: Partial<ProjectConfig["privacy"]>;
   deterministic?: Partial<ProjectConfig["deterministic"]> & {
     triggers?: Partial<ProjectConfig["deterministic"]["triggers"]>;
   };
@@ -86,7 +89,9 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
   loadProjectEnv(rootDir);
   loadGlobalEnv();
   const raw = readFileSync(configPath, "utf8");
-  const parsed = raw.trim().length > 0 ? (JSON.parse(raw) as ProjectConfigFile) : {};
+  const parsedValue: unknown = raw.trim().length > 0 ? JSON.parse(raw) : {};
+  validateProjectConfigFile(parsedValue);
+  const parsed = parsedValue as ProjectConfigFile;
   const globalConfig = loadGlobalConfig();
   const defaults = defaultConfig(rootDir, configPath);
 
@@ -126,6 +131,18 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
     sync: {
       ...defaults.sync,
       ...(parsed.sync ?? {})
+    },
+    retrieval: {
+      ...defaults.retrieval,
+      ...(parsed.retrieval ?? {})
+    },
+    embeddings: {
+      ...defaults.embeddings,
+      ...(parsed.embeddings ?? {})
+    },
+    privacy: {
+      ...defaults.privacy,
+      ...(parsed.privacy ?? {})
     },
     deterministic: {
       ...defaults.deterministic,
@@ -191,6 +208,20 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
     sync: {
       autoSyncOnServerStart: true
     },
+    retrieval: {
+      mode: "fts",
+      rrfK: 60
+    },
+    embeddings: {
+      enabled: false,
+      provider: "openai-compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "nomic-embed-text",
+      batchSize: 16
+    },
+    privacy: {
+      allowRemoteEmbeddings: false
+    },
     deterministic: {
       enabled: true,
       promoteStrongSignals: true,
@@ -204,6 +235,78 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
       }
     }
   };
+}
+
+function validateProjectConfigFile(value: unknown): void {
+  if (!isConfigRecord(value)) throw new Error("Project config must be an object");
+  const retrieval = optionalConfigSection(value, "retrieval");
+  if (retrieval) {
+    if (retrieval.mode !== undefined && retrieval.mode !== "fts" && retrieval.mode !== "hybrid") {
+      throw new Error("retrieval.mode must be fts or hybrid");
+    }
+    if (retrieval.rrfK !== undefined && !isPositiveInteger(retrieval.rrfK)) {
+      throw new Error("retrieval.rrfK must be a positive integer");
+    }
+  }
+
+  const embeddings = optionalConfigSection(value, "embeddings");
+  if (embeddings) {
+    if (embeddings.enabled !== undefined && typeof embeddings.enabled !== "boolean") {
+      throw new Error("embeddings.enabled must be a boolean");
+    }
+    if (embeddings.provider !== undefined && embeddings.provider !== "openai-compatible") {
+      throw new Error("embeddings.provider must be openai-compatible");
+    }
+    if (embeddings.baseUrl !== undefined && !isValidEmbeddingBaseUrl(embeddings.baseUrl)) {
+      throw new Error("embeddings.baseUrl must be a valid HTTP(S) URL");
+    }
+    if (embeddings.model !== undefined && !isNonemptyString(embeddings.model)) {
+      throw new Error("embeddings.model must be a nonempty string");
+    }
+    if (embeddings.apiKeyEnv !== undefined && !isNonemptyString(embeddings.apiKeyEnv)) {
+      throw new Error("embeddings.apiKeyEnv must be a nonempty string");
+    }
+    if (embeddings.batchSize !== undefined && !isPositiveInteger(embeddings.batchSize)) {
+      throw new Error("embeddings.batchSize must be a positive integer");
+    }
+  }
+
+  const privacy = optionalConfigSection(value, "privacy");
+  if (privacy && privacy.allowRemoteEmbeddings !== undefined && typeof privacy.allowRemoteEmbeddings !== "boolean") {
+    throw new Error("privacy.allowRemoteEmbeddings must be a boolean");
+  }
+}
+
+function optionalConfigSection(
+  config: Record<string, unknown>,
+  name: "retrieval" | "embeddings" | "privacy"
+): Record<string, unknown> | undefined {
+  const value = config[name];
+  if (value === undefined) return undefined;
+  if (!isConfigRecord(value)) throw new Error(`${name} must be an object`);
+  return value;
+}
+
+function isConfigRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0;
+}
+
+function isNonemptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isValidEmbeddingBaseUrl(value: unknown): value is string {
+  if (!isNonemptyString(value)) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password;
+  } catch {
+    return false;
+  }
 }
 
 function resolveProviderConfig(
@@ -299,6 +402,20 @@ function defaultConfigFile(): ProjectConfigFile {
     },
     sync: {
       autoSyncOnServerStart: true
+    },
+    retrieval: {
+      mode: "fts",
+      rrfK: 60
+    },
+    embeddings: {
+      enabled: false,
+      provider: "openai-compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "nomic-embed-text",
+      batchSize: 16
+    },
+    privacy: {
+      allowRemoteEmbeddings: false
     },
     deterministic: {
       enabled: true,
@@ -457,7 +574,19 @@ function ensureProjectConfigExamples(rootDir: string): void {
 function defaultConfigExamplesFile(): Record<string, unknown> {
   return {
     note:
-      "Examples only. Copy the extractor and/or investigator blocks you want into config.json. The extractor and investigator are independent and may use different providers, models, base URLs, and token budgets.",
+      "Examples only. Copy the blocks you want into config.json. The extractor and investigator are independent from embeddings and may use different providers, models, base URLs, and token budgets.",
+    localEmbeddings: {
+      description: "Optional local embeddings through an OpenAI-compatible loopback service such as Ollama.",
+      retrieval: { mode: "hybrid", rrfK: 60 },
+      embeddings: {
+        enabled: true,
+        provider: "openai-compatible",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "nomic-embed-text",
+        batchSize: 16
+      },
+      privacy: { allowRemoteEmbeddings: false }
+    },
     openaiCompatible: {
       description: "OpenAI-compatible /chat/completions providers such as OpenAI.",
       extractor: {

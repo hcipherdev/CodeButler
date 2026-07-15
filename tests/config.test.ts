@@ -45,6 +45,15 @@ describe("project config", () => {
     expect(existsSync(configPath)).toBe(true);
     expect(generatedProjectConfig.extractor).toBeUndefined();
     expect(generatedProjectConfig.investigator).toBeUndefined();
+    expect(generatedProjectConfig.retrieval).toEqual({ mode: "fts", rrfK: 60 });
+    expect(generatedProjectConfig.embeddings).toEqual({
+      enabled: false,
+      provider: "openai-compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "nomic-embed-text",
+      batchSize: 16
+    });
+    expect(generatedProjectConfig.privacy).toEqual({ allowRemoteEmbeddings: false });
     expect(existsSync(join(rootDir, ".code-butler", ".gitignore"))).toBe(true);
     expect(readFileSync(join(rootDir, ".code-butler", ".gitignore"), "utf8")).toBe(
       ["/*", "!/project-summary.md", ""].join("\n")
@@ -66,6 +75,15 @@ describe("project config", () => {
     expect(defaults.deterministic.enabled).toBe(true);
     expect(defaults.deterministic.promoteStrongSignals).toBe(true);
     expect(defaults.deterministic.triggers.conversationDirectives).toBe(true);
+    expect(defaults.retrieval).toEqual({ mode: "fts", rrfK: 60 });
+    expect(defaults.embeddings).toEqual({
+      enabled: false,
+      provider: "openai-compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "nomic-embed-text",
+      batchSize: 16
+    });
+    expect(defaults.privacy).toEqual({ allowRemoteEmbeddings: false });
 
     mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
     writeFileSync(
@@ -131,6 +149,15 @@ describe("project config", () => {
 
     const examples = JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.examples.json"), "utf8"));
     expect(examples.note).toContain("extractor and investigator are independent");
+    expect(examples.localEmbeddings).toMatchObject({
+      retrieval: { mode: "hybrid", rrfK: 60 },
+      embeddings: {
+        enabled: true,
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "nomic-embed-text"
+      },
+      privacy: { allowRemoteEmbeddings: false }
+    });
     expect(examples.openaiCompatible.extractor).toMatchObject({
       provider: "openai-compatible",
       baseUrl: "https://api.openai.com/v1",
@@ -154,6 +181,92 @@ describe("project config", () => {
       workspaceIdEnv: "ANTHROPIC_AWS_WORKSPACE_ID",
       regionEnv: "AWS_REGION"
     });
+  });
+
+  it("merges retrieval, embedding, and privacy overrides independently from provider profiles", () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    originalEnv.set("CODE_BUTLER_HOME", process.env.CODE_BUTLER_HOME);
+    process.env.CODE_BUTLER_HOME = globalHome;
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        retrieval: { mode: "hybrid", rrfK: 42 },
+        embeddings: {
+          enabled: true,
+          baseUrl: "https://embeddings.example/v1/",
+          model: "embedding-model",
+          apiKeyEnv: "EMBEDDING_API_KEY",
+          batchSize: 8
+        },
+        privacy: { allowRemoteEmbeddings: true }
+      })
+    );
+
+    const config = loadProjectConfig(rootDir);
+
+    expect(config.retrieval).toEqual({ mode: "hybrid", rrfK: 42 });
+    expect(config.embeddings).toEqual({
+      enabled: true,
+      provider: "openai-compatible",
+      baseUrl: "https://embeddings.example/v1/",
+      model: "embedding-model",
+      apiKeyEnv: "EMBEDDING_API_KEY",
+      batchSize: 8
+    });
+    expect(config.privacy).toEqual({ allowRemoteEmbeddings: true });
+    expect(config.extractor).toMatchObject({ model: "gpt-5-mini", apiKeyEnv: "OPENAI_API_KEY" });
+    expect(config.investigator).toMatchObject({ model: "gpt-5-mini", apiKeyEnv: "OPENAI_API_KEY" });
+  });
+
+  it("applies every Release 3 default to a legacy config without Release 3 sections", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(configPath, JSON.stringify({ sources: { git: { enabled: false } } }));
+
+    const config = loadProjectConfig(rootDir);
+
+    expect(config.retrieval).toEqual({ mode: "fts", rrfK: 60 });
+    expect(config.embeddings).toEqual({
+      enabled: false,
+      provider: "openai-compatible",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      model: "nomic-embed-text",
+      batchSize: 16
+    });
+    expect(config.privacy).toEqual({ allowRemoteEmbeddings: false });
+  });
+
+  it.each([
+    [{ retrieval: "hybrid" }, "retrieval must be an object"],
+    [{ retrieval: { mode: "semantic" } }, "retrieval.mode must be fts or hybrid"],
+    [{ retrieval: { rrfK: 1.5 } }, "retrieval.rrfK must be a positive integer"],
+    [{ embeddings: { enabled: "false" } }, "embeddings.enabled must be a boolean"],
+    [{ embeddings: { provider: "other" } }, "embeddings.provider must be openai-compatible"],
+    [{ embeddings: { baseUrl: "not a URL" } }, "embeddings.baseUrl must be a valid HTTP(S) URL"],
+    [{ embeddings: { model: " " } }, "embeddings.model must be a nonempty string"],
+    [{ embeddings: { apiKeyEnv: "" } }, "embeddings.apiKeyEnv must be a nonempty string"],
+    [{ embeddings: { batchSize: 0 } }, "embeddings.batchSize must be a positive integer"],
+    [{ privacy: { allowRemoteEmbeddings: "false" } }, "privacy.allowRemoteEmbeddings must be a boolean"]
+  ])("rejects malformed Release 3 config %#", (invalid, message) => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(configPath, JSON.stringify(invalid));
+
+    expect(() => loadProjectConfig(rootDir)).toThrow(message);
+  });
+
+  it("rejects malformed project config JSON", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(configPath, "{ not valid JSON");
+
+    expect(() => loadProjectConfig(rootDir)).toThrow(SyntaxError);
   });
 
   it("backfills missing example files without rewriting existing active config", () => {

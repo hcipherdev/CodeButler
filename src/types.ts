@@ -13,7 +13,7 @@ export type MemoryLifecycleStatus = "current" | "superseded" | "retracted";
 export type MemoryRelationType = "supersedes" | "potentially_contradicts";
 export type SyncSourceName = "git" | "codex" | "claude";
 export type DoctorStatus = "ok" | "warning" | "error";
-export type DoctorCheckCategory = "project" | "storage" | "sources" | "sync" | "summary" | "extractor" | "memory";
+export type DoctorCheckCategory = "project" | "storage" | "sources" | "sync" | "summary" | "extractor" | "retrieval" | "memory";
 export type InvestigationMode = "native-rlm" | "heuristic-fallback";
 export type InvestigationStatus = "complete" | "partial" | "failed";
 export type InvestigationStepStatus = "completed" | "failed" | "skipped";
@@ -93,6 +93,13 @@ export interface SearchResult {
   evidence: EvidenceRef;
   citations?: EvidenceCitation[] | undefined;
   trust?: TrustSummary | undefined;
+  ranking?: RankingMetadata | undefined;
+}
+
+export interface RankingMetadata {
+  lexicalRank?: number | undefined;
+  semanticRank?: number | undefined;
+  fusedScore: number;
 }
 
 export interface CommitRecord {
@@ -151,6 +158,7 @@ export interface DurableMemory extends ExtractedMemory {
   validUntil?: string | undefined;
   statusReason?: string | undefined;
   statusChangedAt: string;
+  lifecycleGeneration: string;
 }
 
 export interface MemoryRelation {
@@ -184,6 +192,7 @@ export interface MemorySearchResult {
   statusChangedAt?: string | undefined;
   citations?: EvidenceCitation[] | undefined;
   trust?: TrustSummary | undefined;
+  ranking?: RankingMetadata | undefined;
 }
 
 export interface TemporaryMemory {
@@ -339,6 +348,84 @@ export interface SyncConfig {
   autoSyncOnServerStart: boolean;
 }
 
+export type RetrievalMode = "fts" | "hybrid";
+
+export interface RetrievalConfig {
+  mode: RetrievalMode;
+  rrfK: number;
+}
+
+export interface EmbeddingConfig {
+  enabled: boolean;
+  provider: "openai-compatible";
+  baseUrl: string;
+  model: string;
+  apiKeyEnv?: string | undefined;
+  batchSize: number;
+}
+
+export interface PrivacyConfig {
+  allowRemoteEmbeddings: boolean;
+}
+
+export type EmbeddingOwnerKind = "chunk" | "memory";
+export type EmbeddingJobState = "pending" | "complete" | "failed";
+
+export interface EmbeddingOwner {
+  ownerKind: EmbeddingOwnerKind;
+  ownerId: string;
+  text: string;
+  contentHash: string;
+  ownerVersion: string;
+}
+
+export interface EmbeddingJob {
+  ownerKind: EmbeddingOwnerKind;
+  ownerId: string;
+  contentHash: string;
+  ownerVersion: string;
+  providerKey: string;
+  endpointHash: string;
+  model: string;
+  indexGeneration: string;
+  state: EmbeddingJobState;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+  providerFingerprint?: string | undefined;
+  targetFingerprint?: string | undefined;
+  lastError?: string | undefined;
+  completedAt?: string | undefined;
+}
+
+export interface EmbeddingVector {
+  ownerKind: EmbeddingOwnerKind;
+  ownerId: string;
+  contentHash: string;
+  ownerVersion: string;
+  providerKey: string;
+  endpointHash: string;
+  model: string;
+  providerFingerprint: string;
+  dimension: number;
+  vectorBlob: Uint8Array;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EmbeddingBatchResult {
+  vectors: number[][];
+  dimension: number;
+  providerFingerprint: string;
+}
+
+export interface EmbeddingProvider {
+  endpointHash: string;
+  providerKey: string;
+  isRemote: boolean;
+  embed(inputs: string[]): Promise<EmbeddingBatchResult>;
+}
+
 export interface DeterministicConfig {
   enabled: boolean;
   promoteStrongSignals: boolean;
@@ -384,6 +471,9 @@ export interface ProjectConfig {
   extractor: ExtractorConfig;
   promotion: PromotionConfig;
   sync: SyncConfig;
+  retrieval: RetrievalConfig;
+  embeddings: EmbeddingConfig;
+  privacy: PrivacyConfig;
   deterministic: DeterministicConfig;
   investigator: InvestigatorConfig;
 }

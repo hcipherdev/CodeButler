@@ -4,7 +4,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
-import type { ExtractorProvider } from "../src/types.js";
+import {
+  createEmbeddingEndpointHash,
+  createProviderFingerprint,
+  createProviderKey
+} from "../src/embeddings/fingerprint.js";
+import type { EmbeddingBuildResult } from "../src/embeddings/service.js";
+import type { EmbeddingProvider, ExtractorProvider } from "../src/types.js";
 import { syncProjectMemory } from "../src/sync/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
@@ -596,4 +602,184 @@ describe("automatic sync", () => {
     });
     store.close();
   });
+
+  it("routes extractor-unavailable and no-new-evidence outcomes through one post-commit embedding hook", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const calls: number[] = [];
+    const embeddingBuilder = async (): Promise<EmbeddingBuildResult> => {
+      calls.push(store.listEmbeddingOwners().length);
+      return disabledEmbeddingResult();
+    };
+
+    const unavailable = await syncProjectMemory(store, config, { source: "git", embeddingBuilder });
+    expect(calls).toHaveLength(1);
+    expect(unavailable.embeddings).toMatchObject({ enabled: false, built: 0 });
+
+    const noEvidence = await syncProjectMemory(store, config, {
+      source: "git",
+      extractorProvider: { async extract() { return { memories: [], rejected: [] }; } },
+      embeddingBuilder
+    });
+    expect(noEvidence.memories).toMatchObject({ skipped: true, reason: "No new evidence" });
+    expect(calls).toHaveLength(2);
+    expect(noEvidence.embeddings).toMatchObject({ enabled: false, built: 0 });
+    store.close();
+  });
+
+  it("runs the post-commit embedding hook exactly once after successful extraction", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    let calls = 0;
+
+    const result = await syncProjectMemory(store, config, {
+      source: "git",
+      extractorProvider: { async extract() { return { memories: [], rejected: [] }; } },
+      embeddingBuilder: async () => {
+        calls += 1;
+        return disabledEmbeddingResult();
+      }
+    });
+
+    expect(result.sources.git.imported).toBe(1);
+    expect(result.memories).toMatchObject({ skipped: false });
+    expect(calls).toBe(1);
+    store.close();
+  });
+
+  it("runs the post-commit embedding hook exactly once after extractor failure", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    let calls = 0;
+
+    const result = await syncProjectMemory(store, config, {
+      source: "git",
+      extractorProvider: { async extract() { throw new Error("injected extractor failure"); } },
+      embeddingBuilder: async () => {
+        calls += 1;
+        return disabledEmbeddingResult();
+      }
+    });
+
+    expect(result.sources.git.imported).toBe(1);
+    expect(result.memories.error).toBe("injected extractor failure");
+    expect(calls).toBe(1);
+    store.close();
+  });
+
+  it("keeps committed FTS evidence and returns a safe warning when the embedding hook rejects", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const sourceLikeText = "export const cache = true;";
+    let calls = 0;
+
+    const result = await syncProjectMemory(store, config, {
+      source: "git",
+      embeddingBuilder: async () => {
+        calls += 1;
+        throw new Error(`embedding hook echoed source: ${sourceLikeText}`);
+      }
+    });
+
+    expect(calls).toBe(1);
+    expect(result.sources.git.imported).toBe(1);
+    expect(store.search({ query: "cache" }).length).toBeGreaterThan(0);
+    expect(result.embeddings!.warnings).toEqual(["Embedding build failed"]);
+    expect(result.embeddings!.warnings.join(" ")).not.toContain(sourceLikeText);
+    store.close();
+  });
+
+  it("keeps disabled embeddings provider-free during sync", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    let providerCalls = 0;
+    const provider = syncEmbeddingProvider(config, async () => {
+      providerCalls += 1;
+      throw new Error("disabled provider must not run");
+    });
+
+    const result = await syncProjectMemory(store, config, { source: "git", embeddingProvider: provider });
+
+    expect(result.embeddings).toMatchObject({ enabled: false, built: 0 });
+    expect(providerCalls).toBe(0);
+    expect(store.listEmbeddingJobs()).toEqual([]);
+    store.close();
+  });
+
+  it("isolates embedding failures from committed sync data and retries failed jobs on the next sync", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    config.embeddings.enabled = true;
+    config.embeddings.model = "sync-model";
+    let fail = true;
+    const provider = syncEmbeddingProvider(config, async (inputs) => {
+      if (fail) throw new Error("embedding api_key=sk-proj-abcdefghijklmnop failed");
+      const dimension = 2;
+      return {
+        vectors: inputs.map(() => [1, 0]),
+        dimension,
+        providerFingerprint: createProviderFingerprint(provider.endpointHash, config.embeddings.model, dimension)
+      };
+    });
+
+    const first = await syncProjectMemory(store, config, { source: "git", embeddingProvider: provider });
+    expect(first.sources.git.imported).toBe(1);
+    expect(first.embeddings).toMatchObject({ failed: expect.any(Number), built: 0 });
+    expect(first.embeddings!.failed).toBeGreaterThan(0);
+    expect(first.embeddings!.warnings.join(" ")).toContain("[REDACTED:API_KEY]");
+    expect(store.search({ query: "cache" }).length).toBeGreaterThan(0);
+    expect(store.listEmbeddingJobs({ state: "failed" }).every((job) => job.attempts === 1)).toBe(true);
+
+    fail = false;
+    const second = await syncProjectMemory(store, config, { source: "git", embeddingProvider: provider });
+    expect(second.memories).toMatchObject({ skipped: true, reason: "Extractor not configured" });
+    expect(second.embeddings).toMatchObject({ failed: 0, pending: 0 });
+    expect(second.embeddings!.built).toBeGreaterThan(0);
+    expect(store.listEmbeddingJobs({ state: "complete" }).every((job) => job.attempts === 2)).toBe(true);
+    store.close();
+  });
 });
+
+function disabledEmbeddingResult(): EmbeddingBuildResult {
+  return {
+    enabled: false,
+    eligible: 0,
+    activeCoverage: 0,
+    usable: false,
+    pending: 0,
+    complete: 0,
+    failed: 0,
+    attempts: 0,
+    warnings: ["Embeddings are disabled"],
+    built: 0,
+    retried: 0,
+    enqueued: 0,
+    removedJobs: 0,
+    removedVectors: 0
+  };
+}
+
+function syncEmbeddingProvider(
+  config: ReturnType<typeof loadProjectConfig>,
+  embed: EmbeddingProvider["embed"]
+): EmbeddingProvider {
+  const endpointHash = createEmbeddingEndpointHash(config.embeddings.baseUrl);
+  return {
+    endpointHash,
+    providerKey: createProviderKey(endpointHash, config.embeddings.model),
+    isRemote: false,
+    embed
+  };
+}

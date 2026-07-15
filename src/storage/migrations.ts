@@ -123,17 +123,9 @@ const BASE_SCHEMA = `
     check (from_memory_id <> to_memory_id),
     unique (from_memory_id, to_memory_id, relation_type)
   );
-  create index if not exists idx_memories_lifecycle_status on memories(lifecycle_status);
-  create index if not exists idx_memories_subject_key on memories(subject_key);
   create index if not exists idx_memory_relations_from on memory_relations(from_memory_id, relation_type);
   create index if not exists idx_memory_relations_to on memory_relations(to_memory_id, relation_type);
   create index if not exists idx_memory_relations_type on memory_relations(relation_type, from_memory_id, to_memory_id);
-  create trigger if not exists validate_memories_lifecycle_status_insert
-  before insert on memories when new.lifecycle_status not in ('current', 'superseded', 'retracted')
-  begin select raise(abort, 'invalid memory lifecycle status'); end;
-  create trigger if not exists validate_memories_lifecycle_status_update
-  before update of lifecycle_status on memories when new.lifecycle_status not in ('current', 'superseded', 'retracted')
-  begin select raise(abort, 'invalid memory lifecycle status'); end;
 `;
 
 export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
@@ -221,6 +213,86 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
         before update of lifecycle_status on memories when new.lifecycle_status not in ('current', 'superseded', 'retracted')
         begin select raise(abort, 'invalid memory lifecycle status'); end;
       `);
+    }
+  },
+  {
+    version: 4,
+    name: "add embedding storage schema",
+    up(db) {
+      db.exec(`
+        create table if not exists embedding_jobs (
+          owner_kind text not null check (owner_kind in ('chunk', 'memory')),
+          owner_id text not null,
+          content_hash text not null,
+          provider_key text not null,
+          endpoint_hash text not null,
+          model text not null,
+          provider_fingerprint text,
+          state text not null check (state in ('pending', 'complete', 'failed')),
+          attempts integer not null default 0 check (attempts >= 0),
+          last_error text,
+          created_at text not null,
+          updated_at text not null,
+          completed_at text,
+          check (
+            (state = 'complete' and provider_fingerprint is not null and completed_at is not null)
+            or (state <> 'complete' and provider_fingerprint is null and completed_at is null)
+          ),
+          unique (owner_kind, owner_id, content_hash, provider_key)
+        );
+        create table if not exists embedding_vectors (
+          owner_kind text not null check (owner_kind in ('chunk', 'memory')),
+          owner_id text not null,
+          content_hash text not null,
+          provider_key text not null,
+          endpoint_hash text not null,
+          model text not null,
+          provider_fingerprint text not null,
+          dimension integer not null check (dimension > 0),
+          vector_blob blob not null,
+          created_at text not null,
+          updated_at text not null,
+          unique (owner_kind, owner_id, content_hash, provider_fingerprint)
+        );
+        create index if not exists idx_embedding_jobs_owner
+          on embedding_jobs(owner_kind, owner_id);
+        create index if not exists idx_embedding_jobs_provider_state
+          on embedding_jobs(provider_key, state, updated_at);
+        create index if not exists idx_embedding_vectors_owner
+          on embedding_vectors(owner_kind, owner_id);
+        create index if not exists idx_embedding_vectors_provider
+          on embedding_vectors(provider_fingerprint, owner_kind, owner_id);
+      `);
+    }
+  },
+  {
+    version: 5,
+    name: "add embedding owner generations",
+    up(db) {
+      ensureColumn(db, "embedding_jobs", "owner_version", "text not null default ''");
+      ensureColumn(db, "embedding_vectors", "owner_version", "text not null default ''");
+    }
+  },
+  {
+    version: 6,
+    name: "add collision-proof memory lifecycle generations",
+    up(db) {
+      ensureColumn(db, "memories", "lifecycle_generation", "text not null default ''");
+      const memories = db.prepare(
+        "select id from memories where lifecycle_generation = ''"
+      ).all() as Array<{ id: string }>;
+      const updateGeneration = db.prepare(
+        "update memories set lifecycle_generation = ? where id = ? and lifecycle_generation = ''"
+      );
+      for (const memory of memories) updateGeneration.run(randomUUID(), memory.id);
+    }
+  },
+  {
+    version: 7,
+    name: "add embedding index rebuild generations",
+    up(db) {
+      ensureColumn(db, "embedding_jobs", "index_generation", "text not null default ''");
+      ensureColumn(db, "embedding_jobs", "target_fingerprint", "text");
     }
   }
 ] as const;
