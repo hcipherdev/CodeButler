@@ -12,6 +12,8 @@ It indexes evidence from Git commits, Codex sessions, Claude sessions, manual de
 
 Project memory stays local by default in each repository's `.code-butler/` directory.
 
+Search is local SQLite FTS by default. Projects may opt into hybrid lexical/semantic ranking through an explicitly configured OpenAI-compatible embedding endpoint; FTS remains the exact fallback and remote use requires explicit privacy permission with mandatory redaction.
+
 ## What Code Butler Adds
 
 Git explains what changed. Chat logs explain pieces of why. Agent instruction files explain what future agents should do. Code Butler connects those sources into a searchable project memory layer.
@@ -30,4 +32,5 @@ Code Butler uses three layers:
 
 - [Quick Start](./quickstart.md)
 - [MCP Setup](./mcp-setup.md)
+- [Architecture and retrieval](./architecture.html)
 - [Public Sync](./public-sync.md)

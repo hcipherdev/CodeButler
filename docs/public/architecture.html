@@ -584,7 +584,7 @@
           <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Import new evidence</div>
           <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Chunk source text</div>
           <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Store commits + diffs</div>
-          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>FTS-index content</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>FTS-index content; queue optional embeddings after commit</div>
           <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Advance sync cursor</div>
         </div>
       </div>
@@ -881,7 +881,9 @@
             </summary>
             <div class="layer-body">
               <div class="layer-item"><div class="dot" style="background:var(--green)"></div>SQLite at .code-butler/memory.sqlite</div>
-              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>FTS for sources, chunks, and temporary memories</div>
+              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Offline FTS default for sources, chunks, and temporary memories</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Optional Float32 vectors for chunks + current promoted memories</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Pending / complete / failed retry queue isolated by provider fingerprint</div>
               <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Candidate + promoted durable memories</div>
               <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Quality metadata (status, reasons, verified_at)</div>
             </div>
@@ -940,7 +942,7 @@
               <div class="layer-toggle">▼</div>
             </summary>
             <div class="layer-body">
-              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Health checks: storage, sync, sources, config</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Health checks: storage, sync, sources, config, embedding coverage</div>
               <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Prioritized next-actions with commands</div>
               <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>CLI: code-butler doctor [--json] [--strict]</div>
               <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>MCP: run_doctor tool</div>
@@ -961,7 +963,7 @@
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">search_project_memory</div>
-            <div class="mcp-tool-desc">Search promoted memories + raw sources</div>
+            <div class="mcp-tool-desc">FTS search with optional hybrid rank metadata</div>
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">read_memory_source</div>
@@ -969,7 +971,7 @@
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">find_memories</div>
-            <div class="mcp-tool-desc">Find promoted or candidate durable memories</div>
+            <div class="mcp-tool-desc">Find memories; optional hybrid ranking for promoted results</div>
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">remember_project_memory</div>
@@ -1339,7 +1341,7 @@
     <div class="file-map">
       <div class="file-row">
         <div class="file-path">src/cli.ts</div>
-        <div class="file-desc">CLI commands — init, config, ingest, decision, memory, doctor, sync, sources, watch, project-summary, hooks, mcp, serve</div>
+        <div class="file-desc">CLI commands — init, config, ingest, decision, memory, embeddings, doctor, sync, sources, watch, project-summary, hooks, mcp, serve</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/server.ts</div>
@@ -1355,7 +1357,7 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/types.ts</div>
-        <div class="file-desc">All shared TypeScript types including RLM, temporary memory, providers</div>
+        <div class="file-desc">Shared TypeScript types including retrieval, embeddings, RLM, temporary memory, and providers</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/json.ts</div>
@@ -1371,11 +1373,11 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/storage/store.ts</div>
-        <div class="file-desc">SQLite schema, persistence, FTS search, temporary memory, quality metadata, relations</div>
+        <div class="file-desc">SQLite schema, persistence, FTS/vector storage, embedding queue, temporary memory, quality metadata, relations</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/doctor/service.ts</div>
-        <div class="file-desc">Health checks — storage, sync, sources, config; prioritized next-actions</div>
+        <div class="file-desc">Health checks — storage, sync, sources, config, embedding coverage/fingerprints; prioritized next-actions</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/evidence/citations.ts</div>
@@ -1460,6 +1462,14 @@
       <div class="file-row">
         <div class="file-path">src/search/fts.ts</div>
         <div class="file-desc">Full-text search helpers over SQLite FTS tables</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/search/hybrid.ts · src/search/service.ts</div>
+        <div class="file-desc">Pure cosine + reciprocal-rank fusion and exact FTS-fallback orchestration</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/embeddings/provider.ts · src/embeddings/service.ts</div>
+        <div class="file-desc">OpenAI-compatible embedding provider, mandatory remote redaction, retryable builds, provider fingerprint isolation</div>
       </div>
     </div>
   </section>
@@ -1554,6 +1564,23 @@
           <div class="config-row"><span class="config-key">agent hints</span><span class="config-val">AGENTS.md, CLAUDE.md (explicit init)</span></div>
           <div class="config-row"><span class="config-key">init flow</span><span class="config-val">summary → bootstrap → watch install</span></div>
           <div class="config-row"><span class="config-key">fallback</span><span class="config-val">provider: "fallback" when no API key</span></div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-head">🧭 Retrieval & Embeddings</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">retrieval.mode</span><span class="config-val">fts (default) | hybrid</span></div>
+          <div class="config-row"><span class="config-key">retrieval.rrfK</span><span class="config-val">60</span></div>
+          <div class="config-row"><span class="config-key">embeddings.enabled</span><span class="config-val config-bool-off">false</span></div>
+          <div class="config-row"><span class="config-key">embeddings.provider</span><span class="config-val">openai-compatible</span></div>
+          <div class="config-row"><span class="config-key">embeddings.baseUrl</span><span class="config-val">127.0.0.1:11434/v1</span></div>
+          <div class="config-row"><span class="config-key">embeddings.model</span><span class="config-val">nomic-embed-text</span></div>
+          <div class="config-row"><span class="config-key">privacy.allowRemoteEmbeddings</span><span class="config-val config-bool-off">false</span></div>
+          <div class="config-row"><span class="config-key">remote behavior</span><span class="config-val">explicit opt-in + mandatory redaction</span></div>
+          <div class="config-row"><span class="config-key">fallback</span><span class="config-val config-bool-on">exact offline FTS; no network fallback</span></div>
+          <div class="config-row"><span class="config-key">operations</span><span class="config-val">embeddings build / status</span></div>
+          <div class="config-row"><span class="config-key">offline evaluation</span><span class="config-val">npm run eval:retrieval</span></div>
         </div>
       </div>
 

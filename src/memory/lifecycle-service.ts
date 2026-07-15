@@ -1,5 +1,5 @@
 import type { MemoryStore } from "../storage/store.js";
-import { withTransaction } from "../storage/transactions.js";
+import { afterCommit, withTransaction } from "../storage/transactions.js";
 import type { DurableMemory, MemoryLifecycleStatus } from "../types.js";
 
 export interface UpdateMemoryStatusInput {
@@ -65,6 +65,7 @@ export function updateMemoryStatus(
         createdAt: input.now,
         reason: input.reason
       });
+      scheduleEmbeddingCleanup(store, input.memoryId);
       return updated;
     }
 
@@ -77,12 +78,29 @@ export function updateMemoryStatus(
       }
     }
 
-    return store.updateMemoryLifecycle(input.memoryId, {
+    const updated = store.updateMemoryLifecycle(input.memoryId, {
       lifecycleStatus: input.status,
       validUntil: input.status === "current" ? null : input.now,
       statusReason: input.reason,
       statusChangedAt: input.now
     });
+    scheduleEmbeddingCleanup(store, input.memoryId);
+    return updated;
+  });
+}
+
+function scheduleEmbeddingCleanup(store: MemoryStore, memoryId: string): void {
+  afterCommit(store.db, () => {
+    try {
+      store.deleteStaleEmbeddingJobsForMemory(memoryId);
+    } catch {
+      // Job and vector cleanup are independent best-effort maintenance.
+    }
+    try {
+      store.deleteStaleEmbeddingVectorsForMemory(memoryId);
+    } catch {
+      // Job and vector cleanup are independent best-effort maintenance.
+    }
   });
 }
 

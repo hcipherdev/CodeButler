@@ -2,6 +2,12 @@ import { createAnthropicAwsExtractor } from "../extract/anthropic-aws.js";
 import { createOpenAICompatibleExtractor } from "../extract/openai.js";
 import { extractDeterministicMemories } from "../deterministic/triggers.js";
 import { extractTemporaryMemories } from "../deterministic/temporary.js";
+import { buildEmbeddings } from "../embeddings/service.js";
+import type {
+  EmbeddingBuildResult,
+  EmbeddingServiceOptions
+} from "../embeddings/service.js";
+import { createEmbeddingEndpointHash, createProviderKey } from "../embeddings/fingerprint.js";
 import { assessMemoryQuality } from "../memory/quality.js";
 import type { MemoryStore } from "../storage/store.js";
 import { syncClaudeSource, syncCodexSource } from "../sources/codex.js";
@@ -9,6 +15,7 @@ import { syncGitSource } from "../sources/git.js";
 import type {
   CommitRecord,
   ExtractedMemory,
+  EmbeddingProvider,
   ExtractorConversationInput,
   ExtractorProvider,
   ProjectConfig,
@@ -41,15 +48,23 @@ export interface SyncRunResult {
   sources: Record<SyncSourceName, SyncSourceResult>;
   memories: SyncMemoryResult;
   temporary: SyncTemporaryMemoryResult;
+  embeddings?: EmbeddingBuildResult | undefined;
+}
+
+export type SyncEmbeddingBuilder = typeof buildEmbeddings;
+
+export interface SyncProjectMemoryOptions {
+  source?: SyncSourceName | "all";
+  extractorProvider?: ExtractorProvider;
+  embeddingProvider?: EmbeddingProvider | undefined;
+  embeddingProviderFactory?: EmbeddingServiceOptions["providerFactory"];
+  embeddingBuilder?: SyncEmbeddingBuilder | undefined;
 }
 
 export async function syncProjectMemory(
   store: MemoryStore,
   config: ProjectConfig,
-  options: {
-    source?: SyncSourceName | "all";
-    extractorProvider?: ExtractorProvider;
-  } = {}
+  options: SyncProjectMemoryOptions = {}
 ): Promise<SyncRunResult> {
   const startedAt = new Date().toISOString();
   const selectedSources = options.source && options.source !== "all" ? [options.source] : SOURCE_NAMES;
@@ -181,8 +196,7 @@ export async function syncProjectMemory(
             skipped: true,
             reason: "Extractor not configured"
           };
-    result.completedAt = new Date().toISOString();
-    return result;
+    return finishSync(store, config, result, options);
   }
 
   if (importedConversations.length === 0 && importedCommits.length === 0) {
@@ -193,8 +207,7 @@ export async function syncProjectMemory(
       skipped: true,
       reason: "No new evidence"
     };
-    result.completedAt = new Date().toISOString();
-    return result;
+    return finishSync(store, config, result, options);
   }
 
   try {
@@ -228,8 +241,87 @@ export async function syncProjectMemory(
           };
   }
 
+  return finishSync(store, config, result, options);
+}
+
+async function finishSync(
+  store: MemoryStore,
+  config: ProjectConfig,
+  result: SyncRunResult,
+  options: SyncProjectMemoryOptions
+): Promise<SyncRunResult> {
+  const builder = options.embeddingBuilder ?? buildEmbeddings;
+  const embeddingOptions: EmbeddingServiceOptions = {};
+  if (options.embeddingProvider !== undefined) embeddingOptions.provider = options.embeddingProvider;
+  if (options.embeddingProviderFactory !== undefined) {
+    embeddingOptions.providerFactory = options.embeddingProviderFactory;
+  }
+  try {
+    result.embeddings = await builder(store, config, embeddingOptions);
+  } catch (error) {
+    result.embeddings = embeddingFailureStatus(store, config, error);
+  }
   result.completedAt = new Date().toISOString();
   return result;
+}
+
+function embeddingFailureStatus(
+  store: MemoryStore,
+  config: ProjectConfig,
+  error: unknown
+): EmbeddingBuildResult {
+  const warning = sanitizeSyncEmbeddingError(error);
+  if (!config.embeddings.enabled) {
+    return {
+      enabled: false,
+      eligible: store.listEmbeddingOwners().length,
+      activeCoverage: 0,
+      pending: 0,
+      complete: 0,
+      failed: 0,
+      attempts: 0,
+      warnings: [warning],
+      usable: false,
+      built: 0,
+      retried: 0,
+      enqueued: 0,
+      removedJobs: 0,
+      removedVectors: 0
+    };
+  }
+  let jobs: ReturnType<MemoryStore["listEmbeddingJobs"]> = [];
+  let providerKey: string | undefined;
+  try {
+    const endpointHash = createEmbeddingEndpointHash(config.embeddings.baseUrl);
+    providerKey = createProviderKey(endpointHash, config.embeddings.model);
+    jobs = store.listEmbeddingJobs({ providerKey });
+  } catch {
+    // Invalid provider configuration is represented by the sanitized warning.
+  }
+  return {
+    enabled: true,
+    eligible: store.listEmbeddingOwners().length,
+    activeCoverage: providerKey === undefined
+      ? 0
+      : new Set(store.listActiveEmbeddingVectors({ providerKey }).map((vector) => `${vector.ownerKind}\0${vector.ownerId}`)).size,
+    pending: jobs.filter((job) => job.state === "pending").length,
+    complete: jobs.filter((job) => job.state === "complete").length,
+    failed: jobs.filter((job) => job.state === "failed").length,
+    attempts: jobs.reduce((sum, job) => sum + job.attempts, 0),
+    warnings: [warning],
+    usable: false,
+    ...(providerKey === undefined ? {} : { providerKey }),
+    model: config.embeddings.model,
+    built: 0,
+    retried: 0,
+    enqueued: 0,
+    removedJobs: 0,
+    removedVectors: 0
+  };
+}
+
+function sanitizeSyncEmbeddingError(_error: unknown): string {
+  return "Embedding build failed";
 }
 
 const SOURCE_NAMES: SyncSourceName[] = ["git", "codex", "claude"];
