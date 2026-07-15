@@ -10,6 +10,7 @@ import { explainCodeChange, investigateProjectHistory } from "../investigate/his
 import { updateMemoryStatus } from "../memory/lifecycle-service.js";
 import { summarizeMemoryHealth } from "../memory/quality.js";
 import { rememberProjectMemory } from "../memory/remember.js";
+import { findProjectMemories, searchProjectMemory, type SearchServiceOptions } from "../search/service.js";
 import {
   readProjectBrief,
   refreshProjectSummary,
@@ -125,10 +126,10 @@ export interface ProjectMemoryToolHandlers {
     query: string;
     sourceTypes?: SourceType[];
     limit?: number;
-  }): {
+  }): Promise<{
     memories: ReturnType<MemoryStore["searchMemoryLayer"]>;
     results: ReturnType<MemoryStore["search"]>;
-  };
+  }>;
   read_memory_source(input: { sourceId: string }): ReturnType<MemoryStore["readSource"]>;
   find_memories(input: {
     query?: string;
@@ -137,9 +138,9 @@ export interface ProjectMemoryToolHandlers {
     qualityStatus?: MemoryQualityStatus | "all";
     lifecycleStatus?: MemoryLifecycleStatus | "all";
     limit?: number;
-  }): {
+  }): Promise<{
     results: ReturnType<MemoryStore["searchMemoryLayer"]>;
-  };
+  }>;
   remember_project_memory(input: {
     type: MemoryType;
     text: string;
@@ -225,6 +226,7 @@ export function createProjectMemoryToolHandlers(
     now?: () => Date;
     warn?: (line: string) => void;
     startupMetadata?: ProjectStartupMetadata | undefined;
+    searchService?: SearchServiceOptions | undefined;
   } = {}
 ): ProjectMemoryToolHandlers {
   const rootDir = options.rootDir ?? store.paths.rootDir;
@@ -241,18 +243,19 @@ export function createProjectMemoryToolHandlers(
         databaseCreated: startupMetadata.databaseCreated
       };
     },
-    search_project_memory(input) {
+    async search_project_memory(input) {
+      const result = await searchProjectMemory(store, config, normalizeSearchInput(input), options.searchService);
       return {
-        memories: store.searchMemoryLayer(normalizeMemorySearchInput({ query: input.query, limit: input.limit })),
-        results: store.search(normalizeSearchInput(input)).map((result) => decorateSearchResult(store, result))
+        memories: result.memories,
+        results: result.results.map((item) => decorateSearchResult(store, item))
       };
     },
     read_memory_source(input) {
       return store.readSource(input.sourceId);
     },
-    find_memories(input) {
+    async find_memories(input) {
       return {
-        results: store.searchMemoryLayer(normalizeMemorySearchInput(input))
+        results: await findProjectMemories(store, config, normalizeMemorySearchInput(input), options.searchService)
       };
     },
     remember_project_memory(input) {
@@ -385,7 +388,7 @@ export function registerProjectMemoryTools(
         limit: z.number().int().positive().max(100).optional()
       }
     },
-    async (input) => asJsonContent(handlers.search_project_memory(normalizeSearchInput(input)))
+    async (input) => asJsonContent(await handlers.search_project_memory(normalizeSearchInput(input)))
   );
 
   server.registerTool(
@@ -412,7 +415,7 @@ export function registerProjectMemoryTools(
         limit: z.number().int().positive().max(100).optional()
       }
     },
-    async (input) => asJsonContent(handlers.find_memories(normalizeMemorySearchInput(input)))
+    async (input) => asJsonContent(await handlers.find_memories(normalizeMemorySearchInput(input)))
   );
 
   server.registerTool(

@@ -65,6 +65,51 @@ describe("ordered storage migrations", () => {
     store.close();
   });
 
+  it("upgrades a populated pre-ledger database before creating lifecycle indexes", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const dataDir = join(rootDir, ".code-butler");
+    const databasePath = join(dataDir, "memory.sqlite");
+    mkdirSync(dataDir, { recursive: true });
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      create table memories (
+        id text primary key, type text not null, title text not null, summary text not null,
+        reason text not null, confidence real not null, evidence_json text not null,
+        related_files_json text not null, dedupe_key text not null, evidence_signature text not null,
+        source text not null, created_at text not null, promoted_at text not null,
+        quality_status text not null default 'active', quality_reasons_json text not null default '[]',
+        last_verified_at text
+      );
+      create table memory_candidates (
+        id text primary key, type text not null, title text not null, summary text not null,
+        reason text not null, confidence real not null, evidence_json text not null,
+        related_files_json text not null, dedupe_key text not null unique,
+        promotion_state text not null, evidence_signature text not null,
+        quality_status text not null default 'active', quality_reasons_json text not null default '[]',
+        last_verified_at text, created_at text not null, updated_at text not null
+      );
+      insert into memories values
+        ('legacy-memory', 'decision', 'Legacy memory', 'Keep this row.', 'Migration coverage.', 1,
+         '[]', '[]', 'legacy-memory', 'legacy-signature', 'manual',
+         '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'active', '[]', null);
+    `);
+    legacy.close();
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+
+    expect(store.readMemory("legacy-memory")).toMatchObject({
+      lifecycleStatus: "current",
+      subjectKey: "decision:legacy-memory"
+    });
+    expect(
+      store.db.prepare("select name from sqlite_master where type = 'index' and name = 'idx_memories_lifecycle_status'").get()
+    ).toEqual({ name: "idx_memories_lifecycle_status" });
+    expect(readdirSync(dataDir).filter((name) => name.startsWith("memory.sqlite.backup-") )).toHaveLength(1);
+    store.close();
+  });
+
   it("upgrades v2 lifecycle data additively and backfills unambiguous promotion pointers", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -165,6 +210,142 @@ describe("ordered storage migrations", () => {
     expect(store.db.prepare("select count(*) as count from memories").get()).toEqual({ count: 4 });
     expect(store.db.prepare("select count(*) as count from memory_relations").get()).toEqual({ count: 0 });
     store.close();
+  });
+
+  it("adds constrained embedding tables and upgrades v3 data without changing logical counts", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const legacyStore = openMemoryStore(rootDir);
+    initializeSchema(legacyStore.db, legacyStore.paths.databasePath, {
+      migrations: SCHEMA_MIGRATIONS.slice(0, 3)
+    });
+    legacyStore.addSourceWithChunks({
+      source: {
+        id: "legacy-source",
+        type: "conversation",
+        title: "Legacy source",
+        origin: "fixture",
+        rawContent: "Legacy content"
+      },
+      chunks: [{ text: "Legacy content" }]
+    });
+    legacyStore.upsertMemoryCandidate({
+      type: "decision",
+      title: "Legacy memory",
+      summary: "Keep this memory.",
+      reason: "Migration coverage.",
+      confidence: 1,
+      evidence: [{ sourceType: "conversation", sourceId: "legacy-source" }],
+      relatedFiles: [],
+      dedupeKey: "legacy-memory"
+    });
+    legacyStore.db.prepare(
+      `insert into memories
+         (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          dedupe_key, evidence_signature, source, quality_status, quality_reasons_json,
+          last_verified_at, subject_key, lifecycle_status, valid_from, valid_until,
+          status_reason, status_changed_at, created_at, promoted_at)
+       values (?, 'decision', 'Legacy memory', 'Keep this memory.', 'Migration coverage.', 1,
+               '[]', '[]', 'legacy-memory', 'legacy-signature', 'manual', 'active', '[]', null,
+               'decision:legacy-memory', 'current', ?, null, null, ?, ?, ?)`
+    ).run(
+      "legacy-memory",
+      "2026-07-01T00:00:00.000Z",
+      "2026-07-01T00:00:00.000Z",
+      "2026-07-01T00:00:00.000Z",
+      "2026-07-01T00:00:00.000Z"
+    );
+    const before = {
+      sources: legacyStore.db.prepare("select count(*) as count from sources").get(),
+      chunks: legacyStore.db.prepare("select count(*) as count from chunks").get(),
+      memories: legacyStore.db.prepare("select count(*) as count from memories").get()
+    };
+    legacyStore.close();
+
+    const store = openMemoryStore(rootDir);
+    store.init();
+
+    expect(CURRENT_SCHEMA_VERSION).toBe(7);
+    expect(store.db.prepare("select count(*) as count from sources").get()).toEqual(before.sources);
+    expect(store.db.prepare("select count(*) as count from chunks").get()).toEqual(before.chunks);
+    expect(store.db.prepare("select count(*) as count from memories").get()).toEqual(before.memories);
+    const lifecycleGeneration = store.listMemories({
+      lifecycleStatus: "all",
+      qualityStatus: "all"
+    })[0]!.lifecycleGeneration;
+    expect(lifecycleGeneration).toMatch(/^[a-f0-9-]{36}$/);
+    expect(
+      store.db.prepare(
+        "select name from sqlite_master where type = 'table' and name in ('embedding_jobs', 'embedding_vectors') order by name"
+      ).all()
+    ).toEqual([{ name: "embedding_jobs" }, { name: "embedding_vectors" }]);
+    expect(store.db.prepare("pragma table_info(embedding_jobs)").all()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "index_generation", notnull: 1, dflt_value: "''" }),
+      expect.objectContaining({ name: "target_fingerprint", notnull: 0 })
+    ]));
+    expect(
+      store.db.prepare("select name from sqlite_master where type = 'index' and name like 'idx_embedding_%' order by name").all()
+    ).toEqual(expect.arrayContaining([
+      { name: "idx_embedding_jobs_owner" },
+      { name: "idx_embedding_jobs_provider_state" },
+      { name: "idx_embedding_vectors_owner" },
+      { name: "idx_embedding_vectors_provider" }
+    ]));
+    expect(() =>
+      store.db.prepare(
+        `insert into embedding_jobs
+           (owner_kind, owner_id, content_hash, provider_key, endpoint_hash, model, state,
+            attempts, created_at, updated_at)
+         values ('candidate', 'bad', 'hash', 'key', 'endpoint', 'model', 'pending', 0, 'now', 'now')`
+      ).run()
+    ).toThrow();
+    expect(() =>
+      store.db.prepare(
+        `insert into embedding_jobs
+           (owner_kind, owner_id, content_hash, provider_key, endpoint_hash, model, state,
+            attempts, created_at, updated_at)
+         values ('chunk', 'bad', 'hash', 'key', 'endpoint', 'model', 'running', 0, 'now', 'now')`
+      ).run()
+    ).toThrow();
+    store.close();
+
+    const reopened = openMemoryStore(rootDir);
+    reopened.init();
+    expect(reopened.readMemory("legacy-memory")?.lifecycleGeneration).toBe(lifecycleGeneration);
+    reopened.close();
+  });
+
+  it("upgrades existing v4 embedding rows with a stable empty owner generation", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    initializeSchema(store.db, store.paths.databasePath, {
+      migrations: SCHEMA_MIGRATIONS.slice(0, 4)
+    });
+    store.db.exec(`
+      insert into embedding_jobs
+        (owner_kind, owner_id, content_hash, provider_key, endpoint_hash, model, state,
+         attempts, created_at, updated_at)
+      values ('chunk', 'legacy-chunk', 'content', 'provider', 'endpoint', 'model',
+              'pending', 0, '2026-07-01', '2026-07-01');
+      insert into embedding_vectors
+        (owner_kind, owner_id, content_hash, provider_key, endpoint_hash, model,
+         provider_fingerprint, dimension, vector_blob, created_at, updated_at)
+      values ('chunk', 'legacy-chunk', 'content', 'provider', 'endpoint', 'model',
+              'fingerprint', 1, x'0000803f', '2026-07-01', '2026-07-01');
+    `);
+    store.close();
+
+    const upgraded = openMemoryStore(rootDir);
+    upgraded.init();
+
+    expect(upgraded.db.prepare(
+      "select owner_version as ownerVersion from embedding_jobs where owner_id = 'legacy-chunk'"
+    ).get()).toEqual({ ownerVersion: "" });
+    expect(upgraded.db.prepare(
+      "select owner_version as ownerVersion from embedding_vectors where owner_id = 'legacy-chunk'"
+    ).get()).toEqual({ ownerVersion: "" });
+    upgraded.close();
   });
 
   it("rolls back a failed migration while retaining its pre-migration backup", () => {

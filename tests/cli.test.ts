@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isCliEntrypoint, runCli } from "../src/cli.js";
 import { loadProjectConfig } from "../src/config.js";
+import { createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey } from "../src/embeddings/fingerprint.js";
 import type { ProjectSummaryGenerator } from "../src/project-summary/service.js";
+import type { EmbeddingProvider } from "../src/types.js";
 import { openMemoryStore } from "../src/storage/store.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
@@ -920,6 +922,98 @@ describe("CLI", () => {
 
     expect(output.join("\n")).toContain("Overall: warning");
     expect(output.join("\n")).toContain("[warn]");
+  });
+
+  it("prints stable embedding status in human and JSON formats", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeDoctorConfig(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+    const human: string[] = [];
+    const json: string[] = [];
+
+    await expect(runCli(["embeddings", "status"], { cwd: rootDir, stdout: (line) => human.push(line) })).resolves.toBe(0);
+    await expect(runCli(["embeddings", "status", "--json"], { cwd: rootDir, stdout: (line) => json.push(line) })).resolves.toBe(0);
+
+    expect(human.join("\n")).toContain("Embedding Status");
+    expect(human.join("\n")).toContain("provider=openai-compatible model=nomic-embed-text enabled=false");
+    expect(human.join("\n")).toContain("eligible=0 coverage=0/0 pending=0 complete=0 failed=0 attempts=0");
+    expect(JSON.parse(json.join("\n"))).toEqual(expect.objectContaining({ provider: "openai-compatible", model: "nomic-embed-text", enabled: false, eligible: 0, activeCoverage: 0, pending: 0, complete: 0, failed: 0 }));
+  });
+
+  it("rejects an explicit embedding build when embeddings are disabled", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeDoctorConfig(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+    const output: string[] = [];
+
+    await expect(runCli(["embeddings", "build", "--json"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(1);
+    expect(JSON.parse(output.join("\n"))).toEqual(expect.objectContaining({ enabled: false, usable: false, activeCoverage: 0, built: 0, warnings: ["Embeddings are disabled"] }));
+  });
+
+  it("exits nonzero when an explicit remote embedding build is privacy-blocked", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeDoctorConfig(rootDir);
+    const path = join(rootDir, ".code-butler", "config.json");
+    const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    config.retrieval = { mode: "hybrid", rrfK: 60 };
+    config.embeddings = { enabled: true, provider: "openai-compatible", baseUrl: "https://embedding.example/v1", model: "embed-test", batchSize: 16 };
+    config.privacy = { allowRemoteEmbeddings: false };
+    writeFileSync(path, JSON.stringify(config));
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+    const output: string[] = [];
+
+    await expect(runCli(["embeddings", "build", "--json"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(1);
+    expect(JSON.parse(output.join("\n")).warnings).toEqual(["Remote embeddings require privacy.allowRemoteEmbeddings=true"]);
+  });
+
+  it("uses structured build usability for repaired indexes and retryable provider failures", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeDoctorConfig(rootDir);
+    const path = join(rootDir, ".code-butler", "config.json");
+    const config = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    config.embeddings = { enabled: true, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "embed-test", batchSize: 16 };
+    writeFileSync(path, JSON.stringify(config));
+    const endpointHash = createEmbeddingEndpointHash("http://127.0.0.1:11434/v1");
+    const provider: EmbeddingProvider = {
+      endpointHash,
+      providerKey: createProviderKey(endpointHash, "embed-test"),
+      isRemote: false,
+      async embed() { throw new Error("retryable provider failure"); }
+    };
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({ source: { id: "mixed", type: "conversation", title: "mixed", origin: "test", rawContent: "one two" }, chunks: [{ text: "one" }, { text: "two" }] });
+    for (const [index, owner] of store.listEmbeddingOwners().entries()) {
+      const dimension = index + 2;
+      store.upsertEmbeddingVector({ ...owner, providerKey: provider.providerKey, endpointHash, model: "embed-test", providerFingerprint: createProviderFingerprint(endpointHash, "embed-test", dimension), dimension, vectorBlob: new Uint8Array(dimension * 4) });
+    }
+    store.close();
+    const mixedOutput: string[] = [];
+
+    await expect(runCli(["embeddings", "build", "--json"], { cwd: rootDir, stdout: (line) => mixedOutput.push(line), embeddingServiceOptions: { provider } })).resolves.toBe(0);
+    expect(JSON.parse(mixedOutput.join("\n"))).toMatchObject({ usable: true, failed: 2, activeCoverage: 0 });
+
+    const cleanRoot = makeTempDir();
+    tempDirs.push(cleanRoot);
+    mkdirSync(join(cleanRoot, ".code-butler"), { recursive: true });
+    writeFileSync(join(cleanRoot, ".code-butler", "config.json"), JSON.stringify(config));
+    const cleanStore = openMemoryStore(cleanRoot);
+    cleanStore.init();
+    cleanStore.addSourceWithChunks({ source: { id: "retry", type: "conversation", title: "retry", origin: "test", rawContent: "retry" }, chunks: [{ text: "retry" }] });
+    cleanStore.close();
+    const retryOutput: string[] = [];
+    await expect(runCli(["embeddings", "build", "--json"], { cwd: cleanRoot, stdout: (line) => retryOutput.push(line), embeddingServiceOptions: { provider } })).resolves.toBe(0);
+    expect(JSON.parse(retryOutput.join("\n"))).toMatchObject({ usable: true, failed: 1, activeCoverage: 0 });
   });
 
   it("rejects unknown doctor flags", async () => {

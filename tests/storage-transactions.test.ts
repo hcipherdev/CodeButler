@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { addDecision } from "../src/decisions/store.js";
 import { openMemoryStore } from "../src/storage/store.js";
-import { withTransaction } from "../src/storage/transactions.js";
+import { afterCommit, withTransaction } from "../src/storage/transactions.js";
 import type { ExtractedMemory, TemporaryMemoryUpsertInput } from "../src/types.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
@@ -47,6 +47,65 @@ describe("atomic storage writes", () => {
       { value: "outer-before" },
       { value: "outer-after" }
     ]);
+    store.close();
+  });
+
+  it("runs nested after-commit callbacks once in registration order after the outer commit", () => {
+    const store = createStore();
+    const observed: Array<{ label: string; inTransaction: boolean }> = [];
+
+    withTransaction(store.db, () => {
+      afterCommit(store.db, () => observed.push({ label: "outer-before", inTransaction: store.db.isTransaction }));
+      withTransaction(store.db, () => {
+        afterCommit(store.db, () => observed.push({ label: "inner", inTransaction: store.db.isTransaction }));
+      });
+      afterCommit(store.db, () => observed.push({ label: "outer-after", inTransaction: store.db.isTransaction }));
+      expect(observed).toEqual([]);
+    });
+
+    expect(observed).toEqual([
+      { label: "outer-before", inTransaction: false },
+      { label: "inner", inTransaction: false },
+      { label: "outer-after", inTransaction: false }
+    ]);
+    store.close();
+  });
+
+  it("discards rolled-back callbacks and isolates callback failures after commit", () => {
+    const store = createStore();
+    const observed: string[] = [];
+
+    withTransaction(store.db, () => {
+      afterCommit(store.db, () => {
+        observed.push("throws");
+        throw new Error("isolated callback failure");
+      });
+      expect(() => withTransaction(store.db, () => {
+        afterCommit(store.db, () => observed.push("rolled-back-inner"));
+        throw new Error("inner rollback");
+      })).toThrow("inner rollback");
+      afterCommit(store.db, () => observed.push("continues"));
+    });
+
+    expect(observed).toEqual(["throws", "continues"]);
+    expect(() => withTransaction(store.db, () => {
+      afterCommit(store.db, () => observed.push("rolled-back-outer"));
+      throw new Error("outer rollback");
+    })).toThrow("outer rollback");
+    expect(observed).toEqual(["throws", "continues"]);
+    store.close();
+  });
+
+  it("rejects after-commit scheduling from an untracked external transaction", () => {
+    const store = createStore();
+    store.db.exec("BEGIN");
+
+    expect(() => withTransaction(store.db, () => {
+      afterCommit(store.db, () => undefined);
+    })).toThrow("untracked external transaction");
+    expect(store.db.isTransaction).toBe(true);
+
+    store.db.exec("ROLLBACK");
     store.close();
   });
 
