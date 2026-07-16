@@ -12,12 +12,14 @@ export interface GitSyncResult {
 export function syncGitSource(store: MemoryStore, config: GitSourceConfig): GitSyncResult {
   const cursor = store.getSyncCursor("git", "last_commit")?.cursorValue;
   const hashes = listCommitHashes(config.repoPath, config.maxCommits, cursor);
-  const commits = hashes.map((hash) => readCommit(config.repoPath, hash, config.maxDiffChars));
+  const commits = hashes
+    .filter((hash) => !store.findSourceTombstone("commit", hash))
+    .map((hash) => readCommit(config.repoPath, hash, config.maxDiffChars));
   for (const commit of commits) {
     store.addCommit(commit);
   }
-  if (commits.length > 0) {
-    store.setSyncCursor("git", "last_commit", commits.at(-1)!.hash);
+  if (hashes.length > 0) {
+    store.setSyncCursor("git", "last_commit", hashes.at(-1)!);
   }
   return {
     imported: commits.length,

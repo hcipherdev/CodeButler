@@ -71,6 +71,10 @@
     border: 1px solid var(--border);
     border-radius: 20px;
     padding: 6px 16px;
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 2px 8px;
     font-size: 11px;
     color: var(--muted);
     letter-spacing: 0.08em;
@@ -484,6 +488,71 @@
   }
 
   /* ══════════════════════════════
+     V1.0 CAPABILITY MAPS
+  ══════════════════════════════ */
+  .capability-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+  }
+  .capability-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+  .capability-card:hover {
+    border-color: var(--capability-color, var(--accent));
+    transform: translateY(-2px);
+  }
+  .capability-title {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 12px;
+    color: var(--bright);
+    margin-bottom: 9px;
+  }
+  .capability-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    color: var(--text);
+    font-size: 11px;
+    margin-top: 6px;
+  }
+  .capability-item::before {
+    content: '·';
+    color: var(--capability-color, var(--accent));
+    font-weight: 700;
+  }
+  .flow-note {
+    margin-top: 12px;
+    padding: 12px 14px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--note-color, var(--accent));
+    border-radius: 0 6px 6px 0;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .release-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .release-pill {
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px 10px;
+    background: var(--bg2);
+    color: var(--muted);
+    font-size: 10px;
+  }
+  .release-pill b { color: var(--green); font-weight: 500; }
+
+  /* ══════════════════════════════
      GLOBAL LAUNCHER
   ══════════════════════════════ */
   .launcher-flow {
@@ -536,6 +605,26 @@
     .arch-grid { grid-template-columns: 1fr; }
     .config-grid { grid-template-columns: 1fr; }
   }
+  @media (max-width: 640px) {
+    header { align-items: flex-start; flex-direction: column; }
+    header > * { min-width: 0; }
+    header > div:first-child { width: 100%; }
+    header, main { padding-left: 18px; padding-right: 18px; }
+    main { padding-top: 32px; gap: 36px; }
+    .layer-body { grid-template-columns: 1fr; }
+    .badge {
+      align-self: stretch;
+      width: auto;
+      max-width: none;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      padding: 6px 8px;
+      font-size: 9px;
+      letter-spacing: 0.04em;
+      line-height: 1.5;
+      text-align: center;
+    }
+  }
 </style>
 </head>
 <body>
@@ -543,9 +632,12 @@
 <header>
   <div>
     <div class="logo">code<span>butler</span></div>
-    <div class="subtitle">Local-First Project Memory System — Architecture Overview</div>
+    <div class="subtitle">Local-First Professional Project Memory — v1.0 Architecture</div>
   </div>
-  <div class="badge">SQLite · MCP · TypeScript · <b>9 layers</b> · <b>20 tools</b></div>
+  <div class="badge">
+    <span>SQLite/FTS5 · MCP · Node 24</span>
+    <span><b>10 layers</b> · <b>21 tools</b></span>
+  </div>
 </header>
 
 <main>
@@ -578,14 +670,14 @@
       <div class="pipe-stage">
         <div class="stage-header">
           <div class="stage-num" style="background:rgba(61,219,161,.12);color:var(--green)">2</div>
-          <div class="stage-title">Raw Ingest</div>
+          <div class="stage-title">Safe Ingest</div>
         </div>
         <div class="stage-body">
-          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Import new evidence</div>
-          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Chunk source text</div>
-          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Store commits + diffs</div>
-          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>FTS-index content; queue optional embeddings after commit</div>
-          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Advance sync cursor</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Redact secrets before storage</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Store source + chunks atomically</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Rebuild FTS + relations</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Persist / resolve parse failures</div>
+          <div class="stage-item"><div class="dot" style="background:var(--green)"></div>Commit evidence before embeddings</div>
         </div>
       </div>
 
@@ -658,14 +750,14 @@
       <div class="pipe-stage">
         <div class="stage-header">
           <div class="stage-num" style="background:rgba(255,95,109,.12);color:var(--red)">6</div>
-          <div class="stage-title">Promotion</div>
+          <div class="stage-title">Lifecycle</div>
         </div>
         <div class="stage-body">
           <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Confidence ≥ 0.85</div>
           <div class="stage-item"><div class="dot" style="background:var(--red)"></div>≥ 2 source categories</div>
-          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Quality gate (active/review/quarantine)</div>
+          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Current / superseded / retracted</div>
+          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Conflict review by subject key</div>
           <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Citation resolution + trust scoring</div>
-          <div class="stage-item"><div class="dot" style="background:var(--red)"></div>Candidate → Memory</div>
         </div>
       </div>
 
@@ -681,10 +773,11 @@
           <div class="stage-title">MCP / CLI</div>
         </div>
         <div class="stage-body" style="border-radius:0 0 8px 0">
-          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>20 MCP tools exposed</div>
+          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>21 MCP tools exposed</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Memory health + doctor</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Project narrative summaries</div>
+          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Privacy + retention administration</div>
         </div>
       </div>
 
@@ -780,7 +873,7 @@
             <div class="source-icon" style="background:rgba(61,219,161,.12)">◈</div>
             <div>
               <div class="source-name">Codex Logs</div>
-              <div class="source-desc">~/.codex/archived_sessions — conversation turns</div>
+              <div class="source-desc">~/.codex/sessions + archived_sessions — conversation turns</div>
             </div>
           </div>
           <div class="source-card">
@@ -822,8 +915,8 @@
             <div class="layer-body">
               <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Incremental sync orchestration</div>
               <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Per-source cursor tracking</div>
-              <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Auto-sync on server start</div>
-              <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Runs deterministic → temporary → LLM chain</div>
+              <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Atomic evidence ingestion before embedding work</div>
+              <div class="layer-item"><div class="dot" style="background:var(--accent)"></div>Source failure persistence + automatic resolution</div>
             </div>
           </details>
 
@@ -881,11 +974,11 @@
             </summary>
             <div class="layer-body">
               <div class="layer-item"><div class="dot" style="background:var(--green)"></div>SQLite at .code-butler/memory.sqlite</div>
-              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Offline FTS default for sources, chunks, and temporary memories</div>
+              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Ordered schema migrations + consistent backups</div>
+              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Nested transactions through SQLite savepoints</div>
               <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Optional Float32 vectors for chunks + current promoted memories</div>
               <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Pending / complete / failed retry queue isolated by provider fingerprint</div>
-              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Candidate + promoted durable memories</div>
-              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Quality metadata (status, reasons, verified_at)</div>
+              <div class="layer-item"><div class="dot" style="background:var(--green)"></div>Offline FTS remains the default retrieval path</div>
             </div>
           </details>
 
@@ -898,9 +991,9 @@
             </summary>
             <div class="layer-body">
               <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Citation resolution (commit, conversation, file)</div>
-              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Trust summary scoring</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Exact-chunk locators + repository-contained real paths</div>
               <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Quality assessment (active/needs_review/quarantined)</div>
-              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Memory audit with auto-fix</div>
+              <div class="layer-item"><div class="dot" style="background:var(--cyan)"></div>Complete unbounded audit with scanned / total metadata</div>
             </div>
           </details>
 
@@ -912,10 +1005,25 @@
               <div class="layer-toggle">▼</div>
             </summary>
             <div class="layer-body">
-              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Fingerprint-based change detection</div>
-              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Daily refresh schedule</div>
-              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Generates project-summary.md narrative</div>
-              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Agent bootstrap hints (AGENTS.md / CLAUDE.md)</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Git-tracked code selected deterministically (12 / 20k / 120k limits)</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>User-owned project-summary-notes.md overlay</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Input fingerprint + output hash for manual-edit detection</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Forced refresh creates a timestamped backup</div>
+            </div>
+          </details>
+
+          <details class="layer" open style="--layer-color:var(--red)">
+            <summary class="layer-head">
+              <div class="layer-icon" style="background:rgba(255,95,109,.12)">🛡</div>
+              <div class="layer-title">Privacy & Operations</div>
+              <div class="layer-subtitle">src/privacy/* · src/operations/*</div>
+              <div class="layer-toggle">▼</div>
+            </summary>
+            <div class="layer-body">
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Storage-boundary built-in + project redaction</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Audit, export/import, scrub, delete, retention prune</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Verified recovery backups with restore-on-failure</div>
+              <div class="layer-item"><div class="dot" style="background:var(--red)"></div>Content-free operation log + deletion tombstones</div>
             </div>
           </details>
 
@@ -927,7 +1035,7 @@
               <div class="layer-toggle">▼</div>
             </summary>
             <div class="layer-body">
-              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>20 exposed tools</div>
+              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>21 exposed tools</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Global launcher via code-butler mcp</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate, summarize</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Memory health, doctor, project briefs</div>
@@ -942,10 +1050,10 @@
               <div class="layer-toggle">▼</div>
             </summary>
             <div class="layer-body">
-              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Health checks: storage, sync, sources, config, embedding coverage</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>quick_check, schema version, pending migrations, latest backup</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Audit completeness, recovery diagnostics, embedding coverage</div>
               <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>Prioritized next-actions with commands</div>
-              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>CLI: code-butler doctor [--json] [--strict]</div>
-              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>MCP: run_doctor tool</div>
+              <div class="layer-item"><div class="dot" style="background:var(--yellow)"></div>CLI doctor + MCP run_doctor</div>
             </div>
           </details>
 
@@ -954,7 +1062,7 @@
 
       <!-- RIGHT: MCP Tools -->
       <div>
-        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (20)</div>
+        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (21)</div>
         <div class="mcp-col">
           <div class="mcp-group-label">Search & Read</div>
           <div class="mcp-card">
@@ -967,7 +1075,7 @@
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">read_memory_source</div>
-            <div class="mcp-tool-desc">Read raw stored source by id</div>
+            <div class="mcp-tool-desc">Read the stored, storage-policy-redacted source by id</div>
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">find_memories</div>
@@ -1021,6 +1129,10 @@
             <div class="mcp-tool-desc">Run incremental sync from sources</div>
           </div>
           <div class="mcp-card">
+            <div class="mcp-tool-name">list_source_failures</div>
+            <div class="mcp-tool-desc">List persisted parsing failures and repair state</div>
+          </div>
+          <div class="mcp-card">
             <div class="mcp-tool-name">summarize_project_state</div>
             <div class="mcp-tool-desc">Counts and sync status</div>
           </div>
@@ -1030,12 +1142,12 @@
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">refresh_project_summary</div>
-            <div class="mcp-tool-desc">Regenerate narrative summary</div>
+            <div class="mcp-tool-desc">Refresh narrative with manual-edit protection</div>
           </div>
           <div class="mcp-group-label">Health & Quality</div>
           <div class="mcp-card">
             <div class="mcp-tool-name">summarize_memory_health</div>
-            <div class="mcp-tool-desc">Quality audit: active/review/quarantined counts</div>
+            <div class="mcp-tool-desc">Complete audit with scanned, total, and status counts</div>
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">run_doctor</div>
@@ -1049,152 +1161,320 @@
 
   <!-- ─── STORAGE SCHEMA ────────────────────────────────── -->
   <section class="anim anim-5">
-    <div class="section-label">SQLite Schema — .code-butler/memory.sqlite</div>
+    <div class="section-label">SQLite Schema v10 — .code-butler/memory.sqlite</div>
     <div class="storage-grid">
 
       <div class="table-card">
         <div class="table-head">
-          <div class="table-name">raw_sources</div>
-          <div class="table-tag">FTS</div>
+          <div class="table-name">schema_migrations</div>
+          <div class="table-tag" style="color:var(--yellow)">ORDERED</div>
         </div>
         <div class="table-fields">
-          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
-          <div class="field-row"><span class="field-name">type</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">path</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">content</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">imported_at</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name field-pk">version</span><span class="field-type">INTEGER PK</span></div>
+          <div class="field-row"><span class="field-name">name</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">applied_at</span><span class="field-type">TEXT</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
-          <div class="table-name">source_chunks</div>
-          <div class="table-tag">FTS</div>
+          <div class="table-name">sources</div>
+          <div class="table-tag" style="color:var(--red)">REDACTED</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">type / title / origin</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">raw_content</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">metadata_json</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">created_at</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">chunks + chunks_fts</div>
+          <div class="table-tag" style="color:var(--green)">FTS5</div>
         </div>
         <div class="table-fields">
           <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
           <div class="field-row"><span class="field-name">source_id</span><span class="field-type">TEXT FK</span></div>
-          <div class="field-row"><span class="field-name">locator</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">text</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">role</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">chunk_index / text</span><span class="field-type">INTEGER / TEXT</span></div>
+          <div class="field-row"><span class="field-name">metadata_json</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">FTS title + text</span><span class="field-type">VIRTUAL</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
-          <div class="table-name">git_commits</div>
+          <div class="table-name">commits + decisions</div>
+          <div class="table-tag">EVIDENCE</div>
         </div>
         <div class="table-fields">
-          <div class="field-row"><span class="field-name field-pk">hash</span><span class="field-type">TEXT PK</span></div>
-          <div class="field-row"><span class="field-name">message</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">author</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">timestamp</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">changed_files</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">diff_snippet</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name field-pk">hash / id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">author / authored_at</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">changed_files_json</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">topic / decision / reason</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">evidence_json</span><span class="field-type">TEXT</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
-          <div class="table-name">manual_decisions</div>
+          <div class="table-name">relations + memory_links</div>
+          <div class="table-tag">EVIDENCE GRAPH</div>
         </div>
         <div class="table-fields">
           <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
-          <div class="field-row"><span class="field-name">topic</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">decision</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">reason</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">evidence</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">from / to type + id</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">owner_kind / owner_id</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">target_type / target_id</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">locator / metadata_json</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">sync_sources + sync_cursors</div>
+          <div class="table-tag">INCREMENTAL</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">source + cursor_key</span><span class="field-type">COMPOSITE PK</span></div>
+          <div class="field-row"><span class="field-name">enabled</span><span class="field-type">INTEGER</span></div>
+          <div class="field-row"><span class="field-name">last_sync / success / error</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">cursor_value / updated_at</span><span class="field-type">TEXT</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
           <div class="table-name">memory_candidates</div>
-          <div class="table-tag" style="color:var(--orange)">STAGING</div>
+          <div class="table-tag" style="color:var(--orange)">EXTRACTION</div>
         </div>
         <div class="table-fields">
           <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
-          <div class="field-row"><span class="field-name">type</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">content</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">confidence</span><span class="field-type">REAL</span></div>
-          <div class="field-row"><span class="field-name">evidence_refs</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">source_category</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">quality_status</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">quality_reasons_json</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">last_verified_at</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">type / title / summary</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">evidence_json / signature</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">promotion_state</span><span class="field-type">candidate | promoted</span></div>
+          <div class="field-row"><span class="field-name">promoted_memory_id</span><span class="field-type">TEXT FK</span></div>
+          <div class="field-row"><span class="field-name">quality metadata</span><span class="field-type">TEXT</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
           <div class="table-name">memories</div>
-          <div class="table-tag" style="color:var(--green)">PROMOTED</div>
+          <div class="table-tag" style="color:var(--green)">CANONICAL</div>
         </div>
         <div class="table-fields">
           <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
-          <div class="field-row"><span class="field-name">type</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">content</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">confidence</span><span class="field-type">REAL</span></div>
-          <div class="field-row"><span class="field-name">promoted_at</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">evidence_refs</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">quality_status</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">quality_reasons_json</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">last_verified_at</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">subject_key</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">lifecycle_status</span><span class="field-type">3 STATES</span></div>
+          <div class="field-row"><span class="field-name">valid_from / valid_until</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">status reason / timestamp</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">lifecycle_generation</span><span class="field-type">TEXT</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
-          <div class="table-name">temporary_memories</div>
-          <div class="table-tag" style="color:var(--cyan)">FTS + TTL</div>
+          <div class="table-name">memory_relations</div>
+          <div class="table-tag" style="color:var(--red)">CONFLICTS</div>
         </div>
         <div class="table-fields">
           <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
-          <div class="field-row"><span class="field-name">project_id</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">from_memory_id</span><span class="field-type">TEXT FK</span></div>
+          <div class="field-row"><span class="field-name">to_memory_id</span><span class="field-type">TEXT FK</span></div>
+          <div class="field-row"><span class="field-name">relation_type</span><span class="field-type">supersedes | potentially_contradicts</span></div>
+          <div class="field-row"><span class="field-name">created_at / reason</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">temporary_memories + links</div>
+          <div class="table-tag" style="color:var(--cyan)">FTS5 + TTL</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
           <div class="field-row"><span class="field-name">thread_id / session_id</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">kind</span><span class="field-type">TEXT (6 kinds)</span></div>
+          <div class="field-row"><span class="field-name">kind</span><span class="field-type">6 KINDS</span></div>
           <div class="field-row"><span class="field-name">title / summary / details</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">confidence</span><span class="field-type">REAL</span></div>
           <div class="field-row"><span class="field-name">expires_at</span><span class="field-type">TEXT</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
-          <div class="table-name">temporary_memory_links</div>
+          <div class="table-name">embedding_jobs + vectors</div>
+          <div class="table-tag" style="color:var(--cyan)">OPTIONAL</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">owner_kind + owner_id</span><span class="field-type">COMPOSITE</span></div>
+          <div class="field-row"><span class="field-name">content_hash / owner_version</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">provider_fingerprint</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">state / attempts / error</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">dimension / vector_blob</span><span class="field-type">INTEGER / BLOB</span></div>
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">source_failures</div>
+          <div class="table-tag" style="color:var(--yellow)">REPAIR</div>
         </div>
         <div class="table-fields">
           <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
-          <div class="field-row"><span class="field-name">memory_id</span><span class="field-type">TEXT FK</span></div>
-          <div class="field-row"><span class="field-name">target_type</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">target_id</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">locator</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">adapter / path / error_code</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">sanitized message</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">first / last / attempts</span><span class="field-type">TEXT / INTEGER</span></div>
+          <div class="field-row"><span class="field-name">resolved_at</span><span class="field-type">TEXT</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
-          <div class="table-name">source_entity_relations</div>
+          <div class="table-name">operation_log</div>
+          <div class="table-tag" style="color:var(--red)">NO CONTENT</div>
         </div>
         <div class="table-fields">
-          <div class="field-row"><span class="field-name">source_id</span><span class="field-type">TEXT FK</span></div>
-          <div class="field-row"><span class="field-name">entity_type</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">entity_id</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">relation</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name field-pk">id</span><span class="field-type">TEXT PK</span></div>
+          <div class="field-row"><span class="field-name">operation_type / status</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">actor</span><span class="field-type">cli | mcp | system</span></div>
+          <div class="field-row"><span class="field-name">started / completed</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">safe metadata_json</span><span class="field-type">TEXT</span></div>
         </div>
       </div>
 
       <div class="table-card">
         <div class="table-head">
-          <div class="table-name">sync_cursors</div>
+          <div class="table-name">source_tombstones</div>
+          <div class="table-tag" style="color:var(--red)">NO RESURRECTION</div>
         </div>
         <div class="table-fields">
-          <div class="field-row"><span class="field-name field-pk">source</span><span class="field-type">TEXT PK</span></div>
-          <div class="field-row"><span class="field-name">cursor</span><span class="field-type">TEXT</span></div>
-          <div class="field-row"><span class="field-name">last_sync</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name field-pk">source_type + id hash</span><span class="field-type">COMPOSITE PK</span></div>
+          <div class="field-row"><span class="field-name">source_id_hash</span><span class="field-type">SHA-256</span></div>
+          <div class="field-row"><span class="field-name">deleted_at</span><span class="field-type">TEXT</span></div>
+          <div class="field-row"><span class="field-name">operation_id</span><span class="field-type">TEXT FK</span></div>
         </div>
       </div>
 
+      <div class="table-card">
+        <div class="table-head">
+          <div class="table-name">private_identity_mappings</div>
+          <div class="table-tag" style="color:var(--red)">PRIVATE</div>
+        </div>
+        <div class="table-fields">
+          <div class="field-row"><span class="field-name field-pk">raw_hash</span><span class="field-type">SHA-256 PK</span></div>
+          <div class="field-row"><span class="field-name">stored_identity</span><span class="field-type">TEXT UNIQUE</span></div>
+          <div class="field-row"><span class="field-name">created_at</span><span class="field-type">TEXT</span></div>
+        </div>
+      </div>
+
+    </div>
+    <div class="flow-note" style="--note-color:var(--green)">
+      Migrations run under <code class="code">BEGIN IMMEDIATE</code> with a 5s busy timeout, recheck the version under the write lock, create a consistent SQLite backup, and record each version in the same transaction. Nested application transactions use savepoints.
+    </div>
+  </section>
+
+  <!-- ─── LIFECYCLE + RETRIEVAL ────────────────────────── -->
+  <section class="anim anim-6">
+    <div class="section-label">Durable Lifecycle & Retrieval</div>
+    <div class="capability-grid">
+      <div class="capability-card" style="--capability-color:var(--green)">
+        <div class="capability-title">Canonical durable memory</div>
+        <div class="capability-item">Candidates remain extraction records and point to <code class="code">promoted_memory_id</code>.</div>
+        <div class="capability-item">Durable memories own current, superseded, and retracted lifecycle state.</div>
+        <div class="capability-item">Validity windows, status reason, timestamp, and generation prevent accidental reactivation.</div>
+      </div>
+      <div class="capability-card" style="--capability-color:var(--red)">
+        <div class="capability-title">Conflict control</div>
+        <div class="capability-item">Normalized <code class="code">subject_key</code> groups memories about the same subject.</div>
+        <div class="capability-item">Audits create idempotent potentially-contradicts review relations.</div>
+        <div class="capability-item">Review never automatically retracts or supersedes a memory; supersession is atomic and cycle-checked.</div>
+      </div>
+      <div class="capability-card" style="--capability-color:var(--accent)">
+        <div class="capability-title">Offline-first retrieval</div>
+        <div class="capability-item">FTS5 is the default and remains fully usable without a provider or network.</div>
+        <div class="capability-item">Default memory search returns current durable memories; lifecycle filters reveal historical states.</div>
+        <div class="capability-item">Results may expose lexical rank, semantic rank, and fused score metadata.</div>
+      </div>
+      <div class="capability-card" style="--capability-color:var(--cyan)">
+        <div class="capability-title">Optional hybrid index</div>
+        <div class="capability-item">Only source chunks and current promoted memories are embedded.</div>
+        <div class="capability-item">Float32 cosine ranking is fused with FTS through reciprocal-rank fusion.</div>
+        <div class="capability-item">Endpoint, model, and dimension fingerprints never mix in one ranking operation.</div>
+      </div>
+    </div>
+    <div class="flow-note" style="--note-color:var(--cyan)">
+      Evidence sync commits first. Embedding jobs then move through pending → complete / failed; failures stay retryable and never roll back sync or disable FTS. Remote endpoints require explicit opt-in and receive redacted text only.
+    </div>
+  </section>
+
+  <!-- ─── SUMMARY + REPAIR ─────────────────────────────── -->
+  <section class="anim anim-6">
+    <div class="section-label">Code-Aware Summary & Source Repair</div>
+    <div class="promo-flow">
+      <div class="promo-box">
+        <div class="promo-box-title">1 · Select safe context</div>
+        <div class="promo-item"><span style="color:var(--red)">→</span> Git-tracked and non-ignored files only</div>
+        <div class="promo-item"><span style="color:var(--red)">→</span> Manifest entrypoints → memory links → recent commits</div>
+        <div class="promo-item"><span style="color:var(--red)">→</span> Stable path ordering; reject external, symlink, binary, generated, dependency, and credential paths</div>
+      </div>
+      <div class="promo-arrow">→</div>
+      <div class="promo-box">
+        <div class="promo-box-title">2 · Bound + fingerprint</div>
+        <div class="promo-item"><span style="color:var(--yellow)">→</span> Maximum 12 files, 20,000 chars per file, 120,000 total</div>
+        <div class="promo-item"><span style="color:var(--yellow)">→</span> Record path, full content hash, truncation, and selection reason</div>
+        <div class="promo-item"><span style="color:var(--yellow)">→</span> Include the user-owned project-summary-notes.md overlay</div>
+      </div>
+      <div class="promo-arrow">→</div>
+      <div class="promo-box">
+        <div class="promo-box-title">3 · Protect output</div>
+        <div class="promo-item"><span style="color:var(--green)">→</span> Input fingerprint drives staleness</div>
+        <div class="promo-item"><span style="color:var(--green)">→</span> Output hash detects manual summary edits</div>
+        <div class="promo-item"><span style="color:var(--green)">→</span> Normal refresh refuses overwrite; --force backs up first</div>
+      </div>
+    </div>
+    <div class="flow-note" style="--note-color:var(--yellow)">
+      Adapter parse failures are deduplicated by adapter, path, and error code with sanitized messages, attempt counts, first/last occurrence, and resolution time. A later successful parse marks the failure resolved; inspect them through <code class="code">sources failures</code> or <code class="code">list_source_failures</code>.
+    </div>
+  </section>
+
+  <!-- ─── PRIVACY + OPERATIONS ─────────────────────────── -->
+  <section class="anim anim-6">
+    <div class="section-label">Privacy, Retention & Recovery Boundary</div>
+    <div class="capability-grid">
+      <div class="capability-card" style="--capability-color:var(--red)">
+        <div class="capability-title">Redact before persistence</div>
+        <div class="capability-item">API keys, bearer tokens, private keys, credential URLs, and provider-specific secrets are removed at the storage boundary.</div>
+        <div class="capability-item">Project literal/regex policies add domain-specific redaction without a raw bypass.</div>
+        <div class="capability-item">The same redactor protects vectors, exports, regenerated summaries, errors, and logs.</div>
+      </div>
+      <div class="capability-card" style="--capability-color:var(--orange)">
+        <div class="capability-title">Administrative privacy CLI</div>
+        <div class="capability-item"><code class="code">privacy audit / export / import / scrub / delete / prune</code></div>
+        <div class="capability-item">Exports are redacted by default; raw export requires explicit CLI confirmation and is not exposed through MCP.</div>
+        <div class="capability-item">Retention supports per-adapter maximum age plus per-source overrides.</div>
+      </div>
+      <div class="capability-card" style="--capability-color:var(--green)">
+        <div class="capability-title">Evidence-aware mutation</div>
+        <div class="capability-item">Scrub atomically rebuilds source chunks, FTS, relations, quality state, and embeddings.</div>
+        <div class="capability-item">Delete removes dependent candidates, reassesses remaining evidence, and retracts orphaned durable memories.</div>
+        <div class="capability-item">Hashed tombstones stop later sync or deterministic extraction from resurrecting deleted sources.</div>
+      </div>
+      <div class="capability-card" style="--capability-color:var(--yellow)">
+        <div class="capability-title">Verified recovery + auditability</div>
+        <div class="capability-item">Sensitive mutations use a temporary SQLite backup and verify quick_check, foreign keys, and logical references.</div>
+        <div class="capability-item">Success removes the temporary backup; failure restores and reports the retained path.</div>
+        <div class="capability-item">The operation log records migrations and administrative actions without raw content or search queries.</div>
+      </div>
+    </div>
+    <div class="release-strip">
+      <div class="release-pill"><b>v0.2</b> migrations + atomicity</div>
+      <div class="release-pill"><b>v0.3</b> lifecycle + conflicts</div>
+      <div class="release-pill"><b>v0.4</b> optional hybrid retrieval</div>
+      <div class="release-pill"><b>v0.5</b> code-aware summaries</div>
+      <div class="release-pill"><b>v1.0</b> privacy + operations + Node 24 gates</div>
     </div>
   </section>
 
@@ -1341,7 +1621,11 @@
     <div class="file-map">
       <div class="file-row">
         <div class="file-path">src/cli.ts</div>
-        <div class="file-desc">CLI commands — init, config, ingest, decision, memory, embeddings, doctor, sync, sources, watch, project-summary, hooks, mcp, serve</div>
+        <div class="file-desc">CLI entry and routing — including lifecycle, embeddings, source failures, privacy export/import/scrub/delete/prune</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/cli/commands/*</div>
+        <div class="file-desc">Characterized command groups for memory lifecycle/conflicts, embeddings, source failures, and privacy administration</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/server.ts</div>
@@ -1357,7 +1641,7 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/types.ts</div>
-        <div class="file-desc">Shared TypeScript types including retrieval, embeddings, RLM, temporary memory, and providers</div>
+        <div class="file-desc">Shared TypeScript contracts including lifecycle, retrieval, embeddings, privacy, retention, RLM, and temporary memory</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/json.ts</div>
@@ -1365,7 +1649,11 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/mcp/tools.ts</div>
-        <div class="file-desc">MCP tool registration and handlers (20 tools)</div>
+        <div class="file-desc">MCP registration facade for 21 backward-compatible tools</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/mcp/tool-groups/*</div>
+        <div class="file-desc">Split memory, source, and investigation handlers; privacy-destructive commands remain CLI-only</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/sync/service.ts</div>
@@ -1373,11 +1661,23 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/storage/store.ts</div>
-        <div class="file-desc">SQLite schema, persistence, FTS/vector storage, embedding queue, temporary memory, quality metadata, relations</div>
+        <div class="file-desc">Public storage facade over schema-v10 persistence and transactional maintenance</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/storage/migrations.ts · transactions.ts</div>
+        <div class="file-desc">Ordered locked migrations, consistent backups, migration retention, nested savepoints, and after-commit work</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/storage/source-store.ts · lifecycle-store.ts</div>
+        <div class="file-desc">Atomic source/chunk replacement and canonical durable lifecycle/conflict persistence</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/storage/embedding-store.ts · privacy-maintenance.ts</div>
+        <div class="file-desc">Fingerprint-isolated vector queue plus verified FTS/relation/quality/embedding rebuilds</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/doctor/service.ts</div>
-        <div class="file-desc">Health checks — storage, sync, sources, config, embedding coverage/fingerprints; prioritized next-actions</div>
+        <div class="file-desc">quick_check, schema/migration/backup/recovery/audit/embedding diagnostics and prioritized next-actions</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/evidence/citations.ts</div>
@@ -1405,7 +1705,7 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/sources/codex.ts</div>
-        <div class="file-desc">Codex + Claude conversation log sync</div>
+        <div class="file-desc">Codex active and archived session log adapter</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/sources/claude.ts</div>
@@ -1424,6 +1724,10 @@
         <div class="file-desc">Multi-step history investigation controller (RLM)</div>
       </div>
       <div class="file-row">
+        <div class="file-path">src/investigate/context-builder.ts</div>
+        <div class="file-desc">Shared bounded context assembly for history questions and temporary project state</div>
+      </div>
+      <div class="file-row">
         <div class="file-path">src/investigate/actions.ts</div>
         <div class="file-desc">RLM action definitions and validation schemas (11 actions)</div>
       </div>
@@ -1437,7 +1741,11 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/project-summary/service.ts</div>
-        <div class="file-desc">Project narrative generation, fingerprinting, daily refresh</div>
+        <div class="file-desc">Narrative generation, notes overlay, input/output hashes, manual-edit protection, and forced-refresh backup</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/project-summary/code-context.ts</div>
+        <div class="file-desc">Deterministic safe selection of Git-tracked code with real-path, secret, binary, ignore, and size enforcement</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/project-summary/providers.ts</div>
@@ -1471,6 +1779,22 @@
         <div class="file-path">src/embeddings/provider.ts · src/embeddings/service.ts</div>
         <div class="file-desc">OpenAI-compatible embedding provider, mandatory remote redaction, retryable builds, provider fingerprint isolation</div>
       </div>
+      <div class="file-row">
+        <div class="file-path">src/memory/lifecycle-service.ts · conflicts.ts</div>
+        <div class="file-desc">Atomic supersession/retraction, cycle rejection, subject-key conflict auditing, and lifecycle operation records</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/privacy/redaction.ts · policy.ts</div>
+        <div class="file-desc">Reusable built-in secret detection plus validated project literal/regex redaction policies</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/privacy/service.ts · backup.ts</div>
+        <div class="file-desc">Audit/export/import/scrub/delete/prune with verified recovery, evidence reassessment, tombstones, and backup purge</div>
+      </div>
+      <div class="file-row">
+        <div class="file-path">src/operations/log.ts</div>
+        <div class="file-desc">Typed content-free operation records and hashed source-deletion tombstones</div>
+      </div>
     </div>
   </section>
 
@@ -1486,7 +1810,7 @@
           <div class="config-row"><span class="config-key">git.maxCommits</span><span class="config-val">200</span></div>
           <div class="config-row"><span class="config-key">git.maxDiffChars</span><span class="config-val">12,000</span></div>
           <div class="config-row"><span class="config-key">git.hookInstall</span><span class="config-val config-bool-off">false (manual)</span></div>
-          <div class="config-row"><span class="config-key">codex.roots</span><span class="config-val">~/.codex/archived_sessions</span></div>
+          <div class="config-row"><span class="config-key">codex.roots</span><span class="config-val">sessions + archived_sessions</span></div>
           <div class="config-row"><span class="config-key">codex.includeDefaultRoots</span><span class="config-val config-bool-on">true</span></div>
           <div class="config-row"><span class="config-key">claude.roots</span><span class="config-val">~/.claude/projects</span></div>
         </div>
@@ -1531,12 +1855,14 @@
       </div>
 
       <div class="config-section">
-        <div class="config-head">📈 Promotion & Quality</div>
+        <div class="config-head">📈 Promotion, Lifecycle & Quality</div>
         <div class="config-body">
           <div class="config-row"><span class="config-key">confidenceThreshold</span><span class="config-val">0.85</span></div>
           <div class="config-row"><span class="config-key">requireCommitAndConversation</span><span class="config-val config-bool-on">true</span></div>
           <div class="config-row"><span class="config-key">minSourceCategories</span><span class="config-val">2</span></div>
           <div class="config-row"><span class="config-key">qualityGate</span><span class="config-val">active / needs_review / quarantined</span></div>
+          <div class="config-row"><span class="config-key">lifecycle</span><span class="config-val">current / superseded / retracted</span></div>
+          <div class="config-row"><span class="config-key">conflicts</span><span class="config-val">subject-key review; no auto-retract</span></div>
           <div class="config-row"><span class="config-key">autoSyncOnServerStart</span><span class="config-val config-bool-on">true</span></div>
         </div>
       </div>
@@ -1558,12 +1884,14 @@
       <div class="config-section">
         <div class="config-head">📝 Project Summary & Init</div>
         <div class="config-body">
-          <div class="config-row"><span class="config-key">fingerprint</span><span class="config-val">SHA-256 of manifests+docs+inventory</span></div>
+          <div class="config-row"><span class="config-key">selection</span><span class="config-val">tracked entrypoints → memories → commits</span></div>
+          <div class="config-row"><span class="config-key">limits</span><span class="config-val">12 files / 20k each / 120k total</span></div>
+          <div class="config-row"><span class="config-key">fingerprint</span><span class="config-val">input hash + separate output hash</span></div>
           <div class="config-row"><span class="config-key">refresh</span><span class="config-val">daily (24h cooldown) + watcher</span></div>
           <div class="config-row"><span class="config-key">output</span><span class="config-val">.code-butler/project-summary.md</span></div>
+          <div class="config-row"><span class="config-key">notes overlay</span><span class="config-val">project-summary-notes.md (user-owned)</span></div>
+          <div class="config-row"><span class="config-key">manual edits</span><span class="config-val">refuse; --force backs up first</span></div>
           <div class="config-row"><span class="config-key">agent hints</span><span class="config-val">AGENTS.md, CLAUDE.md (explicit init)</span></div>
-          <div class="config-row"><span class="config-key">init flow</span><span class="config-val">summary → bootstrap → watch install</span></div>
-          <div class="config-row"><span class="config-key">fallback</span><span class="config-val">provider: "fallback" when no API key</span></div>
         </div>
       </div>
 
@@ -1581,6 +1909,19 @@
           <div class="config-row"><span class="config-key">fallback</span><span class="config-val config-bool-on">exact offline FTS; no network fallback</span></div>
           <div class="config-row"><span class="config-key">operations</span><span class="config-val">embeddings build / status</span></div>
           <div class="config-row"><span class="config-key">offline evaluation</span><span class="config-val">npm run eval:retrieval</span></div>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-head">🛡 Privacy & Retention</div>
+        <div class="config-body">
+          <div class="config-row"><span class="config-key">privacy.redactionPatterns</span><span class="config-val">validated literal / regex rules</span></div>
+          <div class="config-row"><span class="config-key">privacy.allowRemoteEmbeddings</span><span class="config-val config-bool-off">false</span></div>
+          <div class="config-row"><span class="config-key">retention.migrationBackups</span><span class="config-val">2 newest</span></div>
+          <div class="config-row"><span class="config-key">retention.sources.*.maxAgeDays</span><span class="config-val">null (keep) by default</span></div>
+          <div class="config-row"><span class="config-key">retention.overrides</span><span class="config-val">per-source policy</span></div>
+          <div class="config-row"><span class="config-key">raw export</span><span class="config-val">explicit CLI confirmation only</span></div>
+          <div class="config-row"><span class="config-key">backup purge</span><span class="config-val">--purge-backups</span></div>
         </div>
       </div>
 

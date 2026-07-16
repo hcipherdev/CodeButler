@@ -19,11 +19,11 @@ export function addDecision(store: MemoryStore, input: DecisionInput): DecisionR
     const createdAt = new Date().toISOString();
     const record: DecisionRecord = {
       id,
-      topic: input.topic,
-      decision: input.decision,
-      reason: input.reason,
-      status: input.status,
-      evidence: input.evidence,
+      topic: store.contentPolicy.text(input.topic),
+      decision: store.contentPolicy.text(input.decision),
+      reason: store.contentPolicy.text(input.reason),
+      status: store.contentPolicy.text(input.status),
+      evidence: store.contentPolicy.evidence(input.evidence),
       createdAt
     };
 
@@ -139,8 +139,16 @@ interface DecisionRow {
 }
 
 function nextDecisionId(store: MemoryStore): string {
-  const row = store.db.prepare("select count(*) as count from decisions").get() as { count: number };
-  return `DEC-${String(row.count + 1).padStart(4, "0")}`;
+  const rows = store.db.prepare("select id from decisions").all() as Array<{ id: string }>;
+  let sequence = rows.reduce((maximum, row) => {
+    const match = /^DEC-(\d+)$/.exec(row.id);
+    return match?.[1] ? Math.max(maximum, Number(match[1])) : maximum;
+  }, 0) + 1;
+  while (true) {
+    const id = `DEC-${String(sequence).padStart(4, "0")}`;
+    if (!store.findSourceTombstone("decision", id)) return id;
+    sequence += 1;
+  }
 }
 
 function normalizeLimit(limit: number | undefined): number {

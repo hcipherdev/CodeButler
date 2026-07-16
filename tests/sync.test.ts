@@ -223,6 +223,98 @@ describe("automatic sync", () => {
     store.close();
   });
 
+  it("persists sanitized parser failures and resolves them after a successful repair", async () => {
+    const { rootDir, repoDir, codexDir } = createFixtureWorkspace();
+    const failedPath = join(codexDir, "broken-secret.jsonl");
+    const secret = "sk-proj-abcdefghijklmnop";
+    writeFileSync(failedPath, `{"api_key":"${secret}`);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const extractorProvider: ExtractorProvider = {
+      async extract() { return { memories: [], rejected: [] }; }
+    };
+
+    await syncProjectMemory(store, config, { source: "codex", extractorProvider });
+    await syncProjectMemory(store, config, { source: "codex", extractorProvider });
+
+    expect(store.getSyncCursor("codex", failedPath)).toBeUndefined();
+    expect(store.listSourceFailures()).toEqual([
+      expect.objectContaining({
+        adapter: "codex",
+        path: failedPath,
+        errorCode: "invalid_jsonl",
+        attempts: 2,
+        message: "The conversation log contains invalid JSONL."
+      })
+    ]);
+    expect(JSON.stringify(store.listSourceFailures())).not.toContain(secret);
+
+    writeFileSync(
+      failedPath,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "repaired", cwd: repoDir } }),
+        JSON.stringify({
+          type: "response_item",
+          payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Repaired log." }] }
+        })
+      ].join("\n")
+    );
+    await syncProjectMemory(store, config, { source: "codex", extractorProvider });
+
+    expect(store.readSource("codex:repaired")).toBeDefined();
+    expect(store.listSourceFailures()).toEqual([]);
+    expect(store.listSourceFailures({ resolved: true })).toEqual([
+      expect.objectContaining({ path: failedPath, resolvedAt: expect.any(String) })
+    ]);
+    store.close();
+  });
+
+  it("resolves a persisted failure when a repaired file matches its last known-good cursor", async () => {
+    const { rootDir, codexDir } = createFixtureWorkspace();
+    const filePath = join(codexDir, "rollout-test.jsonl");
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const extractorProvider: ExtractorProvider = { async extract() { return { memories: [], rejected: [] }; } };
+    await syncProjectMemory(store, config, { source: "codex", extractorProvider });
+    expect(store.getSyncCursor("codex", filePath)).toBeDefined();
+    store.recordSourceFailure({
+      adapter: "codex",
+      path: filePath,
+      errorCode: "read_failed",
+      message: "The conversation log could not be read."
+    });
+
+    await syncProjectMemory(store, config, { source: "codex", extractorProvider });
+
+    expect(store.listSourceFailures()).toEqual([]);
+    expect(store.listSourceFailures({ resolved: true })).toEqual([
+      expect.objectContaining({ path: filePath, errorCode: "read_failed", resolvedAt: expect.any(String) })
+    ]);
+    store.close();
+  });
+
+  it("records valid non-object JSONL rows as structured unsupported-message failures", async () => {
+    const { rootDir, codexDir, claudeDir } = createFixtureWorkspace();
+    const codexPath = join(codexDir, "null.jsonl");
+    const claudePath = join(claudeDir, "null.jsonl");
+    writeFileSync(codexPath, "null\n");
+    writeFileSync(claudePath, "null\n");
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const extractorProvider: ExtractorProvider = { async extract() { return { memories: [], rejected: [] }; } };
+
+    await expect(syncProjectMemory(store, config, { source: "all", extractorProvider })).resolves.toBeDefined();
+
+    expect(store.listSourceFailures({ limit: null })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ adapter: "codex", path: codexPath, errorCode: "no_supported_messages" }),
+      expect.objectContaining({ adapter: "claude", path: claudePath, errorCode: "no_supported_messages" })
+    ]));
+    store.close();
+  });
+
   it("filters conversation logs to the current project by default", async () => {
     const { rootDir, repoDir, claudeDir } = createFixtureWorkspace();
     const encodedProjectDir = join(rootDir, "claude", "projects", repoDir.replace(/^\/+/, "").replaceAll("/", "-"));

@@ -124,6 +124,35 @@ describe("doctor service", () => {
     expect(report.nextActions).toEqual([]);
   });
 
+  it("warns about unresolved persisted source failures without exposing raw content", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir);
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.recordSourceFailure({
+      adapter: "codex",
+      path: "/logs/broken.jsonl",
+      errorCode: "invalid_jsonl",
+      message: "safe public message api_key=sk-proj-abcdefghijklmnop"
+    });
+    store.close();
+
+    const report = runDoctor(rootDir);
+    const check = report.checks.find((item) => item.id === "sources:persistent_failures");
+
+    expect(check).toMatchObject({
+      status: "warning",
+      metadata: { unresolved: 1, byAdapter: { codex: 1 } }
+    });
+    expect(JSON.stringify(report)).not.toContain("sk-proj-");
+    expect(report.nextActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ command: "code-butler sources failures" })
+    ]));
+  });
+
   it("reports disabled embeddings in FTS mode as healthy without network access", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);

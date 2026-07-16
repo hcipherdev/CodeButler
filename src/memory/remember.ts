@@ -5,7 +5,7 @@ import { cleanMemoryText, titleFromMemoryText } from "./directives.js";
 import { updateMemoryStatus } from "./lifecycle-service.js";
 import type { MemoryStore } from "../storage/store.js";
 import { withTransaction } from "../storage/transactions.js";
-import type { DurableMemory, MemoryCandidate, MemoryType } from "../types.js";
+import type { DurableMemory, MemoryCandidate, MemoryType, OperationActor } from "../types.js";
 
 export interface RememberProjectMemoryInput {
   type: MemoryType;
@@ -26,7 +26,7 @@ export interface RememberProjectMemoryResult {
 export function rememberProjectMemory(
   store: MemoryStore,
   input: RememberProjectMemoryInput,
-  options: { now?: () => Date } = {}
+  options: { now?: () => Date; actor?: OperationActor } = {}
 ): RememberProjectMemoryResult {
   const shouldPromote = input.promote ?? true;
   if (input.supersedesMemoryId !== undefined && !shouldPromote) {
@@ -39,7 +39,7 @@ export function rememberProjectMemory(
 function rememberProjectMemoryAtomically(
   store: MemoryStore,
   input: RememberProjectMemoryInput,
-  options: { now?: () => Date },
+  options: { now?: () => Date; actor?: OperationActor },
   shouldPromote: boolean
 ): RememberProjectMemoryResult {
   const summary = cleanMemoryText(input.text);
@@ -105,7 +105,8 @@ function rememberProjectMemoryAtomically(
       status: "superseded",
       reason: `Superseded by ${memory.title}.`,
       replacementMemoryId: memory.id,
-      now
+      now,
+      actor: options.actor
     });
   }
   return { sourceId, candidate, memory };

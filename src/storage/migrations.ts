@@ -4,6 +4,7 @@ import { existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { MemoryType } from "../types.js";
+import { recordCompletedMigrationOperation } from "../operations/log.js";
 
 export interface SchemaMigration {
   version: number;
@@ -294,6 +295,86 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       ensureColumn(db, "embedding_jobs", "index_generation", "text not null default ''");
       ensureColumn(db, "embedding_jobs", "target_fingerprint", "text");
     }
+  },
+  {
+    version: 8,
+    name: "add persistent source failures",
+    up(db) {
+      db.exec(`
+        create table if not exists source_failures (
+          id text primary key,
+          adapter text not null check (adapter in ('git', 'codex', 'claude')),
+          path text not null,
+          error_code text not null,
+          message text not null,
+          first_occurred_at text not null,
+          last_occurred_at text not null,
+          attempts integer not null default 1 check (attempts > 0),
+          resolved_at text,
+          unique (adapter, path, error_code)
+        );
+        create index if not exists idx_source_failures_unresolved
+          on source_failures(resolved_at, last_occurred_at desc);
+        create index if not exists idx_source_failures_adapter
+          on source_failures(adapter, resolved_at, last_occurred_at desc);
+      `);
+    }
+  },
+  {
+    version: 9,
+    name: "add privacy-safe operation log",
+    up(db) {
+      db.exec(`
+        create table if not exists operation_log (
+          id text primary key,
+          operation_type text not null check (operation_type in (
+            'migration', 'lifecycle_change', 'redaction', 'deletion', 'export', 'import',
+            'retention_prune', 'recovery'
+          )),
+          status text not null check (status in ('started', 'completed', 'failed')),
+          started_at text not null,
+          completed_at text,
+          actor text not null check (actor in ('cli', 'mcp', 'system')),
+          metadata_json text not null default '{}',
+          check (
+            (status = 'started' and completed_at is null)
+            or (status in ('completed', 'failed') and completed_at is not null)
+          )
+        );
+        create table if not exists source_tombstones (
+          source_type text not null check (source_type in ('conversation', 'commit', 'decision')),
+          source_id_hash text not null check (
+            length(source_id_hash) = 64 and source_id_hash not glob '*[^0-9a-f]*'
+          ),
+          deleted_at text not null,
+          operation_id text not null references operation_log(id),
+          primary key (source_type, source_id_hash)
+        );
+        create index if not exists idx_operation_log_type_started
+          on operation_log(operation_type, started_at desc);
+        create index if not exists idx_operation_log_status_started
+          on operation_log(status, started_at desc);
+        create index if not exists idx_source_tombstones_operation
+          on source_tombstones(operation_id);
+      `);
+    }
+  },
+  {
+    version: 10,
+    name: "add stable private identity mappings",
+    up(db) {
+      db.exec(`
+        create table if not exists private_identity_mappings (
+          raw_hash text primary key check (
+            length(raw_hash) = 64 and raw_hash not glob '*[^0-9a-f]*'
+          ),
+          stored_identity text not null,
+          created_at text not null
+        );
+        create unique index if not exists idx_private_identity_stored
+          on private_identity_mappings(stored_identity);
+      `);
+    }
   }
 ] as const;
 
@@ -337,14 +418,18 @@ export function initializeSchema(
     if (hasDataToProtect(db)) backupPath = createDatabaseBackup(databasePath);
     for (const migration of pending) {
       migration.up(db);
+      const appliedAt = new Date().toISOString();
       db.prepare("insert into schema_migrations (version, name, applied_at) values (?, ?, ?)").run(
         migration.version,
         migration.name,
-        new Date().toISOString()
+        appliedAt
       );
+      if (migration.version >= 9 && tableExists(db, "operation_log")) {
+        recordCompletedMigrationOperation(db, migration.version, appliedAt);
+      }
     }
     db.exec("COMMIT");
-    if (backupPath) pruneMigrationBackups(databasePath, options.backupRetention ?? 5);
+    if (backupPath) pruneMigrationBackups(databasePath, options.backupRetention ?? 2);
   } catch (error) {
     if (db.isTransaction) db.exec("ROLLBACK");
     throw error;
