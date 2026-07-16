@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
@@ -109,5 +109,28 @@ describe("memory quality storage", () => {
     ]);
 
     store.close();
+  });
+
+  it("checkpoints WAL changes into the primary database before closing", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.db.exec("pragma wal_autocheckpoint = 0");
+    store.db.exec("pragma busy_timeout = 0");
+    store.db.exec("create table checkpoint_fixture (value text); insert into checkpoint_fixture values ('shared');");
+    const reader = new DatabaseSync(store.paths.databasePath, { readOnly: true });
+    reader.exec("begin");
+    expect(reader.prepare("select value from checkpoint_fixture").all()).toEqual([{ value: "shared" }]);
+
+    expect(existsSync(`${store.paths.databasePath}-wal`)).toBe(true);
+    expect(() => store.close()).toThrow("Cannot safely close Code Butler memory database");
+
+    reader.exec("commit");
+    store.close();
+    const walPath = `${store.paths.databasePath}-wal`;
+    expect(existsSync(walPath) ? statSync(walPath).size : 0).toBe(0);
+    expect(reader.prepare("select value from checkpoint_fixture").all()).toEqual([{ value: "shared" }]);
+    reader.close();
   });
 });

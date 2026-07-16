@@ -4,9 +4,13 @@ import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { ensureGlobalConfig, ensureProjectConfig, loadProjectConfig } from "./config.js";
+import { runEmbeddingsCommand } from "./cli/commands/embeddings.js";
+import { runMemoryCommand } from "./cli/commands/memory.js";
+import { runPrivacyCommand } from "./cli/commands/privacy.js";
+import { runSourcesCommand } from "./cli/commands/sources.js";
 import { addDecision, importDecisionMarkdown } from "./decisions/store.js";
 import { runDoctor } from "./doctor/service.js";
-import { buildEmbeddings, getEmbeddingStatus, type EmbeddingBuildResult, type EmbeddingServiceOptions, type EmbeddingStatus } from "./embeddings/service.js";
+import type { EmbeddingServiceOptions } from "./embeddings/service.js";
 import { parseConversationFile } from "./ingest/conversation.js";
 import { ingestGitRepository } from "./ingest/git.js";
 import { auditMemoryConflicts } from "./memory/conflicts.js";
@@ -25,8 +29,8 @@ import {
 } from "./project-summary/service.js";
 import { resolveProjectRoot } from "./project-root.js";
 import { startServer as startProjectMemoryServer, type ProjectMemoryServerOptions } from "./server.js";
-import { getClaudeSourceStatus, getCodexSourceStatus } from "./sources/codex.js";
-import { openMemoryStore } from "./storage/store.js";
+import { openConfiguredMemoryStore } from "./storage/open-configured-store.js";
+import type { MemoryStore } from "./storage/store.js";
 import { syncProjectMemory } from "./sync/service.js";
 import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, MemoryLifecycleStatus, MemoryType, SyncSourceName } from "./types.js";
 import {
@@ -70,7 +74,7 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
     }
 
     if (command === "init") {
-      const store = openMemoryStore(cwd);
+      const store = openConfiguredMemoryStore(cwd);
       store.init();
       try {
         const config = loadProjectConfig(cwd);
@@ -110,7 +114,7 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
     }
 
     if (command === "memory") {
-      return await runMemory(rest, cwd, stdout, { now: options.now });
+      return await runMemoryCommand(rest, cwd, stdout, { now: options.now });
     }
 
     if (command === "doctor") {
@@ -118,7 +122,11 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
     }
 
     if (command === "embeddings") {
-      return await runEmbeddings(rest, cwd, stdout, options.embeddingServiceOptions);
+      return await runEmbeddingsCommand(rest, cwd, stdout, options.embeddingServiceOptions);
+    }
+
+    if (command === "privacy") {
+      return runPrivacyCommand(rest, cwd, stdout);
     }
 
     if (command === "sync") {
@@ -126,7 +134,7 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
     }
 
     if (command === "sources") {
-      return await runSources(rest, cwd, stdout);
+      return await runSourcesCommand(rest, cwd, stdout);
     }
 
     if (command === "watch") {
@@ -174,46 +182,6 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
   }
 }
 
-async function runEmbeddings(args: string[], cwd: string, stdout: (line: string) => void, serviceOptions: EmbeddingServiceOptions = {}): Promise<number> {
-  const [subcommand, ...rest] = args;
-  if (subcommand !== "build" && subcommand !== "status") {
-    throw new Error("Usage: code-butler embeddings <build|status> [--json]");
-  }
-  const json = rest.includes("--json");
-  const unknown = rest.find((arg) => arg !== "--json");
-  if (unknown) throw new Error(`Unknown embeddings option: ${unknown}\nUsage: code-butler embeddings ${subcommand} [--json]`);
-
-  const store = openMemoryStore(cwd);
-  store.init();
-  try {
-    const config = loadProjectConfig(cwd);
-    const result = subcommand === "build"
-      ? await buildEmbeddings(store, config, serviceOptions)
-      : getEmbeddingStatus(store, config, serviceOptions);
-    if (json) stdout(JSON.stringify({ provider: config.embeddings.provider, model: config.embeddings.model, ...result }, null, 2));
-    else printEmbeddingStatus(subcommand, config.embeddings.provider, config.embeddings.model, result, stdout);
-    return subcommand === "build" && "usable" in result && !result.usable ? 1 : 0;
-  } finally {
-    store.close();
-  }
-}
-
-function printEmbeddingStatus(
-  operation: "build" | "status",
-  provider: string,
-  model: string,
-  result: EmbeddingStatus | EmbeddingBuildResult,
-  stdout: (line: string) => void
-): void {
-  stdout(operation === "build" ? "Embedding Build" : "Embedding Status");
-  stdout(`provider=${provider} model=${model} enabled=${result.enabled}`);
-  stdout(`eligible=${result.eligible} coverage=${result.activeCoverage}/${result.eligible} pending=${result.pending} complete=${result.complete} failed=${result.failed} attempts=${result.attempts}`);
-  if ("built" in result) {
-    stdout(`built=${result.built} retried=${result.retried} enqueued=${result.enqueued} removed_jobs=${result.removedJobs} removed_vectors=${result.removedVectors}`);
-  }
-  for (const warning of result.warnings) stdout(`warning=${warning}`);
-}
-
 export function isCliEntrypoint(importMetaUrl: string, argvPath: string | undefined): boolean {
   if (!argvPath) return false;
   try {
@@ -246,7 +214,7 @@ async function runMcp(
   const configCreated = !existsSync(configPath);
   const databaseCreated = !existsSync(databasePath);
 
-  const store = openMemoryStore(resolved.rootDir);
+  const store = openConfiguredMemoryStore(resolved.rootDir);
   store.init();
   store.close();
   ensureProjectConfig(resolved.rootDir);
@@ -283,7 +251,7 @@ async function runIngest(args: string[], cwd: string, stdout: (line: string) => 
     throw new Error("Usage: code-butler ingest <conversation|git> <path>");
   }
 
-  const store = openMemoryStore(cwd);
+  const store = openConfiguredMemoryStore(cwd);
   store.init();
   try {
     if (kind === "conversation") {
@@ -314,7 +282,7 @@ async function runDecision(args: string[], cwd: string, stdout: (line: string) =
     throw new Error("Usage: code-butler decision <add|import> ...");
   }
 
-  const store = openMemoryStore(cwd);
+  const store = openConfiguredMemoryStore(cwd);
   store.init();
   try {
     if (subcommand === "import") {
@@ -352,169 +320,6 @@ async function runDecision(args: string[], cwd: string, stdout: (line: string) =
   }
 }
 
-async function runMemory(
-  args: string[],
-  cwd: string,
-  stdout: (line: string) => void,
-  options: Pick<CliOptions, "now"> = {}
-): Promise<number> {
-  const [subcommand, ...rest] = args;
-  if (subcommand !== "audit" && subcommand !== "remember" && subcommand !== "status" && subcommand !== "conflicts") {
-    throw new Error("Usage: code-butler memory <audit|remember|status|conflicts> ...");
-  }
-
-  if (subcommand === "remember") {
-    const type = parseMemoryTypeFlag(rest, "--type");
-    const text = parseStringFlag(rest, "--text");
-    const title = parseStringFlag(rest, "--title");
-    const reason = parseStringFlag(rest, "--reason");
-    const relatedFiles = parseRepeatedStringFlag(rest, "--related-file");
-    const supersedesMemoryId = parseStringFlag(rest, "--supersedes");
-    const promote = !rest.includes("--candidate");
-    const allowedFlags = new Set(["--type", "--text", "--title", "--reason", "--related-file", "--candidate", "--supersedes"]);
-    const unknownFlag = rest.find((arg) => arg.startsWith("--") && !allowedFlags.has(arg));
-    if (unknownFlag) throw new Error(`Unknown memory remember option: ${unknownFlag}`);
-    validateFlagArguments(rest, {
-      command: "memory remember",
-      valueFlags: new Set(["--type", "--text", "--title", "--reason", "--related-file", "--supersedes"]),
-      booleanFlags: new Set(["--candidate"])
-    });
-    if (!type || !text) {
-      throw new Error(
-        "Usage: code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>]"
-      );
-    }
-    if (!promote && supersedesMemoryId !== undefined) {
-      throw new Error("Superseding a durable memory requires promotion");
-    }
-
-    const store = openMemoryStore(cwd);
-    store.init();
-    try {
-      const remembered = rememberProjectMemory(
-        store,
-        {
-          type,
-          text,
-          ...(title === undefined ? {} : { title }),
-          ...(reason === undefined ? {} : { reason }),
-          relatedFiles,
-          promote,
-          ...(supersedesMemoryId === undefined ? {} : { supersedesMemoryId })
-        },
-        options.now === undefined ? {} : { now: options.now }
-      );
-      const memoryId = remembered.memory?.id ?? remembered.candidate.id;
-      const state = remembered.memory ? "promoted" : "candidate";
-      stdout(`Remembered ${type} memory ${memoryId} (${state})`);
-      return 0;
-    } finally {
-      store.close();
-    }
-  }
-
-  if (subcommand === "status") {
-    const allowedFlags = new Set(["--id", "--status", "--reason", "--replacement"]);
-    const unknownFlag = rest.find((arg) => arg.startsWith("--") && !allowedFlags.has(arg));
-    if (unknownFlag) throw new Error(`Unknown memory status option: ${unknownFlag}`);
-    validateFlagArguments(rest, {
-      command: "memory status",
-      valueFlags: allowedFlags,
-      booleanFlags: new Set()
-    });
-    const memoryId = parseStringFlag(rest, "--id");
-    const status = parseMemoryLifecycleStatusFlag(rest, "--status");
-    const rawReason = parseStringFlag(rest, "--reason");
-    const reason = rawReason?.trim();
-    const replacementMemoryId = parseStringFlag(rest, "--replacement");
-    if (!memoryId || !status || !reason) {
-      if (rawReason !== undefined && !reason) throw new Error("Lifecycle status reason is required");
-      throw new Error("Usage: code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]");
-    }
-    if (status === "superseded" && replacementMemoryId === undefined) {
-      throw new Error("Superseded status requires --replacement");
-    }
-    if (status !== "superseded" && replacementMemoryId !== undefined) {
-      throw new Error("--replacement is only allowed with superseded status");
-    }
-
-    const store = openMemoryStore(cwd);
-    store.init();
-    try {
-      const memory = updateMemoryStatus(store, {
-        memoryId,
-        status,
-        reason,
-        ...(replacementMemoryId === undefined ? {} : { replacementMemoryId }),
-        now: (options.now?.() ?? new Date()).toISOString()
-      });
-      const relationCount = store.listMemoryRelations().filter((relation) =>
-        relation.fromMemoryId === memory.id || relation.toMemoryId === memory.id
-      ).length;
-      stdout(`Memory ${memory.id} status=${memory.lifecycleStatus} replacement=${replacementMemoryId ?? "none"} relations=${relationCount}`);
-      return 0;
-    } finally {
-      store.close();
-    }
-  }
-
-  if (subcommand === "conflicts") {
-    const allowedFlags = new Set(["--fix", "--json"]);
-    const unknownFlag = rest.find((arg) => arg.startsWith("--") && !allowedFlags.has(arg));
-    if (unknownFlag) throw new Error(`Unknown memory conflicts option: ${unknownFlag}`);
-    validateFlagArguments(rest, {
-      command: "memory conflicts",
-      valueFlags: new Set(),
-      booleanFlags: allowedFlags
-    });
-    const fix = rest.includes("--fix");
-    const json = rest.includes("--json");
-    const store = openMemoryStore(cwd);
-    store.init();
-    try {
-      const result = auditMemoryConflicts(store, {
-        fix,
-        ...(options.now === undefined ? {} : { now: options.now().toISOString() })
-      });
-      if (json) {
-        stdout(JSON.stringify(result, null, 2));
-        return 0;
-      }
-      const additions = result.changes.filter((change) => change.kind === "add_relation").length;
-      const removals = result.changes.filter((change) => change.kind === "remove_relation").length;
-      const updates = result.changes.filter((change) => change.kind === "update_quality").length;
-      stdout("Memory Conflicts");
-      stdout(`scanned=${result.scannedMemories} groups=${result.scannedGroups} conflicts=${result.conflictPairs.length} add=${additions} remove=${removals} change=${updates} applied=${fix ? "yes" : "no"}`);
-      return 0;
-    } finally {
-      store.close();
-    }
-  }
-
-  const fix = rest.includes("--fix");
-  const json = rest.includes("--json");
-  const unknownFlag = rest.find((arg) => arg.startsWith("--") && arg !== "--fix" && arg !== "--json");
-  if (unknownFlag) throw new Error(`Unknown memory audit option: ${unknownFlag}`);
-
-  const store = openMemoryStore(cwd);
-  store.init();
-  try {
-    const result = auditMemoryQuality(store, { fix });
-    if (json) {
-      stdout(JSON.stringify(result, null, 2));
-      return 0;
-    }
-    stdout("Memory Audit");
-    stdout(`scanned=${result.scanned} active=${result.active} needs_review=${result.needsReview} quarantined=${result.quarantined} updated=${result.updated}`);
-    for (const reason of result.topReasons) {
-      stdout(`reason ${reason.reason}=${reason.count}`);
-    }
-    return 0;
-  } finally {
-    store.close();
-  }
-}
-
 function runDoctorCli(
   args: string[],
   cwd: string,
@@ -539,7 +344,7 @@ function runDoctorCli(
 async function runSync(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
   const source = parseSyncSourceFlag(args);
 
-  const store = openMemoryStore(cwd);
+  const store = openConfiguredMemoryStore(cwd);
   store.init();
   try {
     const config = loadProjectConfig(cwd);
@@ -547,38 +352,6 @@ async function runSync(args: string[], cwd: string, stdout: (line: string) => vo
     stdout(
       `Synced project memory (git=${result.sources.git.imported}, codex=${result.sources.codex.imported}, claude=${result.sources.claude.imported}, promoted=${result.memories.promoted})`
     );
-    return 0;
-  } finally {
-    store.close();
-  }
-}
-
-async function runSources(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
-  const [subcommand] = args;
-  if (subcommand !== "status") {
-    throw new Error("Usage: code-butler sources status");
-  }
-
-  const store = openMemoryStore(cwd);
-  store.init();
-  try {
-    const config = loadProjectConfig(cwd);
-    const codex = getCodexSourceStatus(store, config.sources.codex, config.sources.git.repoPath);
-    const claude = getClaudeSourceStatus(store, config.sources.claude, config.sources.git.repoPath);
-    const conversationCount = countWhere(store, "sources", "type = 'conversation'");
-    const chunkCount = countRows(store, "chunks");
-    const promotedCount = countRows(store, "memories");
-    const candidateCount = countRows(store, "memory_candidates");
-
-    stdout("Source Status");
-    stdout(`Project root: ${config.sources.git.repoPath}`);
-    stdout(`Conversations in SQLite: ${conversationCount}`);
-    stdout(`Chunks in SQLite: ${chunkCount}`);
-    stdout(`Memories in SQLite: promoted=${promotedCount}, candidates=${candidateCount}`);
-    stdout(formatConversationStatus(codex.source, codex.enabled, codex.projectOnly, codex.totals));
-    for (const root of codex.roots) stdout(formatRootStatus(root));
-    stdout(formatConversationStatus(claude.source, claude.enabled, claude.projectOnly, claude.totals));
-    for (const root of claude.roots) stdout(formatRootStatus(root));
     return 0;
   } finally {
     store.close();
@@ -599,7 +372,7 @@ async function runProjectSummary(
   if (subcommand === "status") {
     const statusOptions: { now?: () => Date } = {};
     if (options.now !== undefined) statusOptions.now = options.now;
-    const store = openMemoryStore(cwd);
+    const store = openConfiguredMemoryStore(cwd);
     store.init();
     try {
       const config = loadProjectConfig(cwd);
@@ -610,6 +383,8 @@ async function runProjectSummary(
       stdout(`metaPath=${relativeSummaryPath(cwd, status.metaPath)}`);
       stdout(`exists=${status.exists}`);
       stdout(`due=${status.due} stale=${status.stale}`);
+      stdout(`manualEditsDetected=${status.manualEditsDetected}`);
+      stdout(`outputBaselineMissing=${status.outputBaselineMissing}`);
       stdout(`fingerprint=${status.fingerprint ?? "none"}`);
       if (status.currentFingerprint) stdout(`currentFingerprint=${status.currentFingerprint}`);
       stdout(`lastGeneratedAt=${status.lastGeneratedAt ?? "never"}`);
@@ -621,7 +396,7 @@ async function runProjectSummary(
     }
   }
 
-  const store = openMemoryStore(cwd);
+  const store = openConfiguredMemoryStore(cwd);
   store.init();
   try {
     const config = loadProjectConfig(cwd);
@@ -634,7 +409,9 @@ async function runProjectSummary(
       stdout(`Refreshed project summary at ${relativeSummaryPath(cwd, result.summaryPath)}`);
     } else {
       stdout(`Project summary unchanged at ${relativeSummaryPath(cwd, result.summaryPath)}`);
+      if (result.skippedReason) stdout(`reason=${result.skippedReason}`);
     }
+    if (result.backupPath) stdout(`backupPath=${relativeSummaryPath(cwd, result.backupPath)}`);
     return 0;
   } finally {
     store.close();
@@ -664,7 +441,7 @@ async function runWatch(
 
   const source = parseSyncSourceFlag(args);
   const intervalSeconds = parseNumberFlag(args, "--interval") ?? 30;
-  const store = openMemoryStore(cwd);
+  const store = openConfiguredMemoryStore(cwd);
   store.init();
   const config = loadProjectConfig(cwd);
   let running = false;
@@ -903,39 +680,6 @@ function waitForInterval(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function countRows(store: ReturnType<typeof openMemoryStore>, table: string): number {
-  const row = store.db.prepare(`select count(*) as count from ${table}`).get() as { count: number };
-  return row.count;
-}
-
-function countWhere(store: ReturnType<typeof openMemoryStore>, table: string, where: string): number {
-  const row = store.db.prepare(`select count(*) as count from ${table} where ${where}`).get() as { count: number };
-  return row.count;
-}
-
-function formatConversationStatus(
-  source: string,
-  enabled: boolean,
-  projectOnly: boolean,
-  totals: { found: number; indexed: number; pending: number; ignored: number; parseFailures: number }
-): string {
-  return `${source}: enabled=${enabled} projectOnly=${projectOnly} found=${totals.found} indexed=${totals.indexed} pending=${totals.pending} ignored=${totals.ignored} parseFailures=${totals.parseFailures}`;
-}
-
-function formatRootStatus(root: {
-  root: string;
-  exists: boolean;
-  found: number;
-  indexed: number;
-  pending: number;
-  ignored: number;
-  parseFailures: number;
-  latestLogAt?: string | undefined;
-}): string {
-  const latest = root.latestLogAt ? ` latest=${root.latestLogAt}` : "";
-  return `  root=${root.root} exists=${root.exists} found=${root.found} indexed=${root.indexed} pending=${root.pending} ignored=${root.ignored} parseFailures=${root.parseFailures}${latest}`;
-}
-
 function printDoctorReport(report: DoctorReport, stdout: (line: string) => void): void {
   stdout("Code Butler Doctor");
   stdout(`Project: ${report.projectRoot}`);
@@ -1008,8 +752,15 @@ function usage(): string {
     "  code-butler doctor [--json] [--strict]",
     "  code-butler embeddings build [--json]",
     "  code-butler embeddings status [--json]",
+    "  code-butler privacy audit [--json]",
+    "  code-butler privacy export --output <file> [--raw --confirm-raw-export] [--json]",
+    "  code-butler privacy import --input <file> [--confirm-nonempty] [--json]",
+    "  code-butler privacy scrub [--purge-backups] [--json]",
+    "  code-butler privacy delete --source-id <id> --confirm-delete <id> [--purge-backups] [--json]",
+    "  code-butler privacy prune <--dry-run|--apply> [--purge-backups] [--json]",
     "  code-butler sync [--source <git|codex|claude|all>]",
     "  code-butler sources status",
+    "  code-butler sources failures [--json]",
     "  code-butler watch [--interval <seconds>] [--source <git|codex|claude|all>]",
     "  code-butler watch status",
     "  code-butler watch uninstall",

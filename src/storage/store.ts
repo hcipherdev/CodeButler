@@ -12,7 +12,37 @@ import {
 import { createEvidenceSignature } from "../memory/evidence-signature.js";
 import { createMemorySubjectKey } from "../memory/lifecycle.js";
 import { redactSensitiveText } from "../privacy/redaction.js";
+import type { RedactionPolicy } from "../privacy/policy.js";
+import {
+  beginOperation,
+  completeOperation,
+  createSourceTombstone,
+  failOperation,
+  findSourceTombstone,
+  listOperations
+} from "../operations/log.js";
 import { initializeSchema } from "./migrations.js";
+import { createStorageContentPolicy, type StorageContentPolicy } from "./content-policy.js";
+import {
+  addSourceWithChunks,
+  findSourcesMentioningFile,
+  readChunkWindow,
+  readConversationWindow,
+  readSource,
+  shouldSuppressSourceWrite
+} from "./source-store.js";
+import {
+  addMemoryRelation as addStoredMemoryRelation,
+  deleteMemoryRelation as deleteStoredMemoryRelation,
+  listMemoryRelations as listStoredMemoryRelations,
+  updateMemoryLifecycle as updateStoredMemoryLifecycle
+} from "./lifecycle-store.js";
+import {
+  activateEmbeddingIndexRebuild as activateStoredEmbeddingIndexRebuild,
+  beginEmbeddingIndexRebuild as beginStoredEmbeddingIndexRebuild,
+  listEmbeddingOwners as listStoredEmbeddingOwners,
+  reconcileEmbeddingJobs as reconcileStoredEmbeddingJobs
+} from "./embedding-store.js";
 import { withTransaction } from "./transactions.js";
 import type {
   CommitRecord,
@@ -38,6 +68,7 @@ import type {
   MemorySource,
   MemoryType,
   SearchResult,
+  SourceFailure,
   SourceType,
   SyncCursor,
   SyncSourceName,
@@ -47,6 +78,173 @@ import type {
   TemporaryMemorySearchResult,
   TemporaryMemoryUpsertInput
 } from "../types.js";
+import type {
+  BeginOperationInput,
+  CreateSourceTombstoneInput,
+  FinishOperationInput,
+  ListOperationsInput,
+  OperationLogEntry,
+  OperationType,
+  SourceTombstone
+} from "../operations/types.js";
+
+function sanitizeCommit(policy: StorageContentPolicy, commit: CommitRecord): CommitRecord {
+  return {
+    hash: policy.identifier(commit.hash),
+    authorName: policy.text(commit.authorName),
+    authorEmail: policy.text(commit.authorEmail),
+    authoredAt: commit.authoredAt,
+    message: policy.text(commit.message),
+    changedFiles: commit.changedFiles.map(policy.path),
+    diffSummary: policy.text(commit.diffSummary)
+  };
+}
+
+function sanitizeDecision(policy: StorageContentPolicy, decision: DecisionRecord): DecisionRecord {
+  return {
+    id: policy.identifier(decision.id),
+    topic: policy.text(decision.topic),
+    decision: policy.text(decision.decision),
+    reason: policy.text(decision.reason),
+    status: policy.text(decision.status),
+    evidence: policy.evidence(decision.evidence),
+    createdAt: decision.createdAt
+  };
+}
+
+function sanitizeExtractedMemory(policy: StorageContentPolicy, memory: ExtractedMemory): ExtractedMemory {
+  return {
+    type: memory.type,
+    title: policy.text(memory.title),
+    summary: policy.text(memory.summary),
+    reason: policy.text(memory.reason),
+    confidence: memory.confidence,
+    evidence: policy.evidence(memory.evidence),
+    relatedFiles: memory.relatedFiles.map(policy.path),
+    dedupeKey: policy.identifier(memory.dedupeKey)
+  };
+}
+
+function sanitizeTemporaryMemory(
+  policy: StorageContentPolicy,
+  input: TemporaryMemoryUpsertInput
+): TemporaryMemoryUpsertInput {
+  return {
+    ...(input.id === undefined ? {} : { id: policy.identifier(input.id) }),
+    ...(input.projectId === undefined ? {} : { projectId: policy.path(input.projectId) }),
+    ...(input.threadId === undefined ? {} : { threadId: policy.identifier(input.threadId) }),
+    ...(input.sessionId === undefined ? {} : { sessionId: policy.identifier(input.sessionId) }),
+    ...(input.sourceAdapter === undefined ? {} : { sourceAdapter: policy.text(input.sourceAdapter) }),
+    kind: input.kind,
+    title: policy.text(input.title),
+    summary: policy.text(input.summary),
+    ...(input.details === undefined ? {} : { details: policy.text(input.details) }),
+    ...(input.relatedFiles === undefined ? {} : { relatedFiles: input.relatedFiles.map(policy.path) }),
+    ...(input.evidence === undefined ? {} : { evidence: policy.evidence(input.evidence) }),
+    ...(input.confidence === undefined ? {} : { confidence: input.confidence }),
+    ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
+    ...(input.updatedAt === undefined ? {} : { updatedAt: input.updatedAt }),
+    ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt })
+  };
+}
+
+function sanitizeEntityRef(
+  policy: StorageContentPolicy,
+  entity: InvestigationEntityRef
+): InvestigationEntityRef {
+  if (entity.entityType === "file") {
+    return { ...entity, entityId: policy.path(entity.entityId) };
+  }
+  if (entity.entityType === "chunk") {
+    return { ...entity, entityId: policy.locator(entity.entityId) };
+  }
+  return { ...entity, entityId: policy.identifier(entity.entityId) };
+}
+
+function sanitizeEmbeddingOwnerId(
+  policy: StorageContentPolicy,
+  ownerKind: EmbeddingOwnerKind | undefined,
+  ownerId: string
+): string {
+  return ownerKind === "chunk" || /:chunk:\d+$/.test(ownerId)
+    ? policy.locator(ownerId)
+    : policy.identifier(ownerId);
+}
+
+function sanitizeEmbeddingVectorInput<T extends Omit<EmbeddingVector, "createdAt" | "updatedAt">>(
+  policy: StorageContentPolicy,
+  input: T
+): T {
+  return {
+    ...input,
+    ownerId: sanitizeEmbeddingOwnerId(policy, input.ownerKind, input.ownerId),
+    model: policy.text(input.model)
+  };
+}
+
+function createDurableContentPolicy(
+  db: DatabaseSync,
+  base: StorageContentPolicy
+): StorageContentPolicy {
+  const identifier = (raw: string): string => {
+    const rawHash = createEmbeddingContentHash(raw);
+    if (hasPrivateIdentityTable(db)) {
+      const existing = db.prepare(
+        "select stored_identity from private_identity_mappings where raw_hash = ?"
+      ).get(rawHash) as { stored_identity: string } | undefined;
+      if (existing) return existing.stored_identity;
+    }
+    const stored = base.identifier(raw);
+    if (stored !== raw && hasPrivateIdentityTable(db)) {
+      db.prepare(
+        `insert into private_identity_mappings (raw_hash, stored_identity, created_at)
+         values (?, ?, ?)
+         on conflict(raw_hash) do nothing`
+      ).run(rawHash, stored, new Date().toISOString());
+    }
+    return stored;
+  };
+  const locator = (raw: string): string => {
+    const chunk = /^(.*):chunk:(\d+)$/.exec(raw);
+    return chunk ? `${identifier(chunk[1] ?? "")}:chunk:${chunk[2]}` : identifier(raw);
+  };
+  const json = <T>(value: T): T => sanitizeStoredJson(value, base.text, identifier) as T;
+  return Object.freeze({
+    privacyPolicy: base.privacyPolicy,
+    text: base.text,
+    identifier,
+    locator,
+    path: identifier,
+    json,
+    evidence: (value: readonly EvidenceRef[]) => value.map((item: EvidenceRef) => ({
+      sourceType: item.sourceType,
+      sourceId: identifier(item.sourceId),
+      ...(item.locator === undefined ? {} : { locator: locator(item.locator) })
+    }))
+  });
+}
+
+function hasPrivateIdentityTable(db: DatabaseSync): boolean {
+  return Boolean(db.prepare(
+    "select 1 from sqlite_master where type = 'table' and name = 'private_identity_mappings'"
+  ).get());
+}
+
+function sanitizeStoredJson(
+  value: unknown,
+  text: (value: string) => string,
+  identifier: (value: string) => string
+): unknown {
+  if (typeof value === "string") return text(value);
+  if (Array.isArray(value)) return value.map((item) => sanitizeStoredJson(item, text, identifier));
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      identifier(key),
+      sanitizeStoredJson(item, text, identifier)
+    ])
+  );
+}
 
 export interface AddSourceInput {
   source: MemorySource;
@@ -79,6 +277,12 @@ export type MemoryLifecycleStatusFilter = MemoryLifecycleStatus | "all";
 export interface MemoryStore {
   init(): void;
   close(): void;
+  beginOperation<T extends OperationType>(input: BeginOperationInput<T>): OperationLogEntry<T>;
+  completeOperation(id: string, input?: FinishOperationInput): OperationLogEntry;
+  failOperation(id: string, input?: FinishOperationInput): OperationLogEntry;
+  listOperations(input?: ListOperationsInput): OperationLogEntry[];
+  createSourceTombstone(input: CreateSourceTombstoneInput): SourceTombstone;
+  findSourceTombstone(sourceType: SourceType, sourceId: string): SourceTombstone | undefined;
   addSourceWithChunks(input: AddSourceInput): string;
   readSource(sourceId: string): MemorySource | undefined;
   readChunkWindow(sourceId: string, chunkIndex: number, before: number, after: number): MemoryChunk[];
@@ -96,6 +300,19 @@ export interface MemoryStore {
   recordSyncStatus(status: SyncStatus): void;
   getSyncStatus(source: SyncSourceName): SyncStatus | undefined;
   listSyncStatuses(): SyncStatus[];
+  recordSourceFailure(input: {
+    adapter: SyncSourceName;
+    path: string;
+    errorCode: string;
+    message: string;
+    occurredAt?: string;
+  }): SourceFailure;
+  resolveSourceFailures(adapter: SyncSourceName, path: string, resolvedAt?: string): number;
+  listSourceFailures(input?: {
+    adapter?: SyncSourceName;
+    resolved?: boolean;
+    limit?: number | null;
+  }): SourceFailure[];
   listEmbeddingOwners(): EmbeddingOwner[];
   reconcileEmbeddingJobs(input: {
     providerKey: string;
@@ -237,6 +454,7 @@ export interface MemoryStore {
   }): MemorySearchResult[];
   readMemorySearchResultsByIds(memoryIds: string[]): MemorySearchResult[];
   getProjectSummary(): ProjectSummary;
+  readonly contentPolicy: StorageContentPolicy;
   db: DatabaseSync;
   paths: {
     rootDir: string;
@@ -247,15 +465,6 @@ export interface MemoryStore {
   };
 }
 
-interface SourceRow {
-  id: string;
-  type: SourceType;
-  title: string;
-  origin: string;
-  raw_content: string;
-  metadata_json: string;
-}
-
 interface SearchRow {
   chunk_id: string;
   source_id: string;
@@ -264,14 +473,6 @@ interface SearchRow {
   text: string;
   metadata_json: string;
   score: number;
-}
-
-interface ChunkRow {
-  id: string;
-  source_id: string;
-  chunk_index: number;
-  text: string;
-  metadata_json: string;
 }
 
 interface CommitRow {
@@ -298,6 +499,18 @@ interface SyncStatusRow {
   last_success_at: string | null;
   last_error: string | null;
   metadata_json: string;
+}
+
+interface SourceFailureRow {
+  id: string;
+  adapter: SyncSourceName;
+  path: string;
+  error_code: string;
+  message: string;
+  first_occurred_at: string;
+  last_occurred_at: string;
+  attempts: number;
+  resolved_at: string | null;
 }
 
 interface MemoryCandidateRow {
@@ -375,15 +588,6 @@ interface RelationRow {
   locator: string | null;
 }
 
-interface MemoryRelationRow {
-  id: string;
-  from_memory_id: string;
-  to_memory_id: string;
-  relation_type: MemoryRelationType;
-  created_at: string;
-  reason: string | null;
-}
-
 interface EmbeddingJobRow {
   owner_kind: EmbeddingOwnerKind;
   owner_id: string;
@@ -429,7 +633,19 @@ const TEMPORARY_MEMORY_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 const TEMPORARY_MEMORY_MAX_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const SQLITE_READ_BATCH_SIZE = 500;
 
-export function openMemoryStore(rootDir: string): MemoryStore {
+export interface OpenMemoryStoreOptions {
+  readonly privacyPolicy?: RedactionPolicy;
+  readonly backupRetention?: number;
+}
+
+export class MemoryStoreCheckpointBusyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MemoryStoreCheckpointBusyError";
+  }
+}
+
+export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions = {}): MemoryStore {
   const dataDir = basename(rootDir) === ".code-butler" ? rootDir : join(rootDir, ".code-butler");
   const conversationsDir = join(dataDir, "imports", "conversations");
   const decisionsDir = join(dataDir, "decisions");
@@ -440,9 +656,13 @@ export function openMemoryStore(rootDir: string): MemoryStore {
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA journal_mode = WAL");
+  const baseContentPolicy = createStorageContentPolicy(options.privacyPolicy);
+  const contentPolicy = createDurableContentPolicy(db, baseContentPolicy);
+  const backupRetention = options.backupRetention;
 
   const store: MemoryStore = {
     db,
+    contentPolicy,
     paths: {
       rootDir,
       dataDir,
@@ -453,100 +673,49 @@ export function openMemoryStore(rootDir: string): MemoryStore {
     init() {
       mkdirSync(conversationsDir, { recursive: true });
       mkdirSync(decisionsDir, { recursive: true });
-      initializeSchema(db, databasePath);
+      initializeSchema(db, databasePath, backupRetention === undefined ? {} : { backupRetention });
     },
     close() {
+      const checkpoint = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+      if (checkpoint.busy !== 0) {
+        throw new MemoryStoreCheckpointBusyError(
+          "Cannot safely close Code Butler memory database: another SQLite reader prevented WAL checkpointing. Close the reader and retry before committing or syncing this project."
+        );
+      }
       db.close();
     },
-    addSourceWithChunks(input) {
-      return withTransaction(db, () => {
-        const sourceId = input.source.id ?? createId(input.source.type);
-        const metadataJson = JSON.stringify(input.source.metadata ?? {});
-        db.prepare(
-          `insert into sources (id, type, title, origin, raw_content, metadata_json, created_at)
-           values (?, ?, ?, ?, ?, ?, ?)
-           on conflict(id) do update set
-             type = excluded.type,
-             title = excluded.title,
-             origin = excluded.origin,
-             raw_content = excluded.raw_content,
-             metadata_json = excluded.metadata_json`
-        ).run(
-          sourceId,
-          input.source.type,
-          input.source.title,
-          input.source.origin,
-          input.source.rawContent,
-          metadataJson,
-          new Date().toISOString()
-        );
-
-        db.prepare("delete from chunks_fts where source_id = ?").run(sourceId);
-        db.prepare("delete from chunks where source_id = ?").run(sourceId);
-
-        const insertChunk = db.prepare(
-          `insert into chunks (id, source_id, chunk_index, text, metadata_json)
-           values (?, ?, ?, ?, ?)`
-        );
-        const insertFts = db.prepare(
-          `insert into chunks_fts (chunk_id, source_id, source_type, title, text)
-           values (?, ?, ?, ?, ?)`
-        );
-
-        for (const [index, chunk] of input.chunks.entries()) {
-          const chunkId = `${sourceId}:chunk:${index}`;
-          insertChunk.run(
-            chunkId,
-            sourceId,
-            index,
-            chunk.text,
-            JSON.stringify(chunk.metadata ?? {})
-          );
-          insertFts.run(chunkId, sourceId, input.source.type, input.source.title, chunk.text);
-        }
-
-        rebuildSourceRelations(db, sourceId, input.source, input.chunks);
-
-        return sourceId;
+    beginOperation(input) {
+      return beginOperation(db, input);
+    },
+    completeOperation(id, input = {}) {
+      return completeOperation(db, id, input);
+    },
+    failOperation(id, input = {}) {
+      return failOperation(db, id, input);
+    },
+    listOperations(input = {}) {
+      return listOperations(db, input);
+    },
+    createSourceTombstone(input) {
+      return createSourceTombstone(db, {
+        ...input,
+        sourceId: contentPolicy.identifier(input.sourceId)
       });
     },
+    findSourceTombstone(sourceType, sourceId) {
+      return findSourceTombstone(db, sourceType, contentPolicy.identifier(sourceId));
+    },
+    addSourceWithChunks(input) {
+      return addSourceWithChunks(db, contentPolicy, input);
+    },
     readSource(sourceId) {
-      const row = db
-        .prepare("select id, type, title, origin, raw_content, metadata_json from sources where id = ?")
-        .get(sourceId) as SourceRow | undefined;
-      if (!row) return undefined;
-      return {
-        id: row.id,
-        type: row.type,
-        title: row.title,
-        origin: row.origin,
-        rawContent: row.raw_content,
-        metadata: parseJsonObject(row.metadata_json)
-      };
+      return readSource(db, contentPolicy, sourceId);
     },
     readChunkWindow(sourceId, chunkIndex, before, after) {
-      const start = Math.max(0, chunkIndex - Math.max(0, before));
-      const end = chunkIndex + Math.max(0, after);
-      const rows = db
-        .prepare(
-          `select id, source_id, chunk_index, text, metadata_json
-           from chunks
-           where source_id = ? and chunk_index between ? and ?
-           order by chunk_index asc`
-        )
-        .all(sourceId, start, end) as unknown as ChunkRow[];
-      return rows.map(chunkFromRow);
+      return readChunkWindow(db, contentPolicy, sourceId, chunkIndex, before, after);
     },
     readConversationWindow(sourceId, anchorChunkId, before, after) {
-      const anchor = db
-        .prepare(
-          `select id, source_id, chunk_index, text, metadata_json
-           from chunks
-           where id = ? and source_id = ?`
-        )
-        .get(anchorChunkId, sourceId) as ChunkRow | undefined;
-      if (!anchor) return [];
-      return store.readChunkWindow(sourceId, anchor.chunk_index, before, after);
+      return readConversationWindow(db, contentPolicy, sourceId, anchorChunkId, before, after);
     },
     search(input) {
       const query = toFtsQuery(input.query);
@@ -620,6 +789,10 @@ export function openMemoryStore(rootDir: string): MemoryStore {
     },
     addCommit(commit) {
       return withTransaction(db, () => {
+        if (shouldSuppressSourceWrite(db, "commit", commit.hash, contentPolicy.identifier)) {
+          return contentPolicy.identifier(commit.hash);
+        }
+        commit = sanitizeCommit(contentPolicy, commit);
         db.prepare(
           `insert into commits
              (hash, author_name, author_email, authored_at, message, changed_files_json, diff_summary)
@@ -667,6 +840,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       });
     },
     readCommit(hash) {
+      hash = contentPolicy.identifier(hash);
       const row = db
         .prepare(
           `select hash, author_name, author_email, authored_at, message, changed_files_json, diff_summary
@@ -685,7 +859,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         )
         .all() as unknown as CommitRow[];
       const query = input.query?.toLowerCase();
-      const filePath = input.filePath;
+      const filePath = input.filePath === undefined ? undefined : contentPolicy.path(input.filePath);
       const limit = normalizeLimit(input.limit);
 
       return rows
@@ -706,6 +880,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .slice(0, limit);
     },
     getEntityLinks(entity) {
+      entity = sanitizeEntityRef(contentPolicy, entity);
       const relationRows = db
         .prepare(
           `select from_type, from_id, relation, to_type, to_id, locator
@@ -819,19 +994,10 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       return dedupeEntityLinks(links);
     },
     findSourcesMentioningFile(filePath, limit) {
-      const rows = db
-        .prepare(
-          `select distinct s.id, s.type, s.title, s.origin, s.raw_content, s.metadata_json
-           from relations r
-           join sources s on s.id = r.from_id
-           where r.from_type = 'source' and r.relation = 'mentions' and r.to_type = 'file' and r.to_id = ?
-           order by s.created_at desc, s.id asc
-           limit ?`
-        )
-        .all(filePath, normalizeLimit(limit)) as unknown as SourceRow[];
-      return rows.map(sourceFromRow);
+      return findSourcesMentioningFile(db, contentPolicy, filePath, limit);
     },
     findMemoriesByEvidence(sourceType, sourceId, limit) {
+      sourceId = contentPolicy.identifier(sourceId);
       const normalizedLimit = normalizeLimit(limit);
       const promoted = store
         .listMemories({ status: "promoted", limit: normalizedLimit * 2 })
@@ -854,9 +1020,10 @@ export function openMemoryStore(rootDir: string): MemoryStore {
          on conflict(source, cursor_key) do update set
            cursor_value = excluded.cursor_value,
            updated_at = excluded.updated_at`
-      ).run(source, cursorKey, cursorValue, new Date().toISOString());
+      ).run(source, contentPolicy.identifier(cursorKey), contentPolicy.text(cursorValue), new Date().toISOString());
     },
     getSyncCursor(source, cursorKey) {
+      cursorKey = contentPolicy.identifier(cursorKey);
       const row = db
         .prepare(
           `select source, cursor_key, cursor_value, updated_at
@@ -873,6 +1040,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       };
     },
     recordSyncStatus(status) {
+      const lastError = status.lastError === undefined ? undefined : contentPolicy.text(status.lastError);
+      const metadata = contentPolicy.json(status.metadata ?? {});
       db.prepare(
         `insert into sync_sources (source, enabled, last_sync_at, last_success_at, last_error, metadata_json)
          values (?, ?, ?, ?, ?, ?)
@@ -887,8 +1056,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         status.enabled ? 1 : 0,
         status.lastSyncAt ?? null,
         status.lastSuccessAt ?? null,
-        status.lastError ?? null,
-        JSON.stringify(status.metadata ?? {})
+        lastError ?? null,
+        JSON.stringify(metadata)
       );
     },
     getSyncStatus(source) {
@@ -911,197 +1080,64 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .all() as unknown as SyncStatusRow[];
       return rows.map(syncStatusFromRow);
     },
+    recordSourceFailure(input) {
+      const occurredAt = input.occurredAt ?? new Date().toISOString();
+      const path = contentPolicy.path(input.path);
+      const errorCode = contentPolicy.identifier(input.errorCode);
+      const message = contentPolicy.text(sanitizeSourceFailureMessage(input.message));
+      db.prepare(
+        `insert into source_failures (
+           id, adapter, path, error_code, message, first_occurred_at, last_occurred_at, attempts, resolved_at
+         ) values (?, ?, ?, ?, ?, ?, ?, 1, null)
+         on conflict(adapter, path, error_code) do update set
+           message = excluded.message,
+           last_occurred_at = excluded.last_occurred_at,
+           attempts = source_failures.attempts + 1,
+           resolved_at = null`
+      ).run(randomUUID(), input.adapter, path, errorCode, message, occurredAt, occurredAt);
+      const row = db.prepare(
+        `select id, adapter, path, error_code, message, first_occurred_at, last_occurred_at, attempts, resolved_at
+         from source_failures where adapter = ? and path = ? and error_code = ?`
+      ).get(input.adapter, path, errorCode) as unknown as SourceFailureRow;
+      return sourceFailureFromRow(row);
+    },
+    resolveSourceFailures(adapter, path, resolvedAt) {
+      path = contentPolicy.path(path);
+      const result = db.prepare(
+        `update source_failures set resolved_at = ?
+         where adapter = ? and path = ? and resolved_at is null`
+      ).run(resolvedAt ?? new Date().toISOString(), adapter, path);
+      return Number(result.changes);
+    },
+    listSourceFailures(input = {}) {
+      const conditions: string[] = [];
+      const parameters: Array<string | number> = [];
+      if (input.adapter !== undefined) {
+        conditions.push("adapter = ?");
+        parameters.push(input.adapter);
+      }
+      conditions.push(input.resolved === true ? "resolved_at is not null" : "resolved_at is null");
+      const where = conditions.length > 0 ? `where ${conditions.join(" and ")}` : "";
+      parameters.push(input.limit === null ? -1 : normalizeLimit(input.limit));
+      const rows = db.prepare(
+        `select id, adapter, path, error_code, message, first_occurred_at, last_occurred_at, attempts, resolved_at
+         from source_failures ${where}
+         order by last_occurred_at desc, adapter asc, path asc, error_code asc
+         limit ?`
+      ).all(...parameters) as unknown as SourceFailureRow[];
+      return rows.map(sourceFailureFromRow);
+    },
     listEmbeddingOwners() {
-      const chunks = db.prepare(
-        `select id, text from chunks order by id asc`
-      ).all() as Array<{ id: string; text: string }>;
-      const memories = db.prepare(
-        `select id, title, summary, reason, lifecycle_generation
-         from memories
-         where lifecycle_status = 'current'
-         order by id asc`
-      ).all() as Array<{
-        id: string;
-        title: string;
-        summary: string;
-        reason: string;
-        lifecycle_generation: string;
-      }>;
-      return [
-        ...chunks.map<EmbeddingOwner>((row) => ({
-          ownerKind: "chunk",
-          ownerId: row.id,
-          text: row.text,
-          contentHash: createEmbeddingContentHash(row.text),
-          ownerVersion: ""
-        })),
-        ...memories.map<EmbeddingOwner>((row) => {
-          const text = [row.title, row.summary, row.reason].join("\n\n");
-          return {
-            ownerKind: "memory",
-            ownerId: row.id,
-            text,
-            contentHash: createEmbeddingContentHash(text),
-            ownerVersion: row.lifecycle_generation
-          };
-        })
-      ];
+      return listStoredEmbeddingOwners(db);
     },
     reconcileEmbeddingJobs(input) {
-      validateProviderKey(input);
-      return withTransaction(db, () => {
-        const owners = store.listEmbeddingOwners();
-        const eligible = new Map(
-          owners.map((owner) => [
-            embeddingOwnerIdentity(owner.ownerKind, owner.ownerId, owner.contentHash),
-            owner.ownerVersion
-          ])
-        );
-        let removedJobs = 0;
-        const jobs = db.prepare(
-          `select owner_kind, owner_id, content_hash, owner_version
-           from embedding_jobs where provider_key = ?`
-        ).all(input.providerKey) as Array<{
-          owner_kind: EmbeddingOwnerKind;
-          owner_id: string;
-          content_hash: string;
-          owner_version: string;
-        }>;
-        const deleteJob = db.prepare(
-          `delete from embedding_jobs
-           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_key = ?`
-        );
-        for (const job of jobs) {
-          const identity = embeddingOwnerIdentity(job.owner_kind, job.owner_id, job.content_hash);
-          if (eligible.get(identity) === job.owner_version) continue;
-          removedJobs += Number(deleteJob.run(
-            job.owner_kind,
-            job.owner_id,
-            job.content_hash,
-            input.providerKey
-          ).changes);
-        }
-
-        let removedVectors = 0;
-        const vectors = db.prepare(
-          `select owner_kind, owner_id, content_hash, owner_version, provider_fingerprint
-           from embedding_vectors where provider_key = ?`
-        ).all(input.providerKey) as Array<{
-          owner_kind: EmbeddingOwnerKind;
-          owner_id: string;
-          content_hash: string;
-          owner_version: string;
-          provider_fingerprint: string;
-        }>;
-        const deleteVector = db.prepare(
-          `delete from embedding_vectors
-           where owner_kind = ? and owner_id = ? and content_hash = ? and provider_fingerprint = ?`
-        );
-        for (const vector of vectors) {
-          const identity = embeddingOwnerIdentity(vector.owner_kind, vector.owner_id, vector.content_hash);
-          if (eligible.get(identity) === vector.owner_version) continue;
-          removedVectors += Number(deleteVector.run(
-            vector.owner_kind,
-            vector.owner_id,
-            vector.content_hash,
-            vector.provider_fingerprint
-          ).changes);
-        }
-
-        const now = new Date().toISOString();
-        const insert = db.prepare(
-          `insert into embedding_jobs
-             (owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model,
-              state, attempts, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
-           on conflict(owner_kind, owner_id, content_hash, provider_key) do nothing`
-        );
-        let enqueued = 0;
-        for (const owner of owners) {
-          enqueued += Number(insert.run(
-            owner.ownerKind,
-            owner.ownerId,
-            owner.contentHash,
-            owner.ownerVersion,
-            input.providerKey,
-            input.endpointHash,
-            input.model,
-            now,
-            now
-          ).changes);
-        }
-        return { enqueued, removedJobs, removedVectors };
-      });
+      return reconcileStoredEmbeddingJobs(db, contentPolicy, input);
     },
     beginEmbeddingIndexRebuild(input) {
-      validateProviderKey(input);
-      return withTransaction(db, () => {
-        const rebuildToken = randomUUID();
-        const removedVectors = Number(db.prepare(
-          "delete from embedding_vectors where provider_key = ?"
-        ).run(input.providerKey).changes);
-        const now = new Date().toISOString();
-        const requeue = db.prepare(
-          `insert into embedding_jobs
-             (owner_kind, owner_id, content_hash, owner_version, provider_key, endpoint_hash, model,
-              index_generation, target_fingerprint, state, attempts, provider_fingerprint,
-              last_error, created_at, updated_at, completed_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, null, 'pending', 0, null, null, ?, ?, null)
-           on conflict(owner_kind, owner_id, content_hash, provider_key) do update set
-             owner_version = excluded.owner_version,
-             endpoint_hash = excluded.endpoint_hash,
-             model = excluded.model,
-             index_generation = excluded.index_generation,
-             target_fingerprint = null,
-             state = 'pending',
-             provider_fingerprint = null,
-             last_error = null,
-             updated_at = excluded.updated_at,
-             completed_at = null`
-        );
-        let requeued = 0;
-        for (const owner of store.listEmbeddingOwners()) {
-          requeued += Number(requeue.run(
-            owner.ownerKind,
-            owner.ownerId,
-            owner.contentHash,
-            owner.ownerVersion,
-            input.providerKey,
-            input.endpointHash,
-            input.model,
-            rebuildToken,
-            now,
-            now
-          ).changes);
-        }
-        return { removedVectors, requeued, rebuildToken };
-      });
+      return beginStoredEmbeddingIndexRebuild(db, contentPolicy, input);
     },
     activateEmbeddingIndexRebuild(input) {
-      if (!input.rebuildToken.trim()) throw new Error("Embedding rebuild token is required");
-      if (!/^[a-f0-9]{64}$/.test(input.providerFingerprint)) {
-        throw new Error("Embedding rebuild target fingerprint is invalid");
-      }
-      return withTransaction(db, () => {
-        const rows = db.prepare(
-          `select distinct target_fingerprint
-           from embedding_jobs
-           where provider_key = ? and index_generation = ?`
-        ).all(input.providerKey, input.rebuildToken) as Array<{ target_fingerprint: string | null }>;
-        if (rows.length === 0) throw new Error("Embedding rebuild generation is no longer active");
-        if (rows.some((row) => row.target_fingerprint !== null && row.target_fingerprint !== input.providerFingerprint)) {
-          throw new Error("Embedding rebuild generation already has a different target fingerprint");
-        }
-        return Number(db.prepare(
-          `update embedding_jobs set target_fingerprint = ?, updated_at = ?
-           where provider_key = ? and index_generation = ?`
-        ).run(
-          input.providerFingerprint,
-          new Date().toISOString(),
-          input.providerKey,
-          input.rebuildToken
-        ).changes);
-      });
+      return activateStoredEmbeddingIndexRebuild(db, input);
     },
     listEmbeddingJobs(input = {}) {
       const predicates: string[] = [];
@@ -1120,7 +1156,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       }
       if (input.ownerId !== undefined) {
         predicates.push("owner_id = ?");
-        parameters.push(input.ownerId);
+        parameters.push(sanitizeEmbeddingOwnerId(contentPolicy, input.ownerKind, input.ownerId));
       }
       const where = predicates.length > 0 ? `where ${predicates.join(" and ")}` : "";
       const rows = db.prepare(
@@ -1133,6 +1169,10 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       return rows.map(embeddingJobFromRow);
     },
     recordEmbeddingJobAttempts(inputs) {
+      inputs = inputs.map((input) => ({
+        ...input,
+        ownerId: sanitizeEmbeddingOwnerId(contentPolicy, input.ownerKind, input.ownerId)
+      }));
       withTransaction(db, () => {
         const readJob = db.prepare(
           `select owner_version, index_generation, target_fingerprint, state from embedding_jobs
@@ -1183,6 +1223,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
     },
     completeEmbeddingJob(input) {
       validateEmbeddingVectorInput(input);
+      input = sanitizeEmbeddingVectorInput(contentPolicy, input);
       withTransaction(db, () => {
         const job = db.prepare(
           `select endpoint_hash, model, owner_version, index_generation, target_fingerprint, state
@@ -1247,6 +1288,11 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       });
     },
     markEmbeddingJobFailed(input) {
+      input = {
+        ...input,
+        ownerId: sanitizeEmbeddingOwnerId(contentPolicy, input.ownerKind, input.ownerId),
+        error: contentPolicy.text(input.error)
+      };
       withTransaction(db, () => {
         const job = db.prepare(
           `select owner_version, index_generation, target_fingerprint, state from embedding_jobs
@@ -1294,6 +1340,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
     },
     upsertEmbeddingVector(input) {
       validateEmbeddingVectorInput(input);
+      input = sanitizeEmbeddingVectorInput(contentPolicy, input);
       upsertEmbeddingVectorRow(db, input, new Date().toISOString());
     },
     listEmbeddingVectors(input = {}) {
@@ -1313,7 +1360,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       }
       if (input.ownerId !== undefined) {
         predicates.push("owner_id = ?");
-        parameters.push(input.ownerId);
+        parameters.push(sanitizeEmbeddingOwnerId(contentPolicy, input.ownerKind, input.ownerId));
       }
       const where = predicates.length > 0 ? `where ${predicates.join(" and ")}` : "";
       const rows = db.prepare(
@@ -1341,7 +1388,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       }
       if (input.ownerId !== undefined) {
         predicates.push("ev.owner_id = ?");
-        parameters.push(input.ownerId);
+        parameters.push(sanitizeEmbeddingOwnerId(contentPolicy, input.ownerKind, input.ownerId));
       }
       predicates.push(`(
         (ev.owner_kind = 'chunk' and ev.owner_version = '' and c.id is not null)
@@ -1400,15 +1447,22 @@ export function openMemoryStore(rootDir: string): MemoryStore {
     deleteEmbeddingJobsForOwner(ownerKind, ownerId) {
       return Number(db.prepare(
         "delete from embedding_jobs where owner_kind = ? and owner_id = ?"
-      ).run(ownerKind, ownerId).changes);
+      ).run(ownerKind, sanitizeEmbeddingOwnerId(contentPolicy, ownerKind, ownerId)).changes);
     },
     deleteEmbeddingVectorsForOwner(ownerKind, ownerId) {
       return Number(db.prepare(
         "delete from embedding_vectors where owner_kind = ? and owner_id = ?"
-      ).run(ownerKind, ownerId).changes);
+      ).run(ownerKind, sanitizeEmbeddingOwnerId(contentPolicy, ownerKind, ownerId)).changes);
     },
     upsertMemoryCandidate(memory, options) {
       return withTransaction(db, () => {
+        memory = sanitizeExtractedMemory(contentPolicy, memory);
+        options = options === undefined ? undefined : {
+          ...options,
+          ...(options.qualityReasons === undefined
+            ? {}
+            : { qualityReasons: options.qualityReasons.map(contentPolicy.text) })
+        };
         const now = new Date().toISOString();
         const existing = db
           .prepare(
@@ -1514,103 +1568,50 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       });
     },
     upsertManualDecisionMemory(decision) {
-      return withTransaction(db, () => upsertMemoryRow(db, {
-        id: `memory-manual-${decision.id}`,
-        type: "decision",
-        title: decision.topic,
-        summary: decision.decision,
-        reason: decision.reason,
-        confidence: 1,
-        evidence: decision.evidence,
-        relatedFiles: [],
-        dedupeKey: `manual-decision:${decision.id}`,
-        source: "manual",
-        qualityStatus: "active",
-        qualityReasons: [],
-        createdAt: decision.createdAt
-      }));
+      return withTransaction(db, () => {
+        decision = sanitizeDecision(contentPolicy, decision);
+        return upsertMemoryRow(db, {
+          id: `memory-manual-${decision.id}`,
+          type: "decision",
+          title: decision.topic,
+          summary: decision.decision,
+          reason: decision.reason,
+          confidence: 1,
+          evidence: decision.evidence,
+          relatedFiles: [],
+          dedupeKey: `manual-decision:${decision.id}`,
+          source: "manual",
+          qualityStatus: "active",
+          qualityReasons: [],
+          createdAt: decision.createdAt
+        });
+      });
     },
     readMemory(id) {
-      return readMemoryRow(db, id);
+      return readMemoryRow(db, contentPolicy.identifier(id));
     },
     updateMemoryLifecycle(id, lifecycle) {
-      return withTransaction(db, () => {
-        const existing = readMemoryRow(db, id);
-        if (!existing) throw new Error(`Unknown durable memory: ${id}`);
-        db.prepare(
-          `update memories
-           set lifecycle_status = ?, valid_from = ?, valid_until = ?, status_reason = ?,
-               status_changed_at = ?, lifecycle_generation = ?
-           where id = ?`
-        ).run(
-          lifecycle.lifecycleStatus,
-          lifecycle.validFrom ?? existing.validFrom,
-          lifecycle.validUntil === undefined ? existing.validUntil ?? null : lifecycle.validUntil,
-          lifecycle.statusReason === undefined ? existing.statusReason ?? null : lifecycle.statusReason,
-          lifecycle.statusChangedAt ?? new Date().toISOString(),
-          randomUUID(),
-          id
-        );
-        return readMemoryRow(db, id) as DurableMemory;
-      });
+      return updateStoredMemoryLifecycle(
+        db,
+        contentPolicy,
+        (memoryId) => readMemoryRow(db, memoryId),
+        id,
+        lifecycle
+      );
     },
     addMemoryRelation(input) {
-      return withTransaction(db, () => {
-        if (input.fromMemoryId === input.toMemoryId) {
-          throw new Error("Memory relations cannot relate a memory to itself");
-        }
-        if (!readMemoryRow(db, input.fromMemoryId)) {
-          throw new Error(`Unknown durable memory: ${input.fromMemoryId}`);
-        }
-        if (!readMemoryRow(db, input.toMemoryId)) {
-          throw new Error(`Unknown durable memory: ${input.toMemoryId}`);
-        }
-        const id = `memory-relation-${randomUUID()}`;
-        db.prepare(
-          `insert into memory_relations (id, from_memory_id, to_memory_id, relation_type, created_at, reason)
-           values (?, ?, ?, ?, ?, ?)
-           on conflict(from_memory_id, to_memory_id, relation_type) do nothing`
-        ).run(
-          id,
-          input.fromMemoryId,
-          input.toMemoryId,
-          input.relationType,
-          input.createdAt ?? new Date().toISOString(),
-          input.reason ?? null
-        );
-        const row = db.prepare(
-          `select id, from_memory_id, to_memory_id, relation_type, created_at, reason
-           from memory_relations
-           where from_memory_id = ? and to_memory_id = ? and relation_type = ?`
-        ).get(input.fromMemoryId, input.toMemoryId, input.relationType) as unknown as MemoryRelationRow;
-        return memoryRelationFromRow(row);
-      });
+      return addStoredMemoryRelation(
+        db,
+        contentPolicy,
+        (memoryId) => readMemoryRow(db, memoryId),
+        input
+      );
     },
     listMemoryRelations(input = {}) {
-      const predicates: string[] = [];
-      const parameters: string[] = [];
-      if (input.fromMemoryId !== undefined) {
-        predicates.push("from_memory_id = ?");
-        parameters.push(input.fromMemoryId);
-      }
-      if (input.toMemoryId !== undefined) {
-        predicates.push("to_memory_id = ?");
-        parameters.push(input.toMemoryId);
-      }
-      if (input.relationType !== undefined) {
-        predicates.push("relation_type = ?");
-        parameters.push(input.relationType);
-      }
-      const where = predicates.length > 0 ? `where ${predicates.join(" and ")}` : "";
-      const rows = db.prepare(
-        `select id, from_memory_id, to_memory_id, relation_type, created_at, reason
-         from memory_relations ${where}
-         order by created_at asc, id asc`
-      ).all(...parameters) as unknown as MemoryRelationRow[];
-      return rows.map(memoryRelationFromRow);
+      return listStoredMemoryRelations(db, contentPolicy, input);
     },
     deleteMemoryRelation(id) {
-      return withTransaction(db, () => db.prepare("delete from memory_relations where id = ?").run(id).changes > 0);
+      return deleteStoredMemoryRelation(db, contentPolicy, id);
     },
     listMemoryCandidates(input = {}) {
       const rows = db
@@ -1656,6 +1657,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
         .slice(0, input.limit === null ? undefined : normalizeLimit(input.limit));
     },
     updateMemoryQuality(kind, id, quality) {
+      id = contentPolicy.identifier(id);
       const table = kind === "candidate" ? "memory_candidates" : "memories";
       db.prepare(
         `update ${table}
@@ -1663,13 +1665,14 @@ export function openMemoryStore(rootDir: string): MemoryStore {
          where id = ?`
       ).run(
         quality.qualityStatus,
-        JSON.stringify(quality.qualityReasons),
+        JSON.stringify(quality.qualityReasons.map(contentPolicy.text)),
         quality.lastVerifiedAt ?? null,
         id
       );
     },
     upsertTemporaryMemory(input) {
       return withTransaction(db, () => {
+        input = sanitizeTemporaryMemory(contentPolicy, input);
         const now = input.updatedAt ?? new Date().toISOString();
         const existing = input.id
           ? db
@@ -1785,8 +1788,8 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       const rankInput: { threadId?: string; sessionId?: string; limit: number } = {
         limit: normalizeLimit(input.limit)
       };
-      if (input.threadId !== undefined) rankInput.threadId = input.threadId;
-      if (input.sessionId !== undefined) rankInput.sessionId = input.sessionId;
+      if (input.threadId !== undefined) rankInput.threadId = contentPolicy.identifier(input.threadId);
+      if (input.sessionId !== undefined) rankInput.sessionId = contentPolicy.identifier(input.sessionId);
       return rankTemporaryMemories(rows, rankInput);
     },
     listActiveTemporaryMemory(input = {}) {
@@ -1860,6 +1863,7 @@ export function openMemoryStore(rootDir: string): MemoryStore {
       ].slice(0, limit);
     },
     readMemorySearchResultsByIds(memoryIds) {
+      memoryIds = memoryIds.map(contentPolicy.identifier);
       if (memoryIds.length === 0) return [];
       const rows = chunked(memoryIds, SQLITE_READ_BATCH_SIZE).flatMap((batch) =>
         db.prepare(
@@ -2120,10 +2124,6 @@ function rankTemporaryMemoryRows(
     .map((memory, index) => ({ ...memory, rank: index + 1 }));
 }
 
-function embeddingOwnerIdentity(ownerKind: EmbeddingOwnerKind, ownerId: string, contentHash: string): string {
-  return `${ownerKind}\0${ownerId}\0${contentHash}`;
-}
-
 function isCurrentEmbeddingOwner(
   db: DatabaseSync,
   input: Pick<EmbeddingOwner, "ownerKind" | "ownerId" | "contentHash" | "ownerVersion">
@@ -2283,10 +2283,6 @@ function chunked<T>(items: T[], size: number): T[][] {
   return batches;
 }
 
-function createId(type: SourceType): string {
-  return `${type}-${randomUUID()}`;
-}
-
 function parseJsonObject(value: string): Record<string, unknown> {
   const parsed = JSON.parse(value) as unknown;
   return parsed && typeof parsed === "object" && !Array.isArray(parsed)
@@ -2303,27 +2299,6 @@ function parseEvidenceJson(value: string): EvidenceRef[] {
   const parsed = JSON.parse(value) as unknown;
   if (!Array.isArray(parsed)) return [];
   return parsed.filter(isEvidenceRef);
-}
-
-function sourceFromRow(row: SourceRow): MemorySource {
-  return {
-    id: row.id,
-    type: row.type,
-    title: row.title,
-    origin: row.origin,
-    rawContent: row.raw_content,
-    metadata: parseJsonObject(row.metadata_json)
-  };
-}
-
-function chunkFromRow(row: ChunkRow): MemoryChunk {
-  return {
-    id: row.id,
-    sourceId: row.source_id,
-    chunkIndex: row.chunk_index,
-    text: row.text,
-    metadata: parseJsonObject(row.metadata_json)
-  };
 }
 
 function toFtsQuery(query: string): string {
@@ -2455,17 +2430,6 @@ function memorySearchResult(
   return result;
 }
 
-function memoryRelationFromRow(row: MemoryRelationRow): MemoryRelation {
-  return {
-    id: row.id,
-    fromMemoryId: row.from_memory_id,
-    toMemoryId: row.to_memory_id,
-    relationType: row.relation_type,
-    createdAt: row.created_at,
-    reason: row.reason ?? undefined
-  };
-}
-
 function temporaryMemoryFromRow(row: TemporaryMemoryRow): TemporaryMemory {
   const memory: TemporaryMemory = {
     id: row.id,
@@ -2563,32 +2527,6 @@ function dedupeEntityLinks(links: InvestigationEntityLink[]): InvestigationEntit
   });
 }
 
-function rebuildSourceRelations(
-  db: DatabaseSync,
-  sourceId: string,
-  source: MemorySource,
-  chunks: Array<{ text: string; metadata?: Record<string, unknown> }>
-): void {
-  db.prepare(
-    `delete from relations
-     where (from_type = 'source' and from_id = ? and relation = 'mentions' and to_type = 'file')
-        or (from_type = 'chunk' and from_id like ? and relation = 'mentions' and to_type = 'file')`
-  ).run(sourceId, `${sourceId}:chunk:%`);
-  const insert = db.prepare(
-    `insert into relations (id, from_type, from_id, relation, to_type, to_id, locator)
-     values (?, ?, ?, ?, ?, ?, ?)`
-  );
-  for (const filePath of detectMentionedFiles(source.rawContent, source.metadata)) {
-    insert.run(randomUUID(), "source", sourceId, "mentions", "file", filePath, null);
-  }
-  for (const [index, chunk] of chunks.entries()) {
-    const chunkId = `${sourceId}:chunk:${index}`;
-    for (const filePath of detectMentionedFiles(chunk.text, chunk.metadata)) {
-      insert.run(randomUUID(), "chunk", chunkId, "mentions", "file", filePath, chunkId);
-    }
-  }
-}
-
 function rebuildCommitRelations(db: DatabaseSync, commit: CommitRecord): void {
   db.prepare(
     `delete from relations
@@ -2601,23 +2539,6 @@ function rebuildCommitRelations(db: DatabaseSync, commit: CommitRecord): void {
   for (const filePath of commit.changedFiles) {
     insert.run(randomUUID(), "commit", commit.hash, "touches", "file", filePath, null);
   }
-}
-
-function detectMentionedFiles(text: string, metadata?: Record<string, unknown>): string[] {
-  const mentioned = new Set<string>();
-  const metadataFilePath = typeof metadata?.filePath === "string" ? metadata.filePath : undefined;
-  if (metadataFilePath) mentioned.add(normalizeDetectedFilePath(metadataFilePath));
-  const metadataChangedFiles = Array.isArray(metadata?.changedFiles)
-    ? metadata.changedFiles.filter((item): item is string => typeof item === "string")
-    : [];
-  for (const filePath of metadataChangedFiles) mentioned.add(normalizeDetectedFilePath(filePath));
-  const matches = text.match(/(?:[\w.-]+\/)+[\w.-]+/g) ?? [];
-  for (const match of matches) mentioned.add(normalizeDetectedFilePath(match));
-  return [...mentioned].filter((filePath) => filePath.length > 0);
-}
-
-function normalizeDetectedFilePath(filePath: string): string {
-  return filePath.replace(/^[("'`]+/, "").replace(/[.,;:!?)"'`]+$/, "");
 }
 
 function matchesMemoryQuery(
@@ -2643,6 +2564,26 @@ function syncStatusFromRow(row: SyncStatusRow): SyncStatus {
   if (row.last_success_at !== null) status.lastSuccessAt = row.last_success_at;
   if (row.last_error !== null) status.lastError = row.last_error;
   return status;
+}
+
+function sourceFailureFromRow(row: SourceFailureRow): SourceFailure {
+  return {
+    id: row.id,
+    adapter: row.adapter,
+    path: row.path,
+    errorCode: row.error_code,
+    message: row.message,
+    firstOccurredAt: row.first_occurred_at,
+    lastOccurredAt: row.last_occurred_at,
+    attempts: row.attempts,
+    ...(row.resolved_at === null ? {} : { resolvedAt: row.resolved_at })
+  };
+}
+
+function sanitizeSourceFailureMessage(message: string): string {
+  const redacted = redactSensitiveText(message).text;
+  const normalized = redacted.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  return (normalized || "Source parsing failed").slice(0, 500);
 }
 
 function isEvidenceRef(value: unknown): value is EvidenceRef {

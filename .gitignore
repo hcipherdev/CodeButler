@@ -40,4 +40,3 @@ dist/
 # Local project memory state
 .code-butler/
 .remember/
-docs/.DS_Store

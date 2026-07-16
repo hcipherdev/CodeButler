@@ -16,6 +16,7 @@ function makeInput(): ProjectSummaryGeneratorInput {
     codeContext: {
       manifests: [{ path: "package.json", content: "{\"scripts\":{\"test\":\"vitest\"}}" }],
       docs: [{ path: "README.md", content: "# Project\n" }],
+      codeFiles: [],
       inventory: ["src", "tests"],
       commits: [],
       projectState: {

@@ -99,6 +99,7 @@ function projectSummaryPayload(input: ProjectSummaryGeneratorInput): Record<stri
     projectRoot: input.projectRoot,
     fingerprint: input.fingerprint,
     agentHints: input.agentHints,
+    notes: input.notes,
     codeContext: input.codeContext
   };
 }

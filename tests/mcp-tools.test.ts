@@ -374,6 +374,7 @@ describe("MCP tool handlers", () => {
       lifecycleStatus: "superseded",
       validUntil: "2026-07-12T11:00:00.000Z"
     });
+    expect(store.listOperations({ operationType: "lifecycle_change" })[0]?.actor).toBe("mcp");
     expect(replacement.memory).toMatchObject({ lifecycleStatus: "current" });
     expect(store.listMemoryRelations({ relationType: "supersedes" })).toEqual([
       expect.objectContaining({ fromMemoryId: replacement.memory.id, toMemoryId: original.memory.id })
@@ -441,7 +442,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("registers and invokes 20 MCP tools with lifecycle validation and wiring", async () => {
+  it("registers and invokes 21 MCP tools with lifecycle validation and wiring", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
@@ -473,8 +474,9 @@ describe("MCP tool handlers", () => {
       now: () => new Date("2026-07-12T16:05:00.000Z")
     });
 
-    expect(registrations).toHaveLength(20);
+    expect(registrations).toHaveLength(21);
     expect(registrations.map((registration) => registration.name)).toContain("update_memory_status");
+    expect(registrations.map((registration) => registration.name)).toContain("list_source_failures");
     const find = registrations.find((registration) => registration.name === "find_memories")!;
     expect(find.inputSchema.lifecycleStatus!.safeParse("all")).toMatchObject({ success: true });
     expect(find.inputSchema.lifecycleStatus!.safeParse("obsolete")).toMatchObject({ success: false });
@@ -518,18 +520,36 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("keeps the architecture copies consistent with the complete 20-tool list", () => {
+  it("lists source failures through the additive MCP handler", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.recordSourceFailure({
+      adapter: "claude",
+      path: "/logs/claude.jsonl",
+      errorCode: "read_failed",
+      message: "The conversation log could not be read."
+    });
+
+    const failures = createProjectMemoryToolHandlers(store).list_source_failures({ adapter: "claude", limit: 10 });
+
+    expect(failures).toEqual([
+      expect.objectContaining({ adapter: "claude", path: "/logs/claude.jsonl", errorCode: "read_failed" })
+    ]);
+    store.close();
+  });
+
+  it("keeps the architecture copies consistent with the complete 21-tool list", () => {
     const architecture = readFileSync(join(process.cwd(), "architecture.html"), "utf8");
     const published = readFileSync(join(process.cwd(), "docs", "public", "architecture.html"), "utf8");
     const toolNames = [...architecture.matchAll(/<div class="mcp-tool-name">([^<]+)<\/div>/g)]
       .map((match) => match[1]);
 
     expect(published).toBe(architecture);
-    expect(architecture).toContain("MCP Tools (20)");
-    expect(architecture).toContain("20 exposed tools");
-    expect(architecture).not.toContain("18 exposed tools");
-    expect(architecture).not.toMatch(/\b18(?:\s+MCP)?\s+tools\b/i);
-    expect(toolNames).toHaveLength(20);
+    expect(architecture).toContain("MCP Tools (21)");
+    expect(architecture).toContain("21 exposed tools");
+    expect(toolNames).toHaveLength(21);
     expect([...toolNames].sort()).toEqual([
       "cleanup_temporary_memory",
       "current_project",
@@ -538,6 +558,7 @@ describe("MCP tool handlers", () => {
       "find_memories",
       "find_related_commits",
       "investigate_project_history",
+      "list_source_failures",
       "read_memory_source",
       "refresh_project_summary",
       "remember_project_memory",

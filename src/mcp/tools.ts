@@ -34,6 +34,9 @@ import type {
   TemporaryMemoryKind
 } from "../types.js";
 import type { DoctorReport } from "../types.js";
+import { registerInvestigationToolGroup } from "./tool-groups/investigation.js";
+import { registerMemoryToolGroup } from "./tool-groups/memory.js";
+import { registerSourceToolGroup } from "./tool-groups/sources.js";
 
 export interface RecentActivitySummary {
   window: {
@@ -205,6 +208,11 @@ export interface ProjectMemoryToolHandlers {
   sync_project_memory(input: {
     source?: SyncSourceName | "all";
   }): Promise<Awaited<ReturnType<typeof syncProjectMemory>>>;
+  list_source_failures(input: {
+    adapter?: SyncSourceName;
+    resolved?: boolean;
+    limit?: number;
+  }): ReturnType<MemoryStore["listSourceFailures"]>;
   summarize_project_state(): ProjectSummary;
   summarize_memory_health(): ReturnType<typeof summarizeMemoryHealth>;
   run_doctor(): DoctorReport;
@@ -218,6 +226,7 @@ const memoryQualityStatusSchema = z.enum(["active", "needs_review", "quarantined
 const memoryLifecycleStatusSchema = z.enum(["current", "superseded", "retracted", "all"]);
 const updateMemoryLifecycleStatusSchema = z.enum(["current", "superseded", "retracted"]);
 const syncSourceSchema = z.enum(["git", "codex", "claude", "all"]);
+const sourceFailureAdapterSchema = z.enum(["git", "codex", "claude"]);
 export function createProjectMemoryToolHandlers(
   store: MemoryStore,
   options: {
@@ -262,7 +271,7 @@ export function createProjectMemoryToolHandlers(
       const remembered = rememberProjectMemory(
         store,
         normalizeRememberMemoryInput(input),
-        options.now === undefined ? {} : { now: options.now }
+        { ...(options.now === undefined ? {} : { now: options.now }), actor: "mcp" }
       );
       const memoryId = remembered.memory?.id ?? remembered.candidate.id;
       const status = remembered.memory ? "promoted" : "candidate";
@@ -288,7 +297,8 @@ export function createProjectMemoryToolHandlers(
       const normalized = normalizeUpdateMemoryStatusInput(input);
       const memory = updateMemoryStatus(store, {
         ...normalized,
-        now: nowIso(options.now)
+        now: nowIso(options.now),
+        actor: "mcp"
       });
       const relations = store
         .listMemoryRelations()
@@ -335,6 +345,9 @@ export function createProjectMemoryToolHandlers(
     async sync_project_memory(input) {
       return syncProjectMemory(store, config, { source: input.source ?? "all" });
     },
+    list_source_failures(input) {
+      return store.listSourceFailures(input);
+    },
     summarize_project_state() {
       return store.getProjectSummary();
     },
@@ -368,249 +381,22 @@ export function registerProjectMemoryTools(
   } = {}
 ): void {
   const handlers = createProjectMemoryToolHandlers(store, options);
+  registerSourceToolGroup(server, handlers);
+  registerMemoryToolGroup(server, handlers);
+  registerInvestigationToolGroup(server, handlers);
+  return;
+}
 
-  server.registerTool(
-    "current_project",
-    {
-      description: "Report which project-local Code Butler store this MCP server is using.",
-      inputSchema: {}
-    },
-    async () => asJsonContent(handlers.current_project())
-  );
-
-  server.registerTool(
-    "search_project_memory",
-    {
-      description: "Search local project memory. Promoted memories are returned ahead of raw source matches.",
-      inputSchema: {
-        query: z.string().min(1),
-        sourceTypes: z.array(sourceTypeSchema).optional(),
-        limit: z.number().int().positive().max(100).optional()
-      }
-    },
-    async (input) => asJsonContent(await handlers.search_project_memory(normalizeSearchInput(input)))
-  );
-
-  server.registerTool(
-    "read_memory_source",
-    {
-      description: "Read the raw stored source for a memory source id.",
-      inputSchema: {
-        sourceId: z.string().min(1)
-      }
-    },
-    async (input) => asJsonContent(handlers.read_memory_source(input))
-  );
-
-  server.registerTool(
-    "find_memories",
-    {
-      description: "Find promoted or candidate durable project memories.",
-      inputSchema: {
-        query: z.string().optional(),
-        type: memoryTypeSchema.optional(),
-        status: z.enum(["promoted", "candidate"]).optional(),
-        qualityStatus: memoryQualityStatusSchema.optional(),
-        lifecycleStatus: memoryLifecycleStatusSchema.optional(),
-        limit: z.number().int().positive().max(100).optional()
-      }
-    },
-    async (input) => asJsonContent(await handlers.find_memories(normalizeMemorySearchInput(input)))
-  );
-
-  server.registerTool(
-    "remember_project_memory",
-    {
-      description: "Store an explicit user-requested durable project memory without inspecting local database internals.",
-      inputSchema: {
-        type: memoryTypeSchema,
-        text: z.string().min(1),
-        title: z.string().min(1).optional(),
-        reason: z.string().min(1).optional(),
-        relatedFiles: z.array(z.string().min(1)).optional(),
-        promote: z.boolean().optional(),
-        supersedesMemoryId: z.string().min(1).optional()
-      }
-    },
-    async (input) => asJsonContent(handlers.remember_project_memory(normalizeRememberMemoryInput(input)))
-  );
-
-  server.registerTool(
-    "update_memory_status",
-    {
-      description: "Mark a durable memory current, superseded, or retracted while preserving lifecycle history.",
-      inputSchema: {
-        memoryId: z.string().min(1),
-        status: updateMemoryLifecycleStatusSchema,
-        reason: z.string().trim().min(1),
-        replacementMemoryId: z.string().min(1).optional()
-      }
-    },
-    async (input) => asJsonContent(handlers.update_memory_status(normalizeUpdateMemoryStatusInput(input)))
-  );
-
-  server.registerTool(
-    "find_decisions",
-    {
-      description: "Find project decisions from manual records and promoted decision memories.",
-      inputSchema: {
-        topic: z.string().optional(),
-        limit: z.number().int().positive().max(100).optional()
-      }
-    },
-    async (input) => asJsonContent(handlers.find_decisions(normalizeDecisionInput(input)))
-  );
-
-  server.registerTool(
-    "find_related_commits",
-    {
-      description: "Find ingested Git commits by query or changed file path.",
-      inputSchema: {
-        query: z.string().optional(),
-        filePath: z.string().optional(),
-        limit: z.number().int().positive().max(100).optional()
-      }
-    },
-    async (input) => asJsonContent(handlers.find_related_commits(normalizeCommitInput(input)))
-  );
-
-  server.registerTool(
-    "explain_code_change",
-    {
-      description: "Explain why a file changed using promoted memories, commits, conversations, and decisions.",
-      inputSchema: {
-        filePath: z.string().min(1),
-        lineNumber: z.number().int().positive().optional(),
-        question: z.string().optional()
-      }
-    },
-    async (input) => asJsonContent(await handlers.explain_code_change(normalizeExplainInput(input)))
-  );
-
-  server.registerTool(
-    "investigate_project_history",
-    {
-      description: "Run a local multi-step project history investigation for a natural language question.",
-      inputSchema: {
-        question: z.string().min(1),
-        limit: z.number().int().positive().max(100).optional()
-      }
-    },
-    async (input) => asJsonContent(await handlers.investigate_project_history(normalizeInvestigationInput(input)))
-  );
-
-  server.registerTool(
-    "summarize_recent_activity",
-    {
-      description:
-        "Summarize recent project activity from timestamped Code Butler sources first, with optional Git working-tree corroboration.",
-      inputSchema: {
-        since: z.string().optional(),
-        until: z.string().optional(),
-        includeWorkingTree: z.boolean().optional()
-      }
-    },
-    async (input) => asJsonContent(handlers.summarize_recent_activity(normalizeRecentActivityInput(input)))
-  );
-
-  server.registerTool(
-    "search_temporary_memory",
-    {
-      description:
-        "Search unexpired temporary working context for this project. Results are prioritized for the current thread/session.",
-      inputSchema: {
-        query: z.string().min(1),
-        threadId: z.string().optional(),
-        sessionId: z.string().optional(),
-        limit: z.number().int().positive().max(100).optional()
-      }
-    },
-    async (input) => asJsonContent(handlers.search_temporary_memory(normalizeTemporarySearchInput(input)))
-  );
-
-  server.registerTool(
-    "summarize_active_context",
-    {
-      description:
-        "Summarize unexpired temporary working context for continuation after compaction or a new agent turn.",
-      inputSchema: {
-        threadId: z.string().optional(),
-        sessionId: z.string().optional(),
-        projectOnly: z.boolean().optional(),
-        limit: z.number().int().positive().max(100).optional()
-      }
-    },
-    async (input) => asJsonContent(handlers.summarize_active_context(normalizeActiveContextInput(input)))
-  );
-
-  server.registerTool(
-    "cleanup_temporary_memory",
-    {
-      description: "Delete expired temporary working context, or all temporary context when expiredOnly is false.",
-      inputSchema: {
-        expiredOnly: z.boolean().optional()
-      }
-    },
-    async (input) => asJsonContent(handlers.cleanup_temporary_memory(normalizeTemporaryCleanupInput(input)))
-  );
-
-  server.registerTool(
-    "sync_project_memory",
-    {
-      description: "Run an incremental sync from configured Git, Codex, and Claude sources.",
-      inputSchema: {
-        source: syncSourceSchema.optional()
-      }
-    },
-    async (input) => asJsonContent(await handlers.sync_project_memory(normalizeSyncInput(input)))
-  );
-
-  server.registerTool(
-    "summarize_project_state",
-    {
-      description: "Summarize the current local project memory index and sync state.",
-      inputSchema: {}
-    },
-    async () => asJsonContent(handlers.summarize_project_state())
-  );
-
-  server.registerTool(
-    "summarize_memory_health",
-    {
-      description: "Summarize durable memory quality status and top quality-review reasons.",
-      inputSchema: {}
-    },
-    async () => asJsonContent(handlers.summarize_memory_health())
-  );
-
-  server.registerTool(
-    "run_doctor",
-    {
-      description: "Run a read-only Code Butler health check for the current project.",
-      inputSchema: {}
-    },
-    async () => asJsonContent(handlers.run_doctor())
-  );
-
-  server.registerTool(
-    "summarize_project_brief",
-    {
-      description: "Read the local project narrative summary and freshness metadata without mutating files.",
-      inputSchema: {}
-    },
-    async () => asJsonContent(await handlers.summarize_project_brief())
-  );
-
-  server.registerTool(
-    "refresh_project_summary",
-    {
-      description: "Refresh the local project narrative summary without rewriting AGENTS.md or CLAUDE.md.",
-      inputSchema: {
-        force: z.boolean().optional()
-      }
-    },
-    async (input) => asJsonContent(await handlers.refresh_project_summary(normalizeProjectSummaryRefreshInput(input)))
-  );
+function normalizeSourceFailureInput(input: {
+  adapter?: SyncSourceName | undefined;
+  resolved?: boolean | undefined;
+  limit?: number | undefined;
+}): { adapter?: SyncSourceName; resolved?: boolean; limit?: number } {
+  const normalized: { adapter?: SyncSourceName; resolved?: boolean; limit?: number } = {};
+  if (input.adapter !== undefined) normalized.adapter = input.adapter;
+  if (input.resolved !== undefined) normalized.resolved = input.resolved;
+  if (input.limit !== undefined) normalized.limit = input.limit;
+  return normalized;
 }
 
 function normalizeSearchInput(input: {

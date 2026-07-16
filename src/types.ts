@@ -1,4 +1,17 @@
 export type SourceType = "conversation" | "commit" | "decision";
+export type {
+  BeginOperationInput,
+  CreateSourceTombstoneInput,
+  FinishOperationInput,
+  ListOperationsInput,
+  OperationActor,
+  OperationLogEntry,
+  OperationMetadata,
+  OperationMetadataByType,
+  OperationStatus,
+  OperationType,
+  SourceTombstone
+} from "./operations/types.js";
 export type MemoryType = "decision" | "bug_fix" | "constraint" | "rejected_approach";
 export type TemporaryMemoryKind =
   | "task_state"
@@ -254,6 +267,18 @@ export interface SyncStatus {
   metadata?: Record<string, unknown>;
 }
 
+export interface SourceFailure {
+  id: string;
+  adapter: SyncSourceName;
+  path: string;
+  errorCode: string;
+  message: string;
+  firstOccurredAt: string;
+  lastOccurredAt: string;
+  attempts: number;
+  resolvedAt?: string | undefined;
+}
+
 export interface DoctorCheck {
   id: string;
   category: DoctorCheckCategory;
@@ -366,6 +391,33 @@ export interface EmbeddingConfig {
 
 export interface PrivacyConfig {
   allowRemoteEmbeddings: boolean;
+  redactionPatterns?: RedactionPatternConfig[];
+}
+
+export interface RedactionPatternConfig {
+  name: string;
+  pattern: string;
+  kind: "literal" | "regex";
+  flags?: string;
+}
+
+export interface SourceRetentionPolicy {
+  maxAgeDays: number | null;
+}
+
+export interface SourceRetentionOverride extends SourceRetentionPolicy {
+  sourceId: string;
+}
+
+export interface RetentionConfig {
+  migrationBackups: number;
+  sources: {
+    git: SourceRetentionPolicy;
+    codex: SourceRetentionPolicy;
+    claude: SourceRetentionPolicy;
+    manual: SourceRetentionPolicy;
+  };
+  overrides: SourceRetentionOverride[];
 }
 
 export type EmbeddingOwnerKind = "chunk" | "memory";
@@ -474,6 +526,7 @@ export interface ProjectConfig {
   retrieval: RetrievalConfig;
   embeddings: EmbeddingConfig;
   privacy: PrivacyConfig;
+  retention?: RetentionConfig;
   deterministic: DeterministicConfig;
   investigator: InvestigatorConfig;
 }

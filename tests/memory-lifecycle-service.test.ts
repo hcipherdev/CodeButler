@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -70,6 +71,69 @@ describe("memory lifecycle orchestration", () => {
         createdAt: "2026-07-12T20:00:00.000Z"
       })
     ]);
+    expect(store.listOperations({ operationType: "lifecycle_change" })).toEqual([
+      expect.objectContaining({
+        status: "completed",
+        actor: "system",
+        startedAt: "2026-07-12T20:00:00.000Z",
+        completedAt: "2026-07-12T20:00:00.000Z",
+        metadata: {
+          memoryIdHash: createHash("sha256").update(original.id).digest("hex"),
+          previousStatus: "current",
+          newStatus: "superseded",
+          replacementMemoryIdHash: createHash("sha256").update(replacement.id).digest("hex")
+        }
+      })
+    ]);
+    store.close();
+  });
+
+  it("logs lifecycle changes for manual decision IDs without storing the raw ID", () => {
+    const store = createStore();
+    const memory = store.upsertManualDecisionMemory({
+      id: "DEC-0001",
+      topic: "Manual decision",
+      decision: "Keep manual lifecycle compatible.",
+      reason: "Legacy IDs use human-readable decision numbers.",
+      status: "accepted",
+      evidence: [],
+      createdAt: "2026-07-12T19:00:00.000Z"
+    });
+
+    expect(() => updateMemoryStatus(store, {
+      memoryId: memory.id,
+      status: "retracted",
+      reason: "Administrative correction.",
+      now: "2026-07-12T20:00:00.000Z",
+      actor: "cli"
+    })).not.toThrow();
+
+    const serialized = JSON.stringify(store.listOperations({ operationType: "lifecycle_change" }));
+    expect(serialized).not.toContain(memory.id);
+    expect(serialized).toContain(createHash("sha256").update(memory.id).digest("hex"));
+    expect(store.listOperations({ operationType: "lifecycle_change" })[0]?.actor).toBe("cli");
+    store.close();
+  });
+
+  it("rolls back lifecycle state, relation, and completed operation log together", () => {
+    const store = createStore();
+    const original = promote(store, "audit-rollback-original");
+    const replacement = promote(store, "audit-rollback-replacement");
+
+    expect(() => withTransaction(store.db, () => {
+      updateMemoryStatus(store, {
+        memoryId: original.id,
+        status: "superseded",
+        reason: "This reason must never enter the operation log",
+        replacementMemoryId: replacement.id,
+        now: "2026-07-12T20:00:10.000Z"
+      });
+      throw new Error("rollback lifecycle audit");
+    })).toThrow("rollback lifecycle audit");
+
+    expect(store.readMemory(original.id)).toMatchObject({ lifecycleStatus: "current" });
+    expect(store.listMemoryRelations({ relationType: "supersedes" })).toEqual([]);
+    expect(store.listOperations({ operationType: "lifecycle_change" })).toEqual([]);
     store.close();
   });
 

@@ -1,6 +1,7 @@
 import type { MemoryStore } from "../storage/store.js";
+import { hashOperationIdentifier, recordCompletedOperation } from "../operations/log.js";
 import { afterCommit, withTransaction } from "../storage/transactions.js";
-import type { DurableMemory, MemoryLifecycleStatus } from "../types.js";
+import type { DurableMemory, MemoryLifecycleStatus, OperationActor } from "../types.js";
 
 export interface UpdateMemoryStatusInput {
   memoryId: string;
@@ -8,6 +9,7 @@ export interface UpdateMemoryStatusInput {
   reason: string;
   replacementMemoryId?: string | undefined;
   now: string;
+  actor?: OperationActor | undefined;
 }
 
 export function updateMemoryStatus(
@@ -65,6 +67,7 @@ export function updateMemoryStatus(
         createdAt: input.now,
         reason: input.reason
       });
+      recordLifecycleChange(store, input, memory.lifecycleStatus);
       scheduleEmbeddingCleanup(store, input.memoryId);
       return updated;
     }
@@ -84,9 +87,30 @@ export function updateMemoryStatus(
       statusReason: input.reason,
       statusChangedAt: input.now
     });
+    recordLifecycleChange(store, input, memory.lifecycleStatus);
     scheduleEmbeddingCleanup(store, input.memoryId);
     return updated;
   });
+}
+
+function recordLifecycleChange(
+  store: MemoryStore,
+  input: UpdateMemoryStatusInput,
+  previousStatus: MemoryLifecycleStatus
+): void {
+  recordCompletedOperation(store.db, {
+    operationType: "lifecycle_change",
+    actor: input.actor ?? "system",
+    metadata: {
+      memoryIdHash: hashOperationIdentifier(input.memoryId),
+      previousStatus,
+      newStatus: input.status,
+      replacementMemoryIdHash: input.replacementMemoryId === undefined
+        ? undefined
+        : hashOperationIdentifier(input.replacementMemoryId)
+    },
+    startedAt: input.now
+  }, input.now);
 }
 
 function scheduleEmbeddingCleanup(store: MemoryStore, memoryId: string): void {

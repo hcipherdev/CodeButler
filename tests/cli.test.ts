@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -25,6 +26,46 @@ describe("CLI", () => {
     } else {
       process.env.CODE_BUTLER_HOME = originalCodeButlerHome;
     }
+  });
+
+  it("keeps the public top-level help surface stable", async () => {
+    const lines: string[] = [];
+
+    await expect(runCli(["help"], { stdout: (line) => lines.push(line) })).resolves.toBe(0);
+
+    expect(lines.join("\n").split("\n").filter((line) => line.startsWith("  code-butler "))).toEqual([
+      "  code-butler init",
+      "  code-butler config init",
+      "  code-butler config global init",
+      "  code-butler ingest conversation <file>",
+      "  code-butler ingest git <repo> [--max-commits <n>]",
+      "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",
+      "  code-butler decision import <markdown-file>",
+      "  code-butler memory audit [--fix] [--json]",
+      "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>]",
+      "  code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]",
+      "  code-butler memory conflicts [--fix] [--json]",
+      "  code-butler doctor [--json] [--strict]",
+      "  code-butler embeddings build [--json]",
+      "  code-butler embeddings status [--json]",
+      "  code-butler privacy audit [--json]",
+      "  code-butler privacy export --output <file> [--raw --confirm-raw-export] [--json]",
+      "  code-butler privacy import --input <file> [--confirm-nonempty] [--json]",
+      "  code-butler privacy scrub [--purge-backups] [--json]",
+      "  code-butler privacy delete --source-id <id> --confirm-delete <id> [--purge-backups] [--json]",
+      "  code-butler privacy prune <--dry-run|--apply> [--purge-backups] [--json]",
+      "  code-butler sync [--source <git|codex|claude|all>]",
+      "  code-butler sources status",
+      "  code-butler sources failures [--json]",
+      "  code-butler watch [--interval <seconds>] [--source <git|codex|claude|all>]",
+      "  code-butler watch status",
+      "  code-butler watch uninstall",
+      "  code-butler project-summary refresh [--force]",
+      "  code-butler project-summary status",
+      "  code-butler hooks install",
+      "  code-butler mcp [--project-root <path>] [--init-here]",
+      "  code-butler serve"
+    ]);
   });
 
   it("recognizes symlinked bin paths as the CLI entrypoint", () => {
@@ -481,6 +522,42 @@ describe("CLI", () => {
     expect(text).toContain("Conversations in SQLite: 0");
   });
 
+  it("lists persisted source failures in human and JSON formats", async () => {
+    const { rootDir } = createConversationProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.recordSourceFailure({
+      adapter: "codex",
+      path: "/logs/broken.jsonl",
+      errorCode: "invalid_jsonl",
+      message: "The conversation log contains invalid JSONL.",
+      occurredAt: "2026-07-15T10:00:00.000Z"
+    });
+    for (let index = 0; index < 11; index += 1) {
+      store.recordSourceFailure({
+        adapter: "claude",
+        path: `/logs/broken-${index}.jsonl`,
+        errorCode: "read_failed",
+        message: "The conversation log could not be read.",
+        occurredAt: `2026-07-15T09:${String(index).padStart(2, "0")}:00.000Z`
+      });
+    }
+    store.close();
+    const human: string[] = [];
+    const json: string[] = [];
+
+    await expect(runCli(["sources", "failures"], { cwd: rootDir, stdout: (line) => human.push(line) })).resolves.toBe(0);
+    await expect(runCli(["sources", "failures", "--json"], { cwd: rootDir, stdout: (line) => json.push(line) })).resolves.toBe(0);
+
+    expect(human.join("\n")).toContain("Source Failures");
+    expect(human.join("\n")).toContain("unresolved=12");
+    expect(human.join("\n")).toContain("invalid_jsonl");
+    expect(JSON.parse(json.join("\n"))).toHaveLength(12);
+    expect(JSON.parse(json.join("\n"))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ adapter: "codex", path: "/logs/broken.jsonl", attempts: 1 })
+    ]));
+  });
+
   it("audits memory quality as JSON without mutating by default", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -627,6 +704,7 @@ describe("CLI", () => {
     expect(store.listMemoryRelations({ relationType: "supersedes" })).toEqual([
       expect.objectContaining({ toMemoryId: original.id })
     ]);
+    expect(store.listOperations({ operationType: "lifecycle_change" })[0]?.actor).toBe("cli");
     store.close();
     expect(output.join("\n")).toContain("Remembered decision memory");
   });
@@ -680,6 +758,7 @@ describe("CLI", () => {
       statusReason: "The policy was incorrect.",
       statusChangedAt: "2026-07-12T14:00:00.000Z"
     });
+    expect(after.listOperations({ operationType: "lifecycle_change" })[0]?.actor).toBe("cli");
     after.close();
   });
 
@@ -956,6 +1035,70 @@ describe("CLI", () => {
     expect(JSON.parse(output.join("\n"))).toEqual(expect.objectContaining({ enabled: false, usable: false, activeCoverage: 0, built: 0, warnings: ["Embeddings are disabled"] }));
   });
 
+  it("scrubs legacy secrets through the privacy CLI", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({
+      source: { id: "legacy", type: "conversation", title: "legacy", origin: "codex", rawContent: "safe" },
+      chunks: [{ text: "safe" }]
+    });
+    const secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+    store.db.prepare("update sources set raw_content = ? where id = ?").run(secret, "legacy");
+    store.close();
+    const output: string[] = [];
+
+    await expect(runCli(["privacy", "scrub", "--json"], {
+      cwd: rootDir,
+      stdout: (line) => output.push(line)
+    })).resolves.toBe(0);
+
+    const result = JSON.parse(output.join("\n")) as { redactions: number; backupPath: string };
+    expect(result.redactions).toBeGreaterThan(0);
+    expect(existsSync(result.backupPath)).toBe(false);
+    const reopened = openMemoryStore(rootDir);
+    reopened.init();
+    expect(JSON.stringify(reopened.db.prepare("select * from sources").all())).not.toContain(secret);
+    reopened.close();
+  });
+
+  it("requires explicit source confirmation for privacy deletion", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({
+      source: { id: "delete-me", type: "conversation", title: "delete", origin: "codex", rawContent: "body" },
+      chunks: [{ text: "body" }]
+    });
+    store.close();
+    const errors: string[] = [];
+
+    await expect(runCli([
+      "privacy", "delete", "--source-id", "delete-me", "--confirm-delete", "wrong"
+    ], { cwd: rootDir, stderr: (line) => errors.push(line) })).resolves.toBe(1);
+
+    expect(errors.join("\n")).toContain("Confirmation must exactly match source ID");
+    const reopened = openMemoryStore(rootDir);
+    reopened.init();
+    expect(reopened.readSource("delete-me")).toBeTruthy();
+    reopened.close();
+  });
+
+  it("requires an explicit dry-run or apply mode for privacy pruning", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const errors: string[] = [];
+
+    await expect(runCli(["privacy", "prune"], {
+      cwd: rootDir,
+      stderr: (line) => errors.push(line)
+    })).resolves.toBe(1);
+
+    expect(errors.join("\n")).toContain("privacy prune <--dry-run|--apply>");
+  });
+
   it("exits nonzero when an explicit remote embedding build is privacy-blocked", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -1144,6 +1287,7 @@ describe("CLI", () => {
         version: 1,
         summaryPath: join(rootDir, ".code-butler", "project-summary.md"),
         fingerprint: "old",
+        outputContentHash: createHash("sha256").update("# Existing Brief\n").digest("hex"),
         lastGeneratedAt: "2026-06-14T10:00:00.000Z",
         lastCheckedAt: "2026-06-14T10:00:00.000Z"
       })
