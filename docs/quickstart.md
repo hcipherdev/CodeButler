@@ -87,6 +87,15 @@ Refresh the generated project summary manually:
 code-butler project-summary refresh
 ```
 
+Put durable human guidance in `.code-butler/project-summary-notes.md`; refresh reads it but never rewrites it. Code context is selected deterministically from safe Git-tracked entrypoints, promoted-memory links, and recent commit files. Normal refresh protects manual edits to the generated summary; use `project-summary status` to inspect the state and `refresh --force` only when you intend to replace it with a timestamped recovery backup.
+
+Inspect persisted conversation parsing failures after repairing source files:
+
+```bash
+code-butler sources failures
+code-butler sources failures --json
+```
+
 ## Build From Source
 
 ```bash

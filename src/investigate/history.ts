@@ -4,6 +4,15 @@ import type { MemoryStore } from "../storage/store.js";
 import { investigationActionSchema } from "./actions.js";
 import { createAnthropicAwsInvestigator } from "./anthropic-aws.js";
 import { createOpenAICompatibleInvestigator } from "./openai.js";
+import {
+  buildInvestigationPlannerContext,
+  buildInvestigationSeed,
+  createInvestigationContext,
+  deriveInvestigationAnchors,
+  type InvestigationAnchors,
+  type InvestigationRuntimeNode as RuntimeNode,
+  type SharedInvestigationContext as SharedInvestigationState
+} from "./context-builder.js";
 import type {
   CommitRecord,
   DecisionRecord,
@@ -13,9 +22,8 @@ import type {
   InvestigationBudget,
   InvestigationEntityLink,
   InvestigationEntityRef,
-  InvestigationMode,
-  InvestigationNode,
   InvestigationObservation,
+  InvestigationPlannerState,
   InvestigationResult,
   InvestigationRunOptions,
   InvestigationStep,
@@ -30,47 +38,12 @@ import type {
   TemporaryMemorySearchResult
 } from "../types.js";
 
-interface InvestigationAnchors {
-  normalizedQuestion: string;
-  filePath?: string;
-  commitHash?: string;
-  decisionLike: boolean;
-}
-
-interface RuntimeNode extends InvestigationNode {
-  stepBudget: number;
-  parentStepId?: string;
-  spawnedChildren: number;
-}
-
 interface ExecutedObservation extends InvestigationObservation {
   temporaryMemories?: TemporaryMemorySearchResult[];
   relatedMemories?: DurableMemory[];
   candidateMemories?: MemoryCandidate[];
   relatedDecisions?: DecisionRecord[];
   visitedEntities?: InvestigationEntityRef[];
-}
-
-interface SharedInvestigationState {
-  rootQuestion: string;
-  mode: InvestigationMode;
-  budget: InvestigationBudget;
-  traceSteps: InvestigationStep[];
-  evidence: Map<string, EvidenceRef>;
-  searchResults: Map<string, SearchResult>;
-  relatedCommits: Map<string, CommitRecord>;
-  relatedDecisions: Map<string, DecisionRecord>;
-  temporaryMemories: Map<string, TemporaryMemorySearchResult>;
-  relatedMemories: Map<string, DurableMemory>;
-  candidateMemories: Map<string, MemoryCandidate>;
-  visitedEntities: Set<string>;
-  visitedActionKeys: Set<string>;
-  nextStepNumber: number;
-  nextNodeNumber: number;
-  totalSteps: number;
-  plannerSteps: number;
-  noNewEvidenceStreak: number;
-  terminationReason?: InvestigationTerminationReason;
 }
 
 interface InvestigationRuntime {
@@ -86,7 +59,7 @@ export async function explainCodeChange(
   options: InvestigationRunOptions = {}
 ): Promise<InvestigationResult> {
   const question = input.question?.trim() || `Why did we modify ${input.filePath}?`;
-  const anchors = deriveAnchors(question, { filePath: input.filePath });
+  const anchors = deriveInvestigationAnchors(question, { filePath: input.filePath });
   const provider = resolveInvestigatorProvider(options);
   if (!options.config?.investigator.enabled || !provider) {
     return buildHeuristicFallback(store, {
@@ -104,7 +77,7 @@ export async function investigateProjectHistory(
   input: { question: string; limit?: number },
   options: InvestigationRunOptions = {}
 ): Promise<InvestigationResult> {
-  const anchors = deriveAnchors(input.question);
+  const anchors = deriveInvestigationAnchors(input.question);
   const provider = resolveInvestigatorProvider(options);
   if (!options.config?.investigator.enabled || !provider) {
     const fallbackInput: { question: string; filePath?: string; limit: number } = {
@@ -126,7 +99,7 @@ async function runNativeInvestigation(
   config: NonNullable<InvestigationRunOptions["config"]>
 ): Promise<InvestigationResult> {
   const budget = budgetFromConfig(config.investigator);
-  const shared = createSharedState(question, budget);
+  const { shared, rootNode } = createInvestigationContext(question, anchors, budget);
   const runtime: InvestigationRuntime = {
     store,
     provider,
@@ -134,23 +107,12 @@ async function runNativeInvestigation(
     shared
   };
 
-  const rootNode: RuntimeNode = {
-    id: createNodeId(shared),
-    question: anchors.normalizedQuestion,
-    depth: 0,
-    stepBudget: budget.maxSteps,
-    spawnedChildren: 0
-  };
-  if (anchors.filePath) rootNode.targetEntity = { entityType: "file", entityId: anchors.filePath };
-  markVisitedEntity(shared, { entityType: "file", entityId: anchors.filePath ?? "" }, Boolean(anchors.filePath));
-  markVisitedEntity(shared, { entityType: "commit", entityId: anchors.commitHash ?? "" }, Boolean(anchors.commitHash));
-
   await seedRootState(runtime, rootNode, anchors);
   if (shared.terminationReason === undefined) {
     await runNode(runtime, rootNode);
   }
 
-  const plannerState = buildPlannerState(runtime.shared, rootNode);
+  const plannerState = buildInvestigationPlannerContext(runtime.shared, rootNode);
   const synthesis = await synthesizeFinalAnswer(runtime, plannerState, anchors);
   return finalizeResult(store, question, anchors.filePath, runtime.shared, synthesis.answer, synthesis.evidenceScore);
 }
@@ -160,78 +122,26 @@ async function seedRootState(
   node: RuntimeNode,
   anchors: InvestigationAnchors
 ): Promise<void> {
-  const searchQuery = [anchors.filePath, anchors.normalizedQuestion].filter(Boolean).join(" ").trim();
-  const seedActions: Array<{ action: InvestigationAction; rationale: string }> = [
-    {
-      action: {
-        type: "search_temporary_memory",
-        query: searchQuery || anchors.normalizedQuestion,
-        limit: runtime.shared.budget.topKPerSearch
-      },
-      rationale: "Initial temporary working-context seed."
-    },
-    {
-      action: {
-        type: "search_memories",
-        query: searchQuery || anchors.normalizedQuestion,
-        limit: runtime.shared.budget.topKPerSearch
-      },
-      rationale: "Initial memory-layer seed."
-    },
-    {
-      action: {
-        type: "search_raw_sources",
-        query: searchQuery || anchors.normalizedQuestion,
-        limit: runtime.shared.budget.topKPerSearch
-      },
-      rationale: "Initial raw-source seed."
-    }
-  ];
-
-  if (anchors.filePath) {
-    seedActions.push({
-      action: {
-        type: "find_related_commits",
-        filePath: anchors.filePath,
-        limit: runtime.shared.budget.topKPerSearch
-      },
-      rationale: "Initial file-to-commit seed."
-    });
-  } else if (anchors.commitHash) {
-    seedActions.push({
-      action: {
-        type: "read_commit",
-        hash: anchors.commitHash
-      },
-      rationale: "Initial commit anchor seed."
-    });
-  }
-
-  if (anchors.filePath) {
-    const decisionMatches = findDecisions(runtime.store, { limit: runtime.shared.budget.topKPerSearch });
-    addDecisions(runtime.shared, decisionMatches);
-  } else if (anchors.decisionLike) {
-    const decisionMatches = findDecisions(runtime.store, {
-      topic: anchors.normalizedQuestion,
-      limit: runtime.shared.budget.topKPerSearch
-    });
+  const seed = buildInvestigationSeed(anchors, runtime.shared.budget);
+  if (seed.decisionLookup) {
+    const decisionMatches = findDecisions(runtime.store, seed.decisionLookup);
     addDecisions(runtime.shared, decisionMatches);
   }
 
-  for (const seed of seedActions) {
+  for (const seedAction of seed.actions) {
     if (runtime.shared.totalSteps >= runtime.shared.budget.maxSteps) {
       runtime.shared.terminationReason = "max_steps";
       return;
     }
-    const executed = executeAction(runtime.store, seed.action, runtime.shared.budget);
+    const executed = executeAction(runtime.store, seedAction.action, runtime.shared.budget);
     const newEvidence = applyObservation(runtime.shared, executed);
     appendStep(runtime.shared, {
       node,
-      action: seed.action,
-      actionInput: actionInputFromAction(seed.action),
+      action: seedAction.action,
+      actionInput: actionInputFromAction(seedAction.action),
       observationSummary: executed.summary,
       newEvidence,
-      plannerRationale: seed.rationale,
+      plannerRationale: seedAction.rationale,
       status: "completed"
     });
   }
@@ -260,7 +170,7 @@ async function runNode(runtime: InvestigationRuntime, node: RuntimeNode): Promis
       return;
     }
 
-    const plannerState = buildPlannerState(runtime.shared, node);
+    const plannerState = buildInvestigationPlannerContext(runtime.shared, node);
     const decision = await requestNextAction(runtime.provider, plannerState, runtime.shared, node);
     if (!decision) {
       if (runtime.shared.terminationReason === undefined) {
@@ -369,7 +279,7 @@ async function runNode(runtime: InvestigationRuntime, node: RuntimeNode): Promis
 
 async function requestNextAction(
   provider: InvestigatorProvider,
-  state: ReturnType<typeof buildPlannerState>,
+  state: InvestigationPlannerState,
   shared: SharedInvestigationState,
   node: RuntimeNode
 ): Promise<{ action: InvestigationAction; rationale: string } | undefined> {
@@ -680,7 +590,7 @@ function applyObservation(shared: SharedInvestigationState, observation: Execute
 
 async function synthesizeFinalAnswer(
   runtime: InvestigationRuntime,
-  state: ReturnType<typeof buildPlannerState>,
+  state: InvestigationPlannerState,
   anchors: InvestigationAnchors
 ): Promise<{ answer: string; evidenceScore: number }> {
   try {
@@ -883,76 +793,6 @@ function decorateSearchResult(store: MemoryStore, result: SearchResult): SearchR
   };
 }
 
-function createSharedState(rootQuestion: string, budget: InvestigationBudget): SharedInvestigationState {
-  return {
-    rootQuestion,
-    mode: "native-rlm",
-    budget,
-    traceSteps: [],
-    evidence: new Map(),
-    searchResults: new Map(),
-    relatedCommits: new Map(),
-    relatedDecisions: new Map(),
-    temporaryMemories: new Map(),
-    relatedMemories: new Map(),
-    candidateMemories: new Map(),
-    visitedEntities: new Set(),
-    visitedActionKeys: new Set(),
-    nextStepNumber: 1,
-    nextNodeNumber: 1,
-    totalSteps: 0,
-    plannerSteps: 0,
-    noNewEvidenceStreak: 0
-  };
-}
-
-function buildPlannerState(
-  shared: SharedInvestigationState,
-  node: RuntimeNode
-): {
-  mode: InvestigationMode;
-  question: string;
-  rootQuestion: string;
-  depth: number;
-  node: InvestigationNode;
-  budget: InvestigationBudget;
-  trace: InvestigationTrace;
-  evidence: EvidenceRef[];
-  visitedEntities: string[];
-  relatedCommits: CommitRecord[];
-  relatedDecisions: DecisionRecord[];
-  temporaryMemories: TemporaryMemorySearchResult[];
-  relatedMemories: DurableMemory[];
-  candidateMemories: MemoryCandidate[];
-  searchResults: SearchResult[];
-} {
-  const plannerNode: InvestigationNode = {
-    id: node.id,
-    question: node.question,
-    depth: node.depth
-  };
-  if (node.targetEntity) plannerNode.targetEntity = node.targetEntity;
-  if (node.parentNodeId) plannerNode.parentNodeId = node.parentNodeId;
-
-  return {
-    mode: shared.mode,
-    question: node.question,
-    rootQuestion: shared.rootQuestion,
-    depth: node.depth,
-    node: plannerNode,
-    budget: shared.budget,
-    trace: { steps: shared.traceSteps },
-    evidence: [...shared.evidence.values()],
-    visitedEntities: [...shared.visitedEntities],
-    relatedCommits: [...shared.relatedCommits.values()],
-    relatedDecisions: [...shared.relatedDecisions.values()],
-    temporaryMemories: [...shared.temporaryMemories.values()],
-    relatedMemories: [...shared.relatedMemories.values()],
-    candidateMemories: [...shared.candidateMemories.values()],
-    searchResults: [...shared.searchResults.values()]
-  };
-}
-
 function budgetFromConfig(config: InvestigatorConfig): InvestigationBudget {
   return {
     maxDepth: config.maxDepth,
@@ -980,24 +820,6 @@ function hasProviderCredentials(config: InvestigatorConfig): boolean {
   const workspaceIdEnv = config.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID";
   const regionEnv = config.regionEnv ?? "AWS_REGION";
   return Boolean(process.env[workspaceIdEnv]?.trim() && process.env[regionEnv]?.trim());
-}
-
-function deriveAnchors(
-  question: string,
-  overrides: { filePath?: string } = {}
-): InvestigationAnchors {
-  const normalizedQuestion = question.trim();
-  const filePath =
-    overrides.filePath ??
-    normalizedQuestion.match(/(?:[\w.-]+\/)+[\w.-]+/)?.[0];
-  const commitHash = normalizedQuestion.match(/\b[0-9a-f]{7,40}\b/i)?.[0];
-  const anchors: InvestigationAnchors = {
-    normalizedQuestion,
-    decisionLike: /\b(decision|decide|chose|choose|rejected|bug|fix|why|reason)\b/i.test(normalizedQuestion)
-  };
-  if (filePath) anchors.filePath = filePath;
-  if (commitHash) anchors.commitHash = commitHash;
-  return anchors;
 }
 
 function appendStep(

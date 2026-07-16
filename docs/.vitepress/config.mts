@@ -10,6 +10,7 @@ export default defineConfig({
     nav: [
       { text: "Quick Start", link: "/quickstart" },
       { text: "MCP Setup", link: "/mcp-setup" },
+      { text: "Privacy", link: "/privacy" },
       { text: "Architecture", link: "/architecture.html" },
       { text: "GitHub", link: "https://github.com/hcipherdev/CodeButler" },
     ],
@@ -20,6 +21,9 @@ export default defineConfig({
           { text: "Overview", link: "/" },
           { text: "Quick Start", link: "/quickstart" },
           { text: "MCP Setup", link: "/mcp-setup" },
+          { text: "Retrieval", link: "/retrieval" },
+          { text: "Operations", link: "/operations" },
+          { text: "Privacy", link: "/privacy" },
           { text: "Architecture", link: "/architecture.html" },
         ],
       },

@@ -53,10 +53,20 @@ describe("project config", () => {
       model: "nomic-embed-text",
       batchSize: 16
     });
-    expect(generatedProjectConfig.privacy).toEqual({ allowRemoteEmbeddings: false });
+    expect(generatedProjectConfig.privacy).toEqual({ allowRemoteEmbeddings: false, redactionPatterns: [] });
+    expect(generatedProjectConfig.retention).toEqual({
+      migrationBackups: 2,
+      sources: {
+        git: { maxAgeDays: null },
+        codex: { maxAgeDays: null },
+        claude: { maxAgeDays: null },
+        manual: { maxAgeDays: null }
+      },
+      overrides: []
+    });
     expect(existsSync(join(rootDir, ".code-butler", ".gitignore"))).toBe(true);
     expect(readFileSync(join(rootDir, ".code-butler", ".gitignore"), "utf8")).toBe(
-      ["/*", "!/project-summary.md", ""].join("\n")
+      ["/*", "!/.gitignore", "!/config.json", "!/memory.sqlite", "!/project-summary.md", ""].join("\n")
     );
     expect(existsSync(join(rootDir, ".code-butler", ".env.example"))).toBe(true);
     expect(existsSync(join(rootDir, ".code-butler", "config.examples.json"))).toBe(true);
@@ -83,7 +93,9 @@ describe("project config", () => {
       model: "nomic-embed-text",
       batchSize: 16
     });
-    expect(defaults.privacy).toEqual({ allowRemoteEmbeddings: false });
+    expect(defaults.privacy).toEqual({ allowRemoteEmbeddings: false, redactionPatterns: [] });
+    expect(defaults.retention!.migrationBackups).toBe(2);
+    expect(defaults.retention!.sources.manual.maxAgeDays).toBeNull();
 
     mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
     writeFileSync(
@@ -158,6 +170,25 @@ describe("project config", () => {
       },
       privacy: { allowRemoteEmbeddings: false }
     });
+    expect(examples.privacyControls).toEqual({
+      description: expect.any(String),
+      privacy: {
+        redactionPatterns: [
+          { name: "internal token", kind: "regex", pattern: "INTERNAL-[A-Za-z0-9]+" },
+          { name: "literal password", kind: "literal", pattern: "replace-this-example" }
+        ]
+      },
+      retention: {
+        migrationBackups: 2,
+        sources: {
+          git: { maxAgeDays: null },
+          codex: { maxAgeDays: 90 },
+          claude: { maxAgeDays: 90 },
+          manual: { maxAgeDays: null }
+        },
+        overrides: []
+      }
+    });
     expect(examples.openaiCompatible.extractor).toMatchObject({
       provider: "openai-compatible",
       baseUrl: "https://api.openai.com/v1",
@@ -201,7 +232,15 @@ describe("project config", () => {
           apiKeyEnv: "EMBEDDING_API_KEY",
           batchSize: 8
         },
-        privacy: { allowRemoteEmbeddings: true }
+        privacy: {
+          allowRemoteEmbeddings: true,
+          redactionPatterns: [{ name: "tenant token", pattern: "TENANT-[0-9]+", kind: "regex" }]
+        },
+        retention: {
+          migrationBackups: 3,
+          sources: { codex: { maxAgeDays: 30 } },
+          overrides: [{ sourceId: "temporary-conversation", maxAgeDays: 7 }]
+        }
       })
     );
 
@@ -216,7 +255,17 @@ describe("project config", () => {
       apiKeyEnv: "EMBEDDING_API_KEY",
       batchSize: 8
     });
-    expect(config.privacy).toEqual({ allowRemoteEmbeddings: true });
+    expect(config.retention?.overrides).toEqual([
+      { sourceId: "temporary-conversation", maxAgeDays: 7 }
+    ]);
+    expect(config.privacy).toEqual({
+      allowRemoteEmbeddings: true,
+      redactionPatterns: [{ name: "tenant token", pattern: "TENANT-[0-9]+", kind: "regex" }]
+    });
+    expect(config.retention).toMatchObject({
+      migrationBackups: 3,
+      sources: { codex: { maxAgeDays: 30 }, git: { maxAgeDays: null } }
+    });
     expect(config.extractor).toMatchObject({ model: "gpt-5-mini", apiKeyEnv: "OPENAI_API_KEY" });
     expect(config.investigator).toMatchObject({ model: "gpt-5-mini", apiKeyEnv: "OPENAI_API_KEY" });
   });
@@ -237,7 +286,8 @@ describe("project config", () => {
       model: "nomic-embed-text",
       batchSize: 16
     });
-    expect(config.privacy).toEqual({ allowRemoteEmbeddings: false });
+    expect(config.privacy).toEqual({ allowRemoteEmbeddings: false, redactionPatterns: [] });
+    expect(config.retention!.migrationBackups).toBe(2);
   });
 
   it.each([
@@ -250,7 +300,26 @@ describe("project config", () => {
     [{ embeddings: { model: " " } }, "embeddings.model must be a nonempty string"],
     [{ embeddings: { apiKeyEnv: "" } }, "embeddings.apiKeyEnv must be a nonempty string"],
     [{ embeddings: { batchSize: 0 } }, "embeddings.batchSize must be a positive integer"],
-    [{ privacy: { allowRemoteEmbeddings: "false" } }, "privacy.allowRemoteEmbeddings must be a boolean"]
+    [{ privacy: { allowRemoteEmbeddings: "false" } }, "privacy.allowRemoteEmbeddings must be a boolean"],
+    [{ privacy: { redactionPatterns: "secret" } }, "privacy.redactionPatterns must be an array"],
+    [{ privacy: { redactionPatterns: [{ name: "", kind: "literal", pattern: "secret" }] } }, "privacy.redactionPatterns[0].name must use safe characters"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "(" }] } }, "privacy.redactionPatterns[0].pattern must be a valid regular expression"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "secret", flags: "x" }] } }, "privacy.redactionPatterns[0].flags contains unsupported flags"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "a*" }] } }, "privacy.redactionPatterns[0].pattern must not match empty text"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "(?=secret)secret" }] } }, "privacy.redactionPatterns[0].pattern uses unsupported lookaround or backreferences"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "(?<token>a)\\k<token>" }] } }, "privacy.redactionPatterns[0].pattern uses unsupported lookaround or backreferences"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "(a+)+" }] } }, "privacy.redactionPatterns[0].pattern contains unsafe nested repetition"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "^(a|aa)+$" }] } }, "privacy.redactionPatterns[0].pattern contains unsafe quantified groups"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "^((a|aa))+$" }] } }, "privacy.redactionPatterns[0].pattern contains unsafe quantified groups"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "^a+a+a+b$" }] } }, "privacy.redactionPatterns[0].pattern contains repeated unbounded repetition"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "regex", pattern: "^.*.*Z$" }] } }, "privacy.redactionPatterns[0].pattern contains repeated unbounded repetition"],
+    [{ privacy: { redactionPatterns: [{ name: "bad", kind: "literal", pattern: "secret", flags: "i" }] } }, "privacy.redactionPatterns[0].flags are only valid for regex rules"],
+    [{ retention: { migrationBackups: -1 } }, "retention.migrationBackups must be a non-negative integer"],
+    [{ retention: { sources: { git: { maxAgeDays: 0 } } } }, "retention.sources.git.maxAgeDays must be null or a positive integer"]
+    ,[{ privacy: { redactionPattern: [] } }, "privacy contains unknown key: redactionPattern"]
+    ,[{ privacy: { redactionPatterns: [{ name: "bad", kind: "literal", pattern: "secret", typo: true }] } }, "privacy.redactionPatterns[0] contains unknown key: typo"]
+    ,[{ retention: { sources: { github: { maxAgeDays: 30 } } } }, "retention.sources contains unknown key: github"]
+    ,[{ retention: { sources: { git: { maxAgeDay: 30 } } } }, "retention.sources.git contains unknown key: maxAgeDay"]
   ])("rejects malformed Release 3 config %#", (invalid, message) => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -295,7 +364,9 @@ describe("project config", () => {
 
     ensureProjectConfig(rootDir);
 
-    expect(readFileSync(gitignorePath, "utf8")).toBe(["/*", "!/project-summary.md", ""].join("\n"));
+    expect(readFileSync(gitignorePath, "utf8")).toBe(
+      ["/*", "!/.gitignore", "!/config.json", "!/memory.sqlite", "!/project-summary.md", ""].join("\n")
+    );
   });
 
   it("adds current Codex sessions when legacy configs only point at archived sessions", () => {

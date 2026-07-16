@@ -14,6 +14,8 @@ Project memory stays local by default in each repository's `.code-butler/` direc
 
 Search is local SQLite FTS by default. Projects may opt into hybrid lexical/semantic ranking through an explicitly configured OpenAI-compatible embedding endpoint; FTS remains the exact fallback and remote use requires explicit privacy permission with mandatory redaction.
 
+Code-aware summaries inspect deterministic, privacy-filtered Git-tracked implementation files and preserve a user-owned notes overlay. Manual summary edits are protected with a separate output hash. Persisted source parsing failures are available through `code-butler sources failures` and `list_source_failures`, then resolve automatically after repair.
+
 ## What Code Butler Adds
 
 Git explains what changed. Chat logs explain pieces of why. Agent instruction files explain what future agents should do. Code Butler connects those sources into a searchable project memory layer.

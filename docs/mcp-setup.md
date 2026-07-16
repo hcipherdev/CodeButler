@@ -16,9 +16,10 @@ The MCP server resolves the target Git repository and creates internal project-l
 
 ## Common Tools
 
-The MCP server exposes 20 tools. Lifecycle-related calls include:
+The MCP server exposes 21 tools. Lifecycle and operations calls include:
 
 - `sync_project_memory`
+- `list_source_failures`
 - `summarize_project_brief`
 - `summarize_active_context`
 - `search_temporary_memory`
@@ -31,6 +32,8 @@ The MCP server exposes 20 tools. Lifecycle-related calls include:
 - `summarize_recent_activity`
 
 `find_memories` accepts optional `lifecycleStatus: "current" | "superseded" | "retracted" | "all"`. When omitted, promoted results remain current-only; candidates are unchanged. `remember_project_memory` accepts `supersedesMemoryId` for promoted replacements. `update_memory_status` requires a nonempty `memoryId`, lifecycle `status`, and `reason`; `superseded` also requires `replacementMemoryId`.
+
+`list_source_failures` accepts optional `adapter`, `resolved`, and bounded `limit` filters. Messages are sanitized and never include raw parser lines. Repairing and successfully reparsing a source resolves its persisted failures automatically.
 
 Search is FTS-only by default. With optional hybrid retrieval configured, `search_project_memory` and `find_memories` may add `ranking.lexicalRank`, `ranking.semanticRank`, and `ranking.fusedScore` to ranked results. Existing fields and required parameters are unchanged. If semantic ranking is unavailable for any reason, the MCP response is exactly the FTS response and contains no ranking metadata.
 

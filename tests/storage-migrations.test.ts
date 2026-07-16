@@ -25,6 +25,60 @@ describe("ordered storage migrations", () => {
     expect(createV3MemorySubjectKey("decision", "  R\u00e9sum\u00e9 / API v2  ")).toBe("decision:resume-api-v2");
   });
 
+  it("adds the version-9 content-free operation and source tombstone schema", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+
+    expect(CURRENT_SCHEMA_VERSION).toBe(10);
+    expect(store.db.prepare("pragma table_info(source_failures)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "adapter" }),
+        expect.objectContaining({ name: "path" }),
+        expect.objectContaining({ name: "error_code" }),
+        expect.objectContaining({ name: "attempts" }),
+        expect.objectContaining({ name: "resolved_at" })
+      ])
+    );
+    expect(store.db.prepare("pragma table_info(operation_log)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "id", pk: 1 }),
+        expect.objectContaining({ name: "operation_type" }),
+        expect.objectContaining({ name: "status" }),
+        expect.objectContaining({ name: "started_at" }),
+        expect.objectContaining({ name: "completed_at" }),
+        expect.objectContaining({ name: "actor" }),
+        expect.objectContaining({ name: "metadata_json", dflt_value: "'{}'" })
+      ])
+    );
+    expect(store.db.prepare("pragma table_info(source_tombstones)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "source_type", pk: 1 }),
+        expect.objectContaining({ name: "source_id_hash", pk: 2 }),
+        expect.objectContaining({ name: "deleted_at" }),
+        expect.objectContaining({ name: "operation_id" })
+      ])
+    );
+    const migrationOperations = store.listOperations({ operationType: "migration" });
+    expect(migrationOperations).toHaveLength(2);
+    expect(migrationOperations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 10 }
+      }),
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 9 }
+      })
+    ]));
+    store.close();
+  });
+
   it("upgrades a legacy database in place, records ordered versions, and creates a backup", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -265,7 +319,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(7);
+    expect(CURRENT_SCHEMA_VERSION).toBe(10);
     expect(store.db.prepare("select count(*) as count from sources").get()).toEqual(before.sources);
     expect(store.db.prepare("select count(*) as count from chunks").get()).toEqual(before.chunks);
     expect(store.db.prepare("select count(*) as count from memories").get()).toEqual(before.memories);
@@ -385,6 +439,11 @@ describe("ordered storage migrations", () => {
     expect(
       db.prepare("select max(version) as version from schema_migrations").get()
     ).toEqual({ version: CURRENT_SCHEMA_VERSION });
+    expect(db.prepare(
+      `select count(*) as count from operation_log
+       where operation_type = 'migration'
+         and json_extract(metadata_json, '$.migrationVersion') = ?`
+    ).get(CURRENT_SCHEMA_VERSION + 1)).toEqual({ count: 0 });
     const retained = readdirSync(join(rootDir, ".code-butler")).filter((name) =>
       name.startsWith("memory.sqlite.backup-")
     );
@@ -393,7 +452,7 @@ describe("ordered storage migrations", () => {
     db.close();
   });
 
-  it("retains only the newest five migration backups by default", () => {
+  it("retains only the newest two migration backups by default", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const dataDir = join(rootDir, ".code-butler");
@@ -413,7 +472,29 @@ describe("ordered storage migrations", () => {
     store.init();
     store.close();
 
-    expect(readdirSync(dataDir).filter((name) => name.startsWith("memory.sqlite.backup-"))).toHaveLength(5);
+    expect(readdirSync(dataDir).filter((name) => name.startsWith("memory.sqlite.backup-"))).toHaveLength(2);
+  });
+
+  it("uses an explicit migration backup retention override", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const dataDir = join(rootDir, ".code-butler");
+    const databasePath = join(dataDir, "memory.sqlite");
+    mkdirSync(dataDir, { recursive: true });
+    const db = new DatabaseSync(databasePath);
+    db.exec("create table legacy_data (value text); insert into legacy_data values ('kept')");
+    db.close();
+    for (let index = 0; index < 4; index += 1) {
+      const backup = `${databasePath}.backup-2026-02-0${index + 1}T00-00-00-000Z.sqlite`;
+      const placeholder = new DatabaseSync(backup);
+      placeholder.close();
+    }
+
+    const store = openMemoryStore(rootDir, { backupRetention: 3 });
+    store.init();
+    store.close();
+
+    expect(readdirSync(dataDir).filter((name) => name.startsWith("memory.sqlite.backup-"))).toHaveLength(3);
   });
 
   it("does not double-apply a migration body across concurrent initializers", async () => {
@@ -466,6 +547,11 @@ describe("ordered storage migrations", () => {
     expect(
       verified.prepare("select count(*) as count from schema_migrations where name = 'concurrency probe'").get()
     ).toEqual({ count: 1 });
+    expect(verified.prepare(
+      `select count(*) as count from operation_log
+       where operation_type = 'migration' and status = 'completed'
+         and json_extract(metadata_json, '$.migrationVersion') = ?`
+    ).get(CURRENT_SCHEMA_VERSION + 1)).toEqual({ count: 1 });
     verified.close();
   });
 

@@ -6,17 +6,42 @@ import { pathToFileURL } from "node:url";
 
 import { loadProjectConfig } from "./config.js";
 import { registerProjectMemoryTools, type ProjectStartupMetadata } from "./mcp/tools.js";
-import { openMemoryStore } from "./storage/store.js";
+import { openConfiguredMemoryStore } from "./storage/open-configured-store.js";
+import { MemoryStoreCheckpointBusyError, type MemoryStore } from "./storage/store.js";
 import { syncProjectMemory } from "./sync/service.js";
 
 export interface ProjectMemoryServer {
   server: McpServer;
-  store: ReturnType<typeof openMemoryStore>;
+  store: MemoryStore;
 }
 
 export interface ProjectMemoryServerOptions {
   rootDir?: string;
   startupMetadata?: ProjectStartupMetadata;
+}
+
+class RecoverableProjectMemoryShutdownError extends Error {}
+
+export async function closeProjectMemoryServer(projectServer: ProjectMemoryServer): Promise<void> {
+  try {
+    projectServer.store.close();
+  } catch (error) {
+    if (error instanceof MemoryStoreCheckpointBusyError) {
+      throw new RecoverableProjectMemoryShutdownError(error.message);
+    }
+    throw new Error(
+      "Memory database close failed before MCP transport shutdown: " +
+      (error instanceof Error ? error.message : String(error))
+    );
+  }
+  try {
+    await projectServer.server.close();
+  } catch (error) {
+    throw new Error(
+      "MCP server close failed after the memory database was safely closed: " +
+      (error instanceof Error ? error.message : String(error))
+    );
+  }
 }
 
 export async function createProjectMemoryServer(
@@ -28,7 +53,7 @@ export async function createProjectMemoryServer(
     configCreated: !existsSync(join(rootDir, ".code-butler", "config.json")),
     databaseCreated: !existsSync(join(rootDir, ".code-butler", "memory.sqlite"))
   };
-  const store = openMemoryStore(rootDir);
+  const store = openConfiguredMemoryStore(rootDir);
   store.init();
   const config = loadProjectConfig(rootDir);
   if (config.sync.autoSyncOnServerStart) {
@@ -48,16 +73,29 @@ export async function startServer(options: ProjectMemoryServerOptions = {}): Pro
   await projectServer.server.connect(transport);
   console.error("Project Memory MCP Server running on stdio");
 
-  const close = async (): Promise<void> => {
-    await projectServer.server.close();
-    projectServer.store.close();
+  const close = (): Promise<void> => closeProjectMemoryServer(projectServer);
+  const handleSignal = (signal: "SIGINT" | "SIGTERM"): void => {
+    void close().then(
+      () => process.exit(0),
+      (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (error instanceof RecoverableProjectMemoryShutdownError) {
+          console.error(
+            `Code Butler ${signal} shutdown was cancelled: ${message} ` +
+            "The server remains running; close other SQLite readers and signal again before syncing this project."
+          );
+          process.exitCode = 1;
+          return;
+        }
+        console.error(
+          `Code Butler ${signal} shutdown failed after closing the memory database: ${message}. Terminating.`
+        );
+        process.exit(1);
+      }
+    );
   };
-  process.once("SIGINT", () => {
-    void close().finally(() => process.exit(0));
-  });
-  process.once("SIGTERM", () => {
-    void close().finally(() => process.exit(0));
-  });
+  process.on("SIGINT", () => handleSignal("SIGINT"));
+  process.on("SIGTERM", () => handleSignal("SIGTERM"));
 
   return projectServer;
 }

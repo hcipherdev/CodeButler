@@ -32,7 +32,8 @@ const KEY_TABLES = [
   "sync_sources",
   "memory_candidates",
   "memories",
-  "temporary_memories"
+  "temporary_memories",
+  "source_failures"
 ] as const;
 const REQUIRED_QUALITY_COLUMNS = ["quality_status", "quality_reasons_json", "last_verified_at"] as const;
 const SYNC_SOURCES: SyncSourceName[] = ["git", "codex", "claude"];
@@ -160,6 +161,7 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
     if (config !== undefined) {
       addProjectChecks(config, addCheck, addAction);
       addSourceChecks(config, storage, addCheck, addAction);
+      addPersistentSourceFailureCheck(storage, addCheck, addAction);
       addSyncChecks(config, storage, now, addCheck, addAction);
       addExtractorChecks(config, addCheck, addAction);
       addEmbeddingChecks(config, storage, addCheck, addAction);
@@ -177,6 +179,47 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
     checks,
     nextActions: sortActions(nextActions)
   };
+}
+
+function addPersistentSourceFailureCheck(
+  storage: DoctorStorageState,
+  addCheck: (check: DoctorCheck) => void,
+  addAction: (action: DoctorNextAction) => void
+): void {
+  if (!storage.db || !storage.readableTables.has("source_failures")) {
+    addCheck({
+      id: "sources:persistent_failures",
+      category: "sources",
+      status: "warning",
+      title: "Source failure diagnostics are unavailable",
+      detail: "The source_failures schema is not available; finish pending migrations."
+    });
+    return;
+  }
+  const rows = storage.db.prepare(
+    `select adapter, count(*) as count
+     from source_failures where resolved_at is null
+     group by adapter order by adapter`
+  ).all() as unknown as Array<{ adapter: SyncSourceName; count: number }>;
+  const byAdapter = Object.fromEntries(rows.map((row) => [row.adapter, Number(row.count)]));
+  const unresolved = rows.reduce((total, row) => total + Number(row.count), 0);
+  addCheck({
+    id: "sources:persistent_failures",
+    category: "sources",
+    status: unresolved > 0 ? "warning" : "ok",
+    title: unresolved > 0 ? "Source parsing failures need repair" : "No unresolved source parsing failures",
+    detail: unresolved > 0
+      ? `${unresolved} persisted source parsing failure(s) remain unresolved.`
+      : "Every persisted source parsing failure is resolved.",
+    metadata: { unresolved, byAdapter }
+  });
+  if (unresolved > 0) {
+    addAction({
+      priority: "medium",
+      command: "code-butler sources failures",
+      reason: "Inspect and repair persisted source parsing failures."
+    });
+  }
 }
 
 function addEmbeddingChecks(

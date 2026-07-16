@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type { ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, ProjectConfig } from "./types.js";
+import type { ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, ProjectConfig, RedactionPatternConfig } from "./types.js";
+import { validateRedactionPattern } from "./privacy/policy.js";
 
 interface ProjectConfigFile {
   sources?: {
@@ -17,6 +18,11 @@ interface ProjectConfigFile {
   retrieval?: Partial<ProjectConfig["retrieval"]>;
   embeddings?: Partial<ProjectConfig["embeddings"]>;
   privacy?: Partial<ProjectConfig["privacy"]>;
+  retention?: {
+    migrationBackups?: number;
+    sources?: Partial<Record<"git" | "codex" | "claude" | "manual", { maxAgeDays?: number | null }>>;
+    overrides?: Array<{ sourceId: string; maxAgeDays: number | null }>;
+  };
   deterministic?: Partial<ProjectConfig["deterministic"]> & {
     triggers?: Partial<ProjectConfig["deterministic"]["triggers"]>;
   };
@@ -43,7 +49,14 @@ const PROVIDER_KEYS = [
   "regionEnv",
   "maxTokens"
 ] as const;
-const PROJECT_CODE_BUTLER_IGNORE = ["/*", "!/project-summary.md", ""].join("\n");
+const PROJECT_CODE_BUTLER_IGNORE = [
+  "/*",
+  "!/.gitignore",
+  "!/config.json",
+  "!/memory.sqlite",
+  "!/project-summary.md",
+  ""
+].join("\n");
 const LEGACY_ENV_ONLY_IGNORE = [".env", ".env.*", "!*.example", ""].join("\n");
 
 export function ensureProjectConfig(rootDir: string): string {
@@ -144,6 +157,16 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
       ...defaults.privacy,
       ...(parsed.privacy ?? {})
     },
+    retention: {
+      migrationBackups: parsed.retention?.migrationBackups ?? defaults.retention!.migrationBackups,
+      sources: {
+        git: { ...defaults.retention!.sources.git, ...(parsed.retention?.sources?.git ?? {}) },
+        codex: { ...defaults.retention!.sources.codex, ...(parsed.retention?.sources?.codex ?? {}) },
+        claude: { ...defaults.retention!.sources.claude, ...(parsed.retention?.sources?.claude ?? {}) },
+        manual: { ...defaults.retention!.sources.manual, ...(parsed.retention?.sources?.manual ?? {}) }
+      },
+      overrides: parsed.retention?.overrides ?? defaults.retention!.overrides
+    },
     deterministic: {
       ...defaults.deterministic,
       ...deterministic,
@@ -220,7 +243,18 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
       batchSize: 16
     },
     privacy: {
-      allowRemoteEmbeddings: false
+      allowRemoteEmbeddings: false,
+      redactionPatterns: []
+    },
+    retention: {
+      migrationBackups: 2,
+      sources: {
+        git: { maxAgeDays: null },
+        codex: { maxAgeDays: null },
+        claude: { maxAgeDays: null },
+        manual: { maxAgeDays: null }
+      },
+      overrides: []
     },
     deterministic: {
       enabled: true,
@@ -272,14 +306,28 @@ function validateProjectConfigFile(value: unknown): void {
   }
 
   const privacy = optionalConfigSection(value, "privacy");
-  if (privacy && privacy.allowRemoteEmbeddings !== undefined && typeof privacy.allowRemoteEmbeddings !== "boolean") {
-    throw new Error("privacy.allowRemoteEmbeddings must be a boolean");
+  if (privacy) {
+    assertKnownKeys(privacy, new Set(["allowRemoteEmbeddings", "redactionPatterns"]), "privacy");
+    if (privacy.allowRemoteEmbeddings !== undefined && typeof privacy.allowRemoteEmbeddings !== "boolean") {
+      throw new Error("privacy.allowRemoteEmbeddings must be a boolean");
+    }
+    if (privacy.redactionPatterns !== undefined) {
+      if (!Array.isArray(privacy.redactionPatterns)) throw new Error("privacy.redactionPatterns must be an array");
+      for (const [index, pattern] of privacy.redactionPatterns.entries()) {
+        if (!isConfigRecord(pattern)) throw new Error(`privacy.redactionPatterns[${index}] must be an object`);
+        assertKnownKeys(pattern, new Set(["name", "kind", "pattern", "flags"]), `privacy.redactionPatterns[${index}]`);
+        validateRedactionPattern(pattern as unknown as RedactionPatternConfig, index);
+      }
+    }
   }
+
+  const retention = optionalConfigSection(value, "retention");
+  if (retention) validateRetentionConfig(retention);
 }
 
 function optionalConfigSection(
   config: Record<string, unknown>,
-  name: "retrieval" | "embeddings" | "privacy"
+  name: "retrieval" | "embeddings" | "privacy" | "retention"
 ): Record<string, unknown> | undefined {
   const value = config[name];
   if (value === undefined) return undefined;
@@ -293,6 +341,47 @@ function isConfigRecord(value: unknown): value is Record<string, unknown> {
 
 function isPositiveInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value > 0;
+}
+
+function validateRetentionConfig(retention: Record<string, unknown>): void {
+  assertKnownKeys(retention, new Set(["migrationBackups", "sources", "overrides"]), "retention");
+  if (retention.migrationBackups !== undefined && !isNonNegativeInteger(retention.migrationBackups)) {
+    throw new Error("retention.migrationBackups must be a non-negative integer");
+  }
+  if (retention.sources === undefined) return;
+  if (!isConfigRecord(retention.sources)) throw new Error("retention.sources must be an object");
+  assertKnownKeys(retention.sources, new Set(["git", "codex", "claude", "manual"]), "retention.sources");
+  for (const adapter of ["git", "codex", "claude", "manual"] as const) {
+    const policy = retention.sources[adapter];
+    if (policy === undefined) continue;
+    if (!isConfigRecord(policy)) throw new Error(`retention.sources.${adapter} must be an object`);
+    assertKnownKeys(policy, new Set(["maxAgeDays"]), `retention.sources.${adapter}`);
+    if (policy.maxAgeDays !== undefined && policy.maxAgeDays !== null && !isPositiveInteger(policy.maxAgeDays)) {
+      throw new Error(`retention.sources.${adapter}.maxAgeDays must be null or a positive integer`);
+    }
+  }
+  if (retention.overrides !== undefined) {
+    if (!Array.isArray(retention.overrides)) throw new Error("retention.overrides must be an array");
+    for (const [index, override] of retention.overrides.entries()) {
+      if (!isConfigRecord(override)) throw new Error(`retention.overrides[${index}] must be an object`);
+      assertKnownKeys(override, new Set(["sourceId", "maxAgeDays"]), `retention.overrides[${index}]`);
+      if (typeof override.sourceId !== "string" || override.sourceId.trim() === "") {
+        throw new Error(`retention.overrides[${index}].sourceId must be a non-empty string`);
+      }
+      if (override.maxAgeDays !== null && !isPositiveInteger(override.maxAgeDays)) {
+        throw new Error(`retention.overrides[${index}].maxAgeDays must be null or a positive integer`);
+      }
+    }
+  }
+}
+
+function assertKnownKeys(record: Record<string, unknown>, allowed: ReadonlySet<string>, path: string): void {
+  const unknown = Object.keys(record).find((key) => !allowed.has(key));
+  if (unknown) throw new Error(`${path} contains unknown key: ${unknown}`);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0;
 }
 
 function isNonemptyString(value: unknown): value is string {
@@ -415,7 +504,18 @@ function defaultConfigFile(): ProjectConfigFile {
       batchSize: 16
     },
     privacy: {
-      allowRemoteEmbeddings: false
+      allowRemoteEmbeddings: false,
+      redactionPatterns: []
+    },
+    retention: {
+      migrationBackups: 2,
+      sources: {
+        git: { maxAgeDays: null },
+        codex: { maxAgeDays: null },
+        claude: { maxAgeDays: null },
+        manual: { maxAgeDays: null }
+      },
+      overrides: []
     },
     deterministic: {
       enabled: true,
@@ -586,6 +686,25 @@ function defaultConfigExamplesFile(): Record<string, unknown> {
         batchSize: 16
       },
       privacy: { allowRemoteEmbeddings: false }
+    },
+    privacyControls: {
+      description: "Project-specific redaction and retention examples. Replace example patterns before use.",
+      privacy: {
+        redactionPatterns: [
+          { name: "internal token", kind: "regex", pattern: "INTERNAL-[A-Za-z0-9]+" },
+          { name: "literal password", kind: "literal", pattern: "replace-this-example" }
+        ]
+      },
+      retention: {
+        migrationBackups: 2,
+        sources: {
+          git: { maxAgeDays: null },
+          codex: { maxAgeDays: 90 },
+          claude: { maxAgeDays: 90 },
+          manual: { maxAgeDays: null }
+        },
+        overrides: []
+      }
     },
     openaiCompatible: {
       description: "OpenAI-compatible /chat/completions providers such as OpenAI.",

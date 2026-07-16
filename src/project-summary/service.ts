@@ -1,23 +1,42 @@
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
   copyFileSync,
   existsSync,
+  fstatSync,
+  linkSync,
+  lstatSync,
+  mkdtempSync,
   mkdirSync,
+  openSync,
   readFileSync,
-  readdirSync,
-  statSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
   writeFileSync
 } from "node:fs";
-import { join, relative } from "node:path";
+import { isAbsolute, join, posix, relative, sep } from "node:path";
 
+import {
+  collectProjectSummaryCodeFiles,
+  listProjectSummarySafeTrackedPaths,
+  MAX_PROJECT_SUMMARY_FILE_CHARS,
+  readProjectSummaryTrackedFile,
+  readTrackedPaths,
+  type ProjectSummaryCodeFile
+} from "./code-context.js";
 import { createConfiguredProjectSummaryGenerator } from "./providers.js";
 import type { MemoryStore, ProjectSummary } from "../storage/store.js";
 import type { CommitRecord, MemorySearchResult, ProjectConfig } from "../types.js";
 
 const SUMMARY_VERSION = 1;
 const DAILY_REFRESH_MS = 24 * 60 * 60 * 1000;
-const MAX_CONTEXT_FILE_CHARS = 80_000;
 const MAX_INVENTORY_ENTRIES = 200;
+const MAX_MANIFEST_FILES = 100;
+const MAX_MANIFEST_CONTENT_CHARS = 120_000;
 const AGENT_FILE_NAMES = ["AGENTS.md", "CLAUDE.md"] as const;
 const MANIFEST_PATHS = [
   "Cargo.toml",
@@ -39,26 +58,27 @@ const MANIFEST_PATHS = [
   "next.config.mjs"
 ] as const;
 const DOC_PATHS = ["README.md", "docs/README.md", "MEMORY_SYSTEM.md", "PLAYBOOK.md"] as const;
-const IGNORED_INVENTORY_NAMES = new Set([
-  ".git",
-  ".code-butler",
-  "node_modules",
-  "dist",
-  "target",
-  "coverage",
-  ".next",
-  ".turbo",
-  ".cache"
-]);
-
+const NESTED_MANIFEST_BASENAMES = new Set(["Cargo.toml", "go.mod", "package.json", "pyproject.toml"]);
 export interface ProjectSummaryTextFile {
   path: string;
   content: string;
+  contentHash?: string;
+  originalBytes?: number;
+  truncated?: boolean;
+}
+
+export interface ProjectSummaryAgentHint {
+  fileName: "AGENTS.md" | "CLAUDE.md";
+  content: string;
+  contentHash?: string;
+  originalBytes?: number;
+  truncated?: boolean;
 }
 
 export interface ProjectSummaryCodeContext {
   manifests: ProjectSummaryTextFile[];
   docs: ProjectSummaryTextFile[];
+  codeFiles: ProjectSummaryCodeFile[];
   inventory: string[];
   memories: MemorySearchResult[];
   commits: CommitRecord[];
@@ -68,7 +88,8 @@ export interface ProjectSummaryCodeContext {
 export interface ProjectSummaryGeneratorInput {
   projectRoot: string;
   fingerprint: string;
-  agentHints: Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; content: string }>;
+  agentHints: ProjectSummaryAgentHint[];
+  notes?: ProjectSummaryTextFile;
   codeContext: ProjectSummaryCodeContext;
 }
 
@@ -81,6 +102,7 @@ export interface ProjectSummaryMeta {
   version: 1;
   summaryPath: string;
   fingerprint: string;
+  outputContentHash?: string;
   lastGeneratedAt?: string;
   lastCheckedAt?: string;
   provider?: string;
@@ -99,6 +121,8 @@ export interface ProjectSummaryStatus {
   metaPath: string;
   due: boolean;
   stale: boolean;
+  manualEditsDetected: boolean;
+  outputBaselineMissing: boolean;
   fingerprint?: string;
   currentFingerprint?: string;
   lastGeneratedAt?: string;
@@ -113,6 +137,8 @@ export interface ProjectSummaryRefreshResult {
   fingerprint?: string;
   meta?: ProjectSummaryMeta;
   skippedReason?: string;
+  manualEditsDetected?: boolean;
+  backupPath?: string;
 }
 
 export interface ProjectSummaryInstallResult extends ProjectSummaryRefreshResult {
@@ -126,6 +152,13 @@ export interface ProjectSummaryOperationOptions {
   now?: () => Date;
   force?: boolean;
   warn?: (line: string) => void;
+  bootstrapApplyFile?: (stagedPath: string, destinationPath: string) => void;
+  summaryApplyFile?: (stagedPath: string, destinationPath: string) => void;
+  summaryBeforeCommit?: (destinationPath: string) => void;
+}
+
+interface ProjectSummaryInputOptions {
+  omitAgentHints?: boolean;
 }
 
 export interface ProjectSummaryInstalledResult extends ProjectSummaryRefreshResult {
@@ -163,12 +196,20 @@ export function getProjectSummaryStatus(
     !existsSync(paths.summaryPath) ||
     meta === undefined ||
     (currentFingerprint !== undefined && meta.fingerprint !== currentFingerprint);
+  const outputHash = existsSync(paths.summaryPath) ? hashFile(paths.summaryPath) : undefined;
+  const outputBaselineMissing = existsSync(paths.summaryPath) && meta?.outputContentHash === undefined;
+  const manualEditsDetected =
+    outputHash !== undefined &&
+    meta?.outputContentHash !== undefined &&
+    outputHash !== meta.outputContentHash;
   const status: ProjectSummaryStatus = {
     exists: existsSync(paths.summaryPath),
     summaryPath: paths.summaryPath,
     metaPath: paths.metaPath,
     due: isSummaryRefreshDue(meta, now),
-    stale
+    stale,
+    manualEditsDetected,
+    outputBaselineMissing
   };
   if (meta?.fingerprint !== undefined) status.fingerprint = meta.fingerprint;
   if (currentFingerprint !== undefined) status.currentFingerprint = currentFingerprint;
@@ -184,8 +225,18 @@ export async function installProjectSummary(
   options: ProjectSummaryOperationOptions = {}
 ): Promise<ProjectSummaryInstallResult> {
   const rootDir = projectRoot(config, store);
-  const refreshed = await refreshProjectSummary(store, config, options);
-  const bootstrap = ensureAgentBootstrapFiles(rootDir, nowDate(options));
+  preflightProjectSummaryOutputs(rootDir);
+  const bootstrapPlan = planAgentBootstrapFiles(rootDir, nowDate(options));
+  const summarySnapshot = snapshotProjectSummaryFiles(rootDir);
+  let refreshed: ProjectSummaryRefreshResult;
+  let bootstrap: ProjectSummaryBootstrapResult;
+  try {
+    refreshed = await refreshProjectSummaryInternal(store, config, options, { omitAgentHints: true });
+    bootstrap = applyAgentBootstrapPlan(bootstrapPlan, options);
+  } catch (error) {
+    restoreProjectSummaryFiles(summarySnapshot);
+    throw error;
+  }
 
   const result: ProjectSummaryInstallResult = {
     ...refreshed,
@@ -202,35 +253,47 @@ export async function initializeProjectSummary(
   options: ProjectSummaryOperationOptions = {}
 ): Promise<ProjectSummaryInstalledResult> {
   const rootDir = projectRoot(config, store);
+  preflightProjectSummaryOutputs(rootDir);
+  const bootstrapPlan = planAgentBootstrapFiles(rootDir, nowDate(options));
+  const summarySnapshot = snapshotProjectSummaryFiles(rootDir);
   const existing = readProjectBrief(rootDir);
   let refreshed: ProjectSummaryRefreshResult;
   let fallback = false;
-
-  if (existing.exists) {
-    refreshed = {
-      checked: false,
-      generated: false,
-      summaryPath: existing.summaryPath
-    };
-    if (existing.meta?.fingerprint !== undefined) refreshed.fingerprint = existing.meta.fingerprint;
-    if (existing.meta !== undefined) refreshed.meta = existing.meta;
-  } else {
-    try {
-      refreshed = await refreshProjectSummary(store, config, options);
-    } catch (error) {
-      fallback = true;
-      const fallbackGenerator = createFallbackProjectSummaryGenerator(error);
-      refreshed = await refreshProjectSummary(store, config, {
-        ...options,
-        generator: fallbackGenerator,
-        force: true
-      });
-      const message = fallbackSummaryWarning(error);
-      options.warn?.(message);
+  let bootstrap: ProjectSummaryBootstrapResult;
+  try {
+    if (existing.exists) {
+      refreshed = {
+        checked: false,
+        generated: false,
+        summaryPath: existing.summaryPath
+      };
+      if (existing.meta?.fingerprint !== undefined) refreshed.fingerprint = existing.meta.fingerprint;
+      if (existing.meta !== undefined) refreshed.meta = existing.meta;
+    } else {
+      try {
+        refreshed = await refreshProjectSummaryInternal(store, config, options, { omitAgentHints: true });
+      } catch (error) {
+        fallback = true;
+        const fallbackGenerator = createFallbackProjectSummaryGenerator(error);
+        refreshed = await refreshProjectSummaryInternal(
+          store,
+          config,
+          {
+            ...options,
+            generator: fallbackGenerator,
+            force: true
+          },
+          { omitAgentHints: true }
+        );
+        const message = fallbackSummaryWarning(error);
+        options.warn?.(message);
+      }
     }
+    bootstrap = applyAgentBootstrapPlan(bootstrapPlan, options);
+  } catch (error) {
+    restoreProjectSummaryFiles(summarySnapshot);
+    throw error;
   }
-
-  const bootstrap = ensureAgentBootstrapFiles(rootDir, nowDate(options));
   return {
     ...refreshed,
     fallback,
@@ -245,16 +308,60 @@ export async function refreshProjectSummary(
   config: ProjectConfig,
   options: ProjectSummaryOperationOptions = {}
 ): Promise<ProjectSummaryRefreshResult> {
+  return refreshProjectSummaryInternal(store, config, options);
+}
+
+async function refreshProjectSummaryInternal(
+  store: MemoryStore,
+  config: ProjectConfig,
+  options: ProjectSummaryOperationOptions,
+  inputOptions: ProjectSummaryInputOptions = {}
+): Promise<ProjectSummaryRefreshResult> {
   const rootDir = projectRoot(config, store);
+  preflightProjectSummaryOutputs(rootDir);
   const paths = projectSummaryPaths(rootDir);
   const now = nowDate(options);
-  const input = collectProjectSummaryInput(store, config);
+  const input = collectProjectSummaryInputInternal(store, config, inputOptions);
   const existing = readProjectBrief(rootDir);
+  const existingOutputHash = existing.exists ? hashFile(paths.summaryPath) : undefined;
+  const manualEditsDetected =
+    existingOutputHash !== undefined &&
+    existing.meta?.outputContentHash !== undefined &&
+    existingOutputHash !== existing.meta.outputContentHash;
+  const outputBaselineMissing = existing.exists && existing.meta?.outputContentHash === undefined;
+
+  if (!options.force && manualEditsDetected) {
+    return {
+      checked: true,
+      generated: false,
+      summaryPath: paths.summaryPath,
+      fingerprint: input.fingerprint,
+      ...(existing.meta ? { meta: existing.meta } : {}),
+      skippedReason: "manual_edits_detected",
+      manualEditsDetected: true
+    };
+  }
+
+  if (
+    !options.force &&
+    outputBaselineMissing &&
+    existing.meta?.fingerprint !== input.fingerprint
+  ) {
+    return {
+      checked: true,
+      generated: false,
+      summaryPath: paths.summaryPath,
+      fingerprint: input.fingerprint,
+      ...(existing.meta ? { meta: existing.meta } : {}),
+      skippedReason: "output_baseline_missing"
+    };
+  }
 
   if (!options.force && existing.exists && existing.meta?.fingerprint === input.fingerprint) {
     const meta = normalizeMeta({
       ...existing.meta,
       summaryPath: paths.summaryPath,
+      ...(existingOutputHash ? { outputContentHash: existingOutputHash } : {}),
       lastCheckedAt: now.toISOString()
     });
     writeProjectSummaryMeta(rootDir, meta);
@@ -267,30 +374,83 @@ export async function refreshProjectSummary(
     };
   }
 
+  let backupPath: string | undefined;
+  if (options.force && existing.exists && (manualEditsDetected || outputBaselineMissing)) {
+    backupPath = backupProjectSummary(paths.summaryPath, paths.dataDir, now);
+  }
+
   const generator = options.generator ?? createConfiguredProjectSummaryGenerator(config);
   const summary = (await generator.generate(input)).trim();
   if (!summary) {
     throw new Error("Project summary generator returned empty content");
   }
 
-  mkdirSync(paths.dataDir, { recursive: true });
-  writeFileSync(paths.summaryPath, `${summary}\n`);
+  const outputExistsBeforeCommit = existsSync(paths.summaryPath);
+  const outputHashBeforeCommit = outputExistsBeforeCommit ? hashFile(paths.summaryPath) : undefined;
+  const outputChangedDuringGeneration = existing.exists
+    ? !outputExistsBeforeCommit || outputHashBeforeCommit !== existingOutputHash
+    : outputExistsBeforeCommit;
+  if (outputChangedDuringGeneration) {
+    if (!options.force) {
+      return {
+        checked: true,
+        generated: false,
+        summaryPath: paths.summaryPath,
+        fingerprint: input.fingerprint,
+        ...(existing.meta ? { meta: existing.meta } : {}),
+        skippedReason: existing.exists ? "manual_edits_detected" : "output_baseline_missing",
+        ...(existing.exists ? { manualEditsDetected: true } : {})
+      };
+    }
+    if (outputExistsBeforeCommit) {
+      backupPath = backupProjectSummary(paths.summaryPath, paths.dataDir, now);
+    }
+  }
+
+  const summaryContent = `${summary}\n`;
   const metaInput: ProjectSummaryMeta = {
     version: SUMMARY_VERSION,
     summaryPath: paths.summaryPath,
     fingerprint: input.fingerprint,
+    outputContentHash: hashBytes(Buffer.from(summaryContent)),
     lastGeneratedAt: now.toISOString(),
     lastCheckedAt: now.toISOString()
   };
   if (generator.name !== undefined) metaInput.provider = generator.name;
   const meta = normalizeMeta(metaInput);
-  writeProjectSummaryMeta(rootDir, meta);
+  try {
+    writeProjectSummaryOutputsAtomically(
+      rootDir,
+      [
+        { path: paths.summaryPath, content: `${summary}\n` },
+        { path: paths.metaPath, content: serializeProjectSummaryMeta(meta) }
+      ],
+      options,
+      {
+        exists: outputExistsBeforeCommit,
+        ...(outputHashBeforeCommit ? { contentHash: outputHashBeforeCommit } : {})
+      }
+    );
+  } catch (error) {
+    if (!(error instanceof ConcurrentProjectSummaryEditError)) throw error;
+    return {
+      checked: true,
+      generated: false,
+      summaryPath: paths.summaryPath,
+      fingerprint: input.fingerprint,
+      ...(existing.meta ? { meta: existing.meta } : {}),
+      skippedReason: "manual_edits_detected",
+      manualEditsDetected: true,
+      ...(backupPath ? { backupPath } : {})
+    };
+  }
   return {
     checked: true,
     generated: true,
     summaryPath: paths.summaryPath,
     fingerprint: input.fingerprint,
-    meta
+    meta,
+    ...(backupPath ? { backupPath } : {})
   };
 }
 
@@ -320,25 +480,42 @@ export function collectProjectSummaryInput(
   store: MemoryStore,
   config: ProjectConfig
 ): ProjectSummaryGeneratorInput {
+  return collectProjectSummaryInputInternal(store, config);
+}
+
+function collectProjectSummaryInputInternal(
+  store: MemoryStore,
+  config: ProjectConfig,
+  options: ProjectSummaryInputOptions = {}
+): ProjectSummaryGeneratorInput {
   const rootDir = projectRoot(config, store);
-  const agentHints = readAgentHints(rootDir);
+  const trackedPaths = readTrackedPaths(rootDir);
+  const manifests = readTrackedManifestFiles(rootDir, discoverManifestPaths(trackedPaths), trackedPaths);
+  const docs = readTrackedTextFiles(rootDir, DOC_PATHS, trackedPaths);
+  const memories = store.searchMemoryLayer({ status: "promoted", limit: 50 });
+  const commits = store.findCommits({ limit: 20 });
+  const agentHints = options.omitAgentHints ? [] : readAgentHints(rootDir, trackedPaths);
+  const notes = readProjectSummaryNotes(rootDir);
   const codeContext: ProjectSummaryCodeContext = {
-    manifests: readExistingTextFiles(rootDir, MANIFEST_PATHS),
-    docs: readExistingTextFiles(rootDir, DOC_PATHS),
-    inventory: readProjectInventory(rootDir),
-    memories: store.searchMemoryLayer({ status: "promoted", limit: 50 }),
-    commits: store.findCommits({ limit: 20 }),
+    manifests,
+    docs,
+    codeFiles: collectProjectSummaryCodeFiles(rootDir, { manifests, memories, commits }),
+    inventory: listProjectSummarySafeTrackedPaths(rootDir, trackedPaths, MAX_INVENTORY_ENTRIES),
+    memories,
+    commits,
     projectState: store.getProjectSummary()
   };
   const fingerprint = fingerprintProjectSummaryInputs({
     projectRoot: rootDir,
     agentHints,
+    ...(notes ? { notes } : {}),
     codeContext
   });
   return {
     projectRoot: rootDir,
     fingerprint,
     agentHints,
+    ...(notes ? { notes } : {}),
     codeContext
   };
 }
@@ -350,6 +527,36 @@ function projectSummaryPaths(rootDir: string): { dataDir: string; summaryPath: s
     summaryPath: join(dataDir, "project-summary.md"),
     metaPath: join(dataDir, "project-summary.meta.json")
   };
+}
+
+function readProjectSummaryNotes(rootDir: string): ProjectSummaryTextFile | undefined {
+  const rootRealPath = realpathSync(rootDir);
+  const notesPath = join(rootRealPath, ".code-butler", "project-summary-notes.md");
+  if (!existsSync(notesPath)) return undefined;
+  try {
+    const before = lstatSync(notesPath);
+    if (!before.isFile() || before.isSymbolicLink()) return undefined;
+    if (!isInsideRoot(rootRealPath, realpathSync(notesPath))) return undefined;
+    const noFollowFlag = (fsConstants as typeof fsConstants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
+    const descriptor = openSync(notesPath, fsConstants.O_RDONLY | noFollowFlag);
+    try {
+      const opened = fstatSync(descriptor);
+      if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) return undefined;
+      const bytes = readFileSync(descriptor);
+      const fullContent = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      return {
+        path: ".code-butler/project-summary-notes.md",
+        content: fullContent.slice(0, MAX_PROJECT_SUMMARY_FILE_CHARS),
+        contentHash: hashBytes(bytes),
+        originalBytes: bytes.byteLength,
+        truncated: fullContent.length > MAX_PROJECT_SUMMARY_FILE_CHARS
+      };
+    } finally {
+      closeSync(descriptor);
+    }
+  } catch {
+    return undefined;
+  }
 }
 
 function readProjectSummaryMeta(rootDir: string): ProjectSummaryMeta | undefined {
@@ -368,8 +575,175 @@ function readProjectSummaryMeta(rootDir: string): ProjectSummaryMeta | undefined
 
 function writeProjectSummaryMeta(rootDir: string, meta: ProjectSummaryMeta): void {
   const paths = projectSummaryPaths(rootDir);
-  mkdirSync(paths.dataDir, { recursive: true });
-  writeFileSync(paths.metaPath, `${JSON.stringify(meta, null, 2)}\n`);
+  writeProjectSummaryOutputsAtomically(rootDir, [
+    { path: paths.metaPath, content: serializeProjectSummaryMeta(meta) }
+  ]);
+}
+
+function serializeProjectSummaryMeta(meta: ProjectSummaryMeta): string {
+  return `${JSON.stringify(meta, null, 2)}\n`;
+}
+
+interface ProjectSummaryOutputWrite {
+  path: string;
+  content: string;
+}
+
+interface AppliedProjectSummaryOutput {
+  path: string;
+  rollbackPath?: string;
+  installed: boolean;
+}
+
+interface ExpectedProjectSummaryOutput {
+  exists: boolean;
+  contentHash?: string;
+}
+
+class ConcurrentProjectSummaryEditError extends Error {}
+
+function preflightProjectSummaryOutputs(rootDir: string): void {
+  const rootRealPath = realpathSync(rootDir);
+  const paths = projectSummaryPaths(rootDir);
+  const expectedDataDir = join(rootRealPath, ".code-butler");
+  if (!isInsideRoot(rootRealPath, expectedDataDir)) {
+    throw new Error("Project summary data directory escapes the project root: .code-butler");
+  }
+  if (existsSync(paths.dataDir)) validateProjectSummaryDataDir(paths.dataDir, rootRealPath);
+  for (const path of [paths.summaryPath, paths.metaPath]) {
+    if (!existsSync(path)) continue;
+    const stats = lstatSync(path);
+    if (!stats.isFile() || stats.isSymbolicLink()) {
+      throw new Error(`Project summary destination must be a regular non-symlink file: ${path}`);
+    }
+    if (!isInsideRoot(rootRealPath, realpathSync(path))) {
+      throw new Error(`Project summary destination escapes the project root: ${path}`);
+    }
+  }
+}
+
+function validateProjectSummaryDataDir(dataDir: string, rootRealPath: string): void {
+  const stats = lstatSync(dataDir);
+  if (!stats.isDirectory() || stats.isSymbolicLink()) {
+    throw new Error(`Project summary data directory must be a regular non-symlink directory: ${dataDir}`);
+  }
+  if (!isInsideRoot(rootRealPath, realpathSync(dataDir))) {
+    throw new Error(`Project summary data directory escapes the project root: ${dataDir}`);
+  }
+}
+
+function writeProjectSummaryOutputsAtomically(
+  rootDir: string,
+  writes: ProjectSummaryOutputWrite[],
+  options: Pick<ProjectSummaryOperationOptions, "summaryApplyFile" | "summaryBeforeCommit"> = {},
+  expectedSummary?: ExpectedProjectSummaryOutput
+): void {
+  const rootRealPath = realpathSync(rootDir);
+  const paths = projectSummaryPaths(rootDir);
+  if (!existsSync(paths.dataDir)) mkdirSync(paths.dataDir);
+  validateProjectSummaryDataDir(paths.dataDir, rootRealPath);
+
+  const stagedDir = mkdtempSync(join(paths.dataDir, ".project-summary-write-"));
+  const staged = new Map<string, string>();
+  const modes = new Map<string, number>();
+  const applied: AppliedProjectSummaryOutput[] = [];
+  try {
+    for (const [index, write] of writes.entries()) {
+      if (write.path !== paths.summaryPath && write.path !== paths.metaPath) {
+        throw new Error(`Unsafe project summary destination: ${write.path}`);
+      }
+      if (existsSync(write.path)) {
+        const stats = lstatSync(write.path);
+        if (!stats.isSymbolicLink()) {
+          if (!stats.isFile()) {
+            throw new Error(`Project summary destination must be a regular file or replaceable symlink: ${write.path}`);
+          }
+          if (!isInsideRoot(rootRealPath, realpathSync(write.path))) {
+            throw new Error(`Project summary destination escapes the project root: ${write.path}`);
+          }
+          modes.set(write.path, stats.mode);
+        }
+      }
+      const stagedPath = join(stagedDir, `output-${index}`);
+      writeFileSync(stagedPath, write.content, { flag: "wx" });
+      const mode = modes.get(write.path);
+      if (mode !== undefined) chmodSync(stagedPath, mode);
+      staged.set(write.path, stagedPath);
+    }
+
+    for (const [index, write] of writes.entries()) {
+      const stagedPath = staged.get(write.path);
+      if (!stagedPath) throw new Error(`Missing staged project summary output: ${write.path}`);
+      if (write.path === paths.summaryPath && expectedSummary) {
+        options.summaryBeforeCommit?.(write.path);
+        validateExpectedProjectSummaryOutput(write.path, expectedSummary);
+      }
+      let rollbackPath: string | undefined;
+      if (existsSync(write.path)) {
+        rollbackPath = join(stagedDir, `.rollback-${index}`);
+        renameSync(write.path, rollbackPath);
+      }
+      const appliedOutput: AppliedProjectSummaryOutput = {
+        path: write.path,
+        ...(rollbackPath ? { rollbackPath } : {}),
+        installed: false
+      };
+      applied.push(appliedOutput);
+      if (write.path === paths.summaryPath && expectedSummary) {
+        if (expectedSummary.exists) {
+          if (!rollbackPath || hashFile(rollbackPath) !== expectedSummary.contentHash) {
+            throw new ConcurrentProjectSummaryEditError("Project summary changed during refresh commit");
+          }
+        } else if (rollbackPath) {
+          throw new ConcurrentProjectSummaryEditError("Project summary appeared during refresh commit");
+        }
+      }
+      if (options.summaryApplyFile) {
+        options.summaryApplyFile(stagedPath, write.path);
+        appliedOutput.installed = true;
+      } else {
+        try {
+          linkSync(stagedPath, write.path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST" && write.path === paths.summaryPath) {
+            throw new ConcurrentProjectSummaryEditError("Project summary changed during refresh commit");
+          }
+          throw error;
+        }
+        appliedOutput.installed = true;
+        unlinkSync(stagedPath);
+      }
+    }
+  } catch (error) {
+    for (const output of applied.reverse()) {
+      if (output.installed) rmSync(output.path, { force: true, recursive: true });
+      if (output.rollbackPath && existsSync(output.rollbackPath)) {
+        if (!existsSync(output.path)) {
+          renameSync(output.rollbackPath, output.path);
+        } else if (output.path === paths.summaryPath) {
+          backupProjectSummary(output.rollbackPath, paths.dataDir, new Date());
+        }
+      }
+    }
+    throw error;
+  } finally {
+    rmSync(stagedDir, { force: true, recursive: true });
+  }
+}
+
+function validateExpectedProjectSummaryOutput(
+  summaryPath: string,
+  expected: ExpectedProjectSummaryOutput
+): void {
+  if (!expected.exists) {
+    if (existsSync(summaryPath)) {
+      throw new ConcurrentProjectSummaryEditError("Project summary appeared during refresh commit");
+    }
+    return;
+  }
+  if (!existsSync(summaryPath) || hashFile(summaryPath) !== expected.contentHash) {
+    throw new ConcurrentProjectSummaryEditError("Project summary changed during refresh commit");
+  }
 }
 
 function normalizeMeta(input: Partial<ProjectSummaryMeta>): ProjectSummaryMeta {
@@ -384,6 +758,9 @@ function normalizeMeta(input: Partial<ProjectSummaryMeta>): ProjectSummaryMeta {
   if (input.lastGeneratedAt !== undefined) meta.lastGeneratedAt = input.lastGeneratedAt;
   if (input.lastCheckedAt !== undefined) meta.lastCheckedAt = input.lastCheckedAt;
   if (input.provider !== undefined) meta.provider = input.provider;
+  if (typeof input.outputContentHash === "string" && /^[a-f0-9]{64}$/.test(input.outputContentHash)) {
+    meta.outputContentHash = input.outputContentHash;
+  }
   return meta;
 }
 
@@ -394,36 +771,213 @@ function isSummaryRefreshDue(meta: ProjectSummaryMeta | undefined, now: Date): b
   return now.getTime() - lastCheckedAt >= DAILY_REFRESH_MS;
 }
 
-function ensureAgentBootstrapFiles(rootDir: string, now: Date): { backupDir?: string; backupFiles: string[] } {
-  const filesToBackUp: Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; path: string }> = [];
-  const filesToWrite: Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; path: string; content: string }> = [];
+interface ProjectSummaryBootstrapFilePlan {
+  fileName: "AGENTS.md" | "CLAUDE.md";
+  path: string;
+  content: string;
+  existed: boolean;
+  originalContent?: Buffer;
+  originalDev?: bigint;
+  originalIno?: bigint;
+  originalSize?: bigint;
+  originalMtimeNs?: bigint;
+  originalHash?: string;
+  mode?: number;
+  backupBasePath?: string;
+}
 
+interface ProjectSummaryBootstrapPlan {
+  rootDir: string;
+  files: ProjectSummaryBootstrapFilePlan[];
+}
+
+interface ProjectSummaryBootstrapResult {
+  backupDir?: string;
+  backupFiles: string[];
+}
+
+interface ProjectSummaryFileSnapshot {
+  path: string;
+  content?: Buffer;
+}
+
+function planAgentBootstrapFiles(rootDir: string, now: Date): ProjectSummaryBootstrapPlan {
+  const rootRealPath = realpathSync(rootDir);
+  const timestamp = timestampForBackup(now);
+  const files: ProjectSummaryBootstrapFilePlan[] = [];
   for (const fileName of AGENT_FILE_NAMES) {
     const path = join(rootDir, fileName);
+    if (!isInsideRoot(rootRealPath, join(rootRealPath, fileName))) {
+      throw new Error(`Unsafe bootstrap destination: ${fileName}`);
+    }
     const content = agentBootstrapText(fileName);
-    if (existsSync(path)) {
-      const current = readFileSync(path, "utf8");
-      if (current === content) continue;
-      if (!isGeneratedBootstrap(current)) filesToBackUp.push({ fileName, path });
+    if (!existsSync(path)) {
+      files.push({ fileName, path, content, existed: false });
+      continue;
     }
-    filesToWrite.push({ fileName, path, content });
+    const stats = lstatSync(path, { bigint: true });
+    if (!stats.isFile() || stats.isSymbolicLink()) {
+      throw new Error(`Bootstrap destination must be a regular non-symlink file: ${fileName}`);
+    }
+    if (!isInsideRoot(rootRealPath, realpathSync(path))) {
+      throw new Error(`Bootstrap destination escapes the project root: ${fileName}`);
+    }
+    const originalContent = readFileSync(path);
+    const current = originalContent.toString("utf8");
+    if (current === content) continue;
+    const file: ProjectSummaryBootstrapFilePlan = {
+      fileName,
+      path,
+      content,
+      existed: true,
+      originalContent,
+      originalDev: stats.dev,
+      originalIno: stats.ino,
+      originalSize: stats.size,
+      originalMtimeNs: stats.mtimeNs,
+      originalHash: hashBytes(originalContent),
+      mode: Number(stats.mode)
+    };
+    if (!isGeneratedBootstrap(current)) {
+      file.backupBasePath = join(rootDir, `${fileName}.code-butler-backup-${timestamp}`);
+    }
+    files.push(file);
   }
+  return { rootDir, files };
+}
 
+function applyAgentBootstrapPlan(
+  plan: ProjectSummaryBootstrapPlan,
+  options: ProjectSummaryOperationOptions
+): ProjectSummaryBootstrapResult {
+  if (plan.files.length === 0) return { backupFiles: [] };
+  const stagingDir = mkdtempSync(join(plan.rootDir, ".code-butler-bootstrap-"));
+  const staged = new Map<string, string>();
   const backupFiles: string[] = [];
-  if (filesToBackUp.length > 0) {
-    const timestamp = timestampForBackup(now);
-    for (const file of filesToBackUp) {
-      const backupPath = join(rootDir, `${file.fileName}.code-butler-backup-${timestamp}`);
-      copyFileSync(file.path, backupPath);
-      backupFiles.push(backupPath);
+  const appliedFiles: Array<{ file: ProjectSummaryBootstrapFilePlan; rollbackPath?: string }> = [];
+  try {
+    for (const file of plan.files) {
+      const stagedPath = join(stagingDir, file.fileName);
+      writeFileSync(stagedPath, file.content);
+      if (file.mode !== undefined) chmodSync(stagedPath, file.mode);
+      staged.set(file.path, stagedPath);
+    }
+    for (const file of plan.files) {
+      validateBootstrapIdentity(file);
+      const stagedPath = staged.get(file.path);
+      if (!stagedPath) throw new Error(`Missing staged bootstrap: ${file.fileName}`);
+      let rollbackPath: string | undefined;
+      if (file.existed) {
+        rollbackPath = join(stagingDir, `.rollback-${file.fileName}`);
+        renameSync(file.path, rollbackPath);
+        if (hashFile(rollbackPath) !== file.originalHash) {
+          renameSync(rollbackPath, file.path);
+          throw new Error(`Bootstrap destination changed during install: ${file.fileName}`);
+        }
+      }
+      appliedFiles.push({ file, ...(rollbackPath ? { rollbackPath } : {}) });
+      if (file.backupBasePath && rollbackPath) {
+        backupFiles.push(createCollisionSafeBackup(rollbackPath, file.backupBasePath));
+      }
+      (options.bootstrapApplyFile ?? renameSync)(stagedPath, file.path);
+    }
+  } catch (error) {
+    for (const applied of appliedFiles.reverse()) restoreAppliedBootstrapFile(applied);
+    for (const backupPath of backupFiles) rmSync(backupPath, { force: true });
+    throw error;
+  } finally {
+    rmSync(stagingDir, { force: true, recursive: true });
+  }
+  return backupFiles.length > 0 ? { backupDir: plan.rootDir, backupFiles } : { backupFiles };
+}
+
+function validateBootstrapIdentity(file: ProjectSummaryBootstrapFilePlan): void {
+  if (!file.existed) {
+    if (existsSync(file.path)) throw new Error(`Bootstrap destination changed during install: ${file.fileName}`);
+    return;
+  }
+  const stats = lstatSync(file.path, { bigint: true });
+  if (
+    !stats.isFile() ||
+    stats.isSymbolicLink() ||
+    stats.dev !== file.originalDev ||
+    stats.ino !== file.originalIno ||
+    stats.size !== file.originalSize ||
+    stats.mtimeNs !== file.originalMtimeNs
+  ) {
+    throw new Error(`Bootstrap destination changed during install: ${file.fileName}`);
+  }
+}
+
+function restoreAppliedBootstrapFile(applied: {
+  file: ProjectSummaryBootstrapFilePlan;
+  rollbackPath?: string;
+}): void {
+  rmSync(applied.file.path, { force: true, recursive: true });
+  if (applied.rollbackPath && existsSync(applied.rollbackPath)) {
+    renameSync(applied.rollbackPath, applied.file.path);
+  }
+}
+
+function createCollisionSafeBackup(sourcePath: string, basePath: string): string {
+  for (let suffix = 0; ; suffix += 1) {
+    const candidate = suffix === 0 ? basePath : `${basePath}-${suffix}`;
+    try {
+      copyFileSync(sourcePath, candidate, fsConstants.COPYFILE_EXCL);
+      return candidate;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
   }
+}
 
-  for (const file of filesToWrite) {
-    writeFileSync(file.path, file.content);
+function backupProjectSummary(summaryPath: string, dataDir: string, now: Date): string {
+  const backupRoot = join(dataDir, "backups");
+  const backupDir = join(backupRoot, "project-summary");
+  ensureContainedDirectory(dataDir, backupRoot);
+  ensureContainedDirectory(dataDir, backupDir);
+  const basePath = join(backupDir, `project-summary-${timestampForBackup(now)}.md`);
+  return createCollisionSafeBackup(summaryPath, basePath);
+}
+
+function ensureContainedDirectory(dataDir: string, path: string): void {
+  const dataDirRealPath = realpathSync(dataDir);
+  if (!existsSync(path)) mkdirSync(path);
+  const stats = lstatSync(path);
+  if (!stats.isDirectory() || stats.isSymbolicLink() || !isInsideRoot(dataDirRealPath, realpathSync(path))) {
+    throw new Error(`Project summary backup directory is unsafe: ${path}`);
   }
+}
 
-  return backupFiles.length > 0 ? { backupDir: rootDir, backupFiles } : { backupFiles };
+function hashBytes(content: Uint8Array): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+function hashFile(path: string): string {
+  return hashBytes(readFileSync(path));
+}
+
+function snapshotProjectSummaryFiles(rootDir: string): ProjectSummaryFileSnapshot[] {
+  const paths = projectSummaryPaths(rootDir);
+  return [paths.summaryPath, paths.metaPath].map((path) => ({
+    path,
+    ...(existsSync(path) ? { content: readFileSync(path) } : {})
+  }));
+}
+
+function restoreProjectSummaryFiles(snapshots: ProjectSummaryFileSnapshot[]): void {
+  for (const snapshot of snapshots) {
+    rmSync(snapshot.path, { force: true, recursive: true });
+    if (snapshot.content) writeFileSync(snapshot.path, snapshot.content);
+  }
+}
+
+function isInsideRoot(rootRealPath: string, candidatePath: string): boolean {
+  const pathFromRoot = relative(rootRealPath, candidatePath);
+  return (
+    pathFromRoot === "" ||
+    (pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot))
+  );
 }
 
 function createFallbackProjectSummaryGenerator(error: unknown): ProjectSummaryGenerator {
@@ -489,74 +1043,20 @@ function projectRoot(config: ProjectConfig, store: MemoryStore): string {
   return config.sources.git.repoPath || store.paths.rootDir;
 }
 
-function readAgentHints(rootDir: string): Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; content: string }> {
-  const currentHints = readAgentHintFiles(rootDir);
-  if (currentHints.length > 0) return currentHints;
-  return readLatestBackedUpAgentHints(rootDir);
-}
-
-function readAgentHintFiles(rootDir: string): Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; content: string }> {
-  const hints: Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; content: string }> = [];
+function readAgentHints(rootDir: string, trackedPaths: ReadonlySet<string>): ProjectSummaryAgentHint[] {
+  const hints: ProjectSummaryAgentHint[] = [];
   for (const fileName of AGENT_FILE_NAMES) {
-    const path = join(rootDir, fileName);
-    if (!existsSync(path)) continue;
-    const content = readFileSync(path, "utf8");
-    if (isGeneratedBootstrap(content)) continue;
-    hints.push({ fileName, content: truncate(content, MAX_CONTEXT_FILE_CHARS) });
+    const file = readProjectSummaryTrackedFile(rootDir, fileName, trackedPaths);
+    if (!file || isGeneratedBootstrap(file.content)) continue;
+    hints.push({
+      fileName,
+      content: file.content,
+      contentHash: file.contentHash,
+      originalBytes: file.originalBytes,
+      truncated: file.truncated
+    });
   }
   return hints;
-}
-
-function readLatestBackedUpAgentHints(
-  rootDir: string
-): Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; content: string }> {
-  const rootBackupHints = readLatestRootAgentBackups(rootDir);
-  if (rootBackupHints.length > 0) return rootBackupHints;
-
-  const backupRoot = join(rootDir, ".code-butler", "backups", "agent-instructions");
-  if (!existsSync(backupRoot) || !statSync(backupRoot).isDirectory()) return [];
-  const backupDirs = readdirSync(backupRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort()
-    .reverse();
-  for (const backupDir of backupDirs) {
-    const hints = readAgentHintFiles(join(backupRoot, backupDir));
-    if (hints.length > 0) return hints;
-  }
-  return [];
-}
-
-function readLatestRootAgentBackups(
-  rootDir: string
-): Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; content: string }> {
-  if (!existsSync(rootDir) || !statSync(rootDir).isDirectory()) return [];
-  const groups = new Map<string, Array<{ fileName: "AGENTS.md" | "CLAUDE.md"; path: string }>>();
-  for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
-    if (!entry.isFile()) continue;
-    const match = entry.name.match(agentBackupPattern());
-    if (!match?.[1] || !match[2]) continue;
-    const timestamp = match[2];
-    const fileName = match[1] as "AGENTS.md" | "CLAUDE.md";
-    const current = groups.get(timestamp) ?? [];
-    current.push({ fileName, path: join(rootDir, entry.name) });
-    groups.set(timestamp, current);
-  }
-
-  const latestTimestamp = [...groups.keys()].sort().reverse()[0];
-  if (!latestTimestamp) return [];
-  return (groups.get(latestTimestamp) ?? []).map((backup) => ({
-    fileName: backup.fileName,
-    content: truncate(readFileSync(backup.path, "utf8"), MAX_CONTEXT_FILE_CHARS)
-  }));
-}
-
-function isAgentBackupFile(fileName: string): boolean {
-  return agentBackupPattern().test(fileName);
-}
-
-function agentBackupPattern(): RegExp {
-  return /^(AGENTS\.md|CLAUDE\.md)\.code-butler-backup-(.+)$/;
 }
 
 function isGeneratedBootstrap(content: string): boolean {
@@ -568,44 +1068,70 @@ function isGeneratedBootstrap(content: string): boolean {
   );
 }
 
-function readExistingTextFiles(rootDir: string, relativePaths: readonly string[]): ProjectSummaryTextFile[] {
+function readTrackedTextFiles(
+  rootDir: string,
+  relativePaths: readonly string[],
+  trackedPaths: ReadonlySet<string>
+): ProjectSummaryTextFile[] {
   const files: ProjectSummaryTextFile[] = [];
   for (const relativePath of relativePaths) {
-    const path = join(rootDir, relativePath);
-    if (!existsSync(path) || !statSync(path).isFile()) continue;
+    const file = readProjectSummaryTrackedFile(rootDir, relativePath, trackedPaths);
+    if (!file) continue;
     files.push({
-      path: relativePath,
-      content: truncate(readFileSync(path, "utf8"), MAX_CONTEXT_FILE_CHARS)
+      path: file.path,
+      content: file.content,
+      contentHash: file.contentHash,
+      originalBytes: file.originalBytes,
+      truncated: file.truncated
     });
   }
   return files;
 }
 
-function readProjectInventory(rootDir: string): string[] {
-  if (!existsSync(rootDir)) return [];
-  const entries: string[] = [];
-  for (const entry of readdirSync(rootDir, { withFileTypes: true })) {
-    if (IGNORED_INVENTORY_NAMES.has(entry.name)) continue;
-    if (isAgentBackupFile(entry.name)) continue;
-    const suffix = entry.isDirectory() ? "/" : "";
-    entries.push(`${entry.name}${suffix}`);
+function readTrackedManifestFiles(
+  rootDir: string,
+  relativePaths: readonly string[],
+  trackedPaths: ReadonlySet<string>
+): ProjectSummaryTextFile[] {
+  const files: ProjectSummaryTextFile[] = [];
+  let transmittedChars = 0;
+  for (const relativePath of relativePaths) {
+    if (files.length >= MAX_MANIFEST_FILES || transmittedChars >= MAX_MANIFEST_CONTENT_CHARS) break;
+    const remainingChars = MAX_MANIFEST_CONTENT_CHARS - transmittedChars;
+    const file = readProjectSummaryTrackedFile(
+      rootDir,
+      relativePath,
+      trackedPaths,
+      Math.min(MAX_PROJECT_SUMMARY_FILE_CHARS, remainingChars)
+    );
+    if (!file) continue;
+    files.push({
+      path: file.path,
+      content: file.content,
+      contentHash: file.contentHash,
+      originalBytes: file.originalBytes,
+      truncated: file.truncated
+    });
+    transmittedChars += file.content.length;
   }
+  return files;
+}
 
-  const srcDir = join(rootDir, "src");
-  if (existsSync(srcDir) && statSync(srcDir).isDirectory()) {
-    for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
-      entries.push(`src/${entry.name}${entry.isDirectory() ? "/" : ""}`);
+function discoverManifestPaths(trackedPaths: ReadonlySet<string>): string[] {
+  const fixedPaths: string[] = [];
+  const fixedPathSet = new Set<string>();
+  for (const path of MANIFEST_PATHS) {
+    if (!trackedPaths.has(path)) continue;
+    fixedPaths.push(path);
+    fixedPathSet.add(path);
+  }
+  const nestedPaths: string[] = [];
+  for (const path of trackedPaths) {
+    if (!fixedPathSet.has(path) && NESTED_MANIFEST_BASENAMES.has(posix.basename(path))) {
+      nestedPaths.push(path);
     }
   }
-
-  const cratesDir = join(rootDir, "crates");
-  if (existsSync(cratesDir) && statSync(cratesDir).isDirectory()) {
-    for (const entry of readdirSync(cratesDir, { withFileTypes: true })) {
-      entries.push(`crates/${entry.name}${entry.isDirectory() ? "/" : ""}`);
-    }
-  }
-
-  return [...new Set(entries)].sort().slice(0, MAX_INVENTORY_ENTRIES);
+  return [...fixedPaths, ...nestedPaths.sort()];
 }
 
 function fingerprintProjectSummaryInputs(input: Omit<ProjectSummaryGeneratorInput, "fingerprint">): string {
@@ -614,8 +1140,10 @@ function fingerprintProjectSummaryInputs(input: Omit<ProjectSummaryGeneratorInpu
       JSON.stringify({
         projectRoot: input.projectRoot,
         agentHints: input.agentHints,
+        notes: input.notes,
         manifests: input.codeContext.manifests,
         docs: input.codeContext.docs,
+        codeFiles: input.codeContext.codeFiles,
         inventory: input.codeContext.inventory,
         memories: input.codeContext.memories.map((memory) => ({
           kind: memory.kind,
@@ -669,11 +1197,6 @@ function nowDate(options: { now?: () => Date }): Date {
 
 function timestampForBackup(date: Date): string {
   return date.toISOString().replace(/[:.]/g, "-");
-}
-
-function truncate(content: string, maxChars: number): string {
-  if (content.length <= maxChars) return content;
-  return `${content.slice(0, maxChars)}\n[truncated ${content.length - maxChars} chars]`;
 }
 
 export function relativeSummaryPath(rootDir: string, absolutePath: string): string {

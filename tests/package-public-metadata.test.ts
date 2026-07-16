@@ -14,10 +14,14 @@ describe("public package metadata", () => {
     files?: string[];
     keywords?: string[];
     scripts?: Record<string, string>;
+    version?: string;
+    engines?: { node?: string };
   };
 
   it("publishes discoverable metadata for the public npm package", () => {
     expect(packageJson.name).toBe("code-butler");
+    expect(packageJson.version).toBe("1.0.0");
+    expect(packageJson.engines?.node).toBe(">=24.0.0");
     expect(packageJson.license).toBe("Apache-2.0");
     expect(packageJson.repository).toEqual({
       type: "git",
@@ -34,5 +38,6 @@ describe("public package metadata", () => {
     );
     expect(packageJson.scripts?.prepack).toBe("npm run build");
     expect(packageJson.scripts?.prepublishOnly).toBe("npm run typecheck && npm test");
+    expect(packageJson.scripts?.["test:migrations"]).toBeTruthy();
   });
 });

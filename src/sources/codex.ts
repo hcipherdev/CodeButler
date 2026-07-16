@@ -72,20 +72,47 @@ function syncConversationLogSource(
   sourceName: "codex" | "claude",
   config: ConversationLogSourceConfig,
   projectRoot: string,
-  parser: (filePath: string) => ParsedConversationLog | undefined
+  parser: (filePath: string) => ConversationParseResult
 ): ConversationSyncResult {
   const conversations: ExtractorConversationInput[] = [];
   let imported = 0;
 
   for (const root of config.roots) {
     for (const filePath of findJsonlFiles(root)) {
-      const signature = fileSignature(filePath);
+      let signature: string;
+      try {
+        signature = fileSignature(filePath);
+      } catch {
+        store.recordSourceFailure({
+          adapter: sourceName,
+          path: filePath,
+          errorCode: "read_failed",
+          message: sourceFailureMessage("read_failed")
+        });
+        continue;
+      }
       const cursor = store.getSyncCursor(sourceName, filePath)?.cursorValue;
-      if (cursor === signature) continue;
-      const parsed = parser(filePath);
-      if (!parsed) continue;
+      if (cursor === signature) {
+        store.resolveSourceFailures(sourceName, filePath);
+        continue;
+      }
+      const result = parser(filePath);
+      if (!result.ok) {
+        store.recordSourceFailure({
+          adapter: sourceName,
+          path: filePath,
+          errorCode: result.errorCode,
+          message: sourceFailureMessage(result.errorCode)
+        });
+        continue;
+      }
+      store.resolveSourceFailures(sourceName, filePath);
+      const parsed = result.value;
       if (!shouldIncludeConversation(parsed, filePath, projectRoot, config.projectOnly)) continue;
       store.setSyncCursor(sourceName, filePath, signature);
+      if (parsed.source.id && store.findSourceTombstone("conversation", parsed.source.id)) {
+        continue;
+      }
       store.addSourceWithChunks({ source: parsed.source, chunks: parsed.chunks });
       const conversation: ExtractorConversationInput = {
         sourceId: parsed.source.id!,
@@ -109,7 +136,7 @@ function getConversationSourceStatus(
   sourceName: "codex" | "claude",
   config: ConversationLogSourceConfig,
   projectRoot: string,
-  parser: (filePath: string) => ParsedConversationLog | undefined
+  parser: (filePath: string) => ConversationParseResult
 ): ConversationSourceStatus {
   const roots = config.roots.map<ConversationSourceRootStatus>((root) => {
     const files = findJsonlFiles(root);
@@ -125,11 +152,12 @@ function getConversationSourceStatus(
     let latestMtime = 0;
     for (const filePath of files) {
       latestMtime = Math.max(latestMtime, statSync(filePath).mtimeMs);
-      const parsed = parser(filePath);
-      if (!parsed) {
+      const result = parser(filePath);
+      if (!result.ok) {
         status.parseFailures += 1;
         continue;
       }
+      const parsed = result.value;
       if (!shouldIncludeConversation(parsed, filePath, projectRoot, config.projectOnly)) {
         status.ignored += 1;
         continue;
@@ -169,8 +197,19 @@ interface ParsedConversationLog {
   chunks: MemoryChunk[];
 }
 
-function parseCodexFile(filePath: string): ParsedConversationLog | undefined {
-  const raw = readFileSync(filePath, "utf8");
+type ConversationParseErrorCode = "read_failed" | "invalid_jsonl" | "no_supported_messages";
+
+type ConversationParseResult =
+  | { ok: true; value: ParsedConversationLog }
+  | { ok: false; errorCode: ConversationParseErrorCode };
+
+function parseCodexFile(filePath: string): ConversationParseResult {
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return { ok: false, errorCode: "read_failed" };
+  }
   const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
   let sessionId: string | undefined;
   let cwd: string | undefined;
@@ -178,9 +217,14 @@ function parseCodexFile(filePath: string): ParsedConversationLog | undefined {
   const transcript: string[] = [];
 
   for (const line of lines) {
-    const parsed = safeParseJson(line);
-    if (!parsed) continue;
-    const record = parsed as Record<string, unknown>;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      return { ok: false, errorCode: "invalid_jsonl" };
+    }
+    const record = asRecord(parsed);
+    if (!record) continue;
     if (!sessionId && record.type === "session_meta") {
       const payload = asRecord(record.payload);
       if (typeof payload?.id === "string") sessionId = payload.id;
@@ -209,9 +253,9 @@ function parseCodexFile(filePath: string): ParsedConversationLog | undefined {
     });
   }
 
-  if (chunks.length === 0) return undefined;
+  if (chunks.length === 0) return { ok: false, errorCode: "no_supported_messages" };
   const resolvedSessionId = sessionId ?? basename(filePath, extname(filePath));
-  return {
+  return { ok: true, value: {
     source: {
       id: `codex:${resolvedSessionId}`,
       type: "conversation",
@@ -226,11 +270,16 @@ function parseCodexFile(filePath: string): ParsedConversationLog | undefined {
       }
     },
     chunks
-  };
+  } };
 }
 
-function parseClaudeFile(filePath: string): ParsedConversationLog | undefined {
-  const raw = readFileSync(filePath, "utf8");
+function parseClaudeFile(filePath: string): ConversationParseResult {
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf8");
+  } catch {
+    return { ok: false, errorCode: "read_failed" };
+  }
   const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
   let sessionId: string | undefined;
   let cwd: string | undefined;
@@ -238,9 +287,14 @@ function parseClaudeFile(filePath: string): ParsedConversationLog | undefined {
   const transcript: string[] = [];
 
   for (const line of lines) {
-    const parsed = safeParseJson(line);
-    if (!parsed) continue;
-    const record = parsed as Record<string, unknown>;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      return { ok: false, errorCode: "invalid_jsonl" };
+    }
+    const record = asRecord(parsed);
+    if (!record) continue;
     if (!sessionId && typeof record.sessionId === "string") {
       sessionId = record.sessionId;
     }
@@ -267,9 +321,9 @@ function parseClaudeFile(filePath: string): ParsedConversationLog | undefined {
     });
   }
 
-  if (chunks.length === 0) return undefined;
+  if (chunks.length === 0) return { ok: false, errorCode: "no_supported_messages" };
   const resolvedSessionId = sessionId ?? basename(filePath, extname(filePath));
-  return {
+  return { ok: true, value: {
     source: {
       id: `claude:${resolvedSessionId}`,
       type: "conversation",
@@ -284,7 +338,7 @@ function parseClaudeFile(filePath: string): ParsedConversationLog | undefined {
       }
     },
     chunks
-  };
+  } };
 }
 
 function shouldIncludeConversation(
@@ -364,12 +418,10 @@ function extractClaudeContent(value: unknown): string {
     .trim();
 }
 
-function safeParseJson(value: string): unknown | undefined {
-  try {
-    return JSON.parse(value) as unknown;
-  } catch {
-    return undefined;
-  }
+function sourceFailureMessage(errorCode: ConversationParseErrorCode): string {
+  if (errorCode === "read_failed") return "The conversation log could not be read.";
+  if (errorCode === "invalid_jsonl") return "The conversation log contains invalid JSONL.";
+  return "The conversation log contains no supported messages.";
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
