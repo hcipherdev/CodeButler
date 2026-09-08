@@ -1,3 +1,4 @@
+import { normalizeScope, SCOPE_EXTRACTION_GUIDANCE } from "../memory/scope.js";
 import type {
   EvidenceRef,
   ExtractedMemory,
@@ -12,7 +13,7 @@ import { parseJsonFromModelText } from "../json.js";
 const VALID_MEMORY_TYPES: MemoryType[] = ["decision", "bug_fix", "constraint", "rejected_approach"];
 const EXTRACTOR_SYSTEM_PROMPT =
   "Extract durable project memories. Respond with strict JSON shaped as {\"memories\": [...]}. " +
-  "Conversation evidence must include the exact supplied source ID and exact supplied chunk ID as locator.";
+  "Conversation evidence must include the exact supplied source ID and exact supplied chunk ID as locator." + SCOPE_EXTRACTION_GUIDANCE;
 
 export function createOpenAICompatibleExtractor(
   config: ExtractorConfig,
@@ -90,7 +91,8 @@ function readMemories(payload: unknown, context: ExtractorContext): ExtractorRes
       rejected.push({ index, reason: evidenceReason });
       continue;
     }
-    const memory = parseMemory(value);
+    let memory: ExtractedMemory | undefined;
+    try { memory = parseMemory(value); } catch { memory = undefined; }
     if (!memory) {
       rejected.push({ index, reason: "invalid_memory_record" });
       continue;
@@ -129,6 +131,7 @@ function parseMemory(value: unknown): ExtractedMemory | undefined {
   }
 
   return {
+    scope: normalizeScope(record?.scope),
     type,
     title,
     summary,

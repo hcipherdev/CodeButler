@@ -3,6 +3,7 @@ import type { MemoryLifecycleStatus, SourceType } from "../types.js";
 export const OPERATION_TYPES = [
   "migration",
   "lifecycle_change",
+  "scope_change",
   "redaction",
   "deletion",
   "export",
@@ -25,6 +26,7 @@ export interface IdentifierCountCategoryMetadata {
 }
 
 export interface OperationMetadataByType {
+  scope_change: { memoryIdHash?: string; reasonHash?: string; category?: string };
   migration: { migrationVersion?: number | undefined };
   lifecycle_change: {
     memoryIdHash?: string | undefined;

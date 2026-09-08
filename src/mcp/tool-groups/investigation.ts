@@ -1,3 +1,4 @@
+import { memoryScopeSchema, targetEnvironmentSchema, SCOPE_GUIDANCE } from "../../memory/scope.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -9,8 +10,9 @@ export function registerInvestigationToolGroup(
   handlers: ProjectMemoryToolHandlers
 ): void {
   server.registerTool("explain_code_change", {
-    description: "Explain why a file changed using promoted memories, commits, conversations, and decisions.",
+    description: "Explain why a file changed using promoted memories, commits, conversations, and decisions." + SCOPE_GUIDANCE,
     inputSchema: {
+      targetEnvironment: targetEnvironmentSchema.optional(),
       filePath: z.string().min(1),
       lineNumber: z.number().int().positive().optional(),
       question: z.string().optional()
@@ -20,8 +22,9 @@ export function registerInvestigationToolGroup(
   )));
 
   server.registerTool("investigate_project_history", {
-    description: "Run a local multi-step project history investigation for a natural language question.",
+    description: "Run a local multi-step project history investigation for a natural language question." + SCOPE_GUIDANCE,
     inputSchema: {
+      targetEnvironment: targetEnvironmentSchema.optional(),
       question: z.string().min(1),
       limit: z.number().int().positive().max(100).optional()
     }
@@ -37,40 +40,42 @@ export function registerInvestigationToolGroup(
       until: z.string().optional(),
       includeWorkingTree: z.boolean().optional()
     }
-  }, async (input) => asJsonContent(handlers.summarize_recent_activity(
+  }, async (input) => asJsonContent(await handlers.summarize_recent_activity(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["summarize_recent_activity"]>[0]>(input)
   )));
 
   server.registerTool("search_temporary_memory", {
     description:
-      "Search unexpired temporary working context for this project. Results are prioritized for the current thread/session.",
+      "Search unexpired temporary working context for this project. Results are prioritized for the current thread/session." + SCOPE_GUIDANCE,
     inputSchema: {
+      targetEnvironment: targetEnvironmentSchema.optional(),
       query: z.string().min(1),
       threadId: z.string().optional(),
       sessionId: z.string().optional(),
       limit: z.number().int().positive().max(100).optional()
     }
-  }, async (input) => asJsonContent(handlers.search_temporary_memory(
+  }, async (input) => asJsonContent(await handlers.search_temporary_memory(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["search_temporary_memory"]>[0]>(input)
   )));
 
   server.registerTool("summarize_active_context", {
     description:
-      "Summarize unexpired temporary working context for continuation after compaction or a new agent turn.",
+      "Summarize unexpired temporary working context for continuation after compaction or a new agent turn." + SCOPE_GUIDANCE,
     inputSchema: {
+      targetEnvironment: targetEnvironmentSchema.optional(),
       threadId: z.string().optional(),
       sessionId: z.string().optional(),
       projectOnly: z.boolean().optional(),
       limit: z.number().int().positive().max(100).optional()
     }
-  }, async (input) => asJsonContent(handlers.summarize_active_context(
+  }, async (input) => asJsonContent(await handlers.summarize_active_context(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["summarize_active_context"]>[0]>(input)
   )));
 
   server.registerTool("cleanup_temporary_memory", {
     description: "Delete expired temporary working context, or all temporary context when expiredOnly is false.",
     inputSchema: { expiredOnly: z.boolean().optional() }
-  }, async (input) => asJsonContent(handlers.cleanup_temporary_memory(
+  }, async (input) => asJsonContent(await handlers.cleanup_temporary_memory(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["cleanup_temporary_memory"]>[0]>(input)
   )));
 }

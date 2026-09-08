@@ -1,3 +1,4 @@
+import { SCOPE_GUIDANCE } from "../memory/scope.js";
 import {
   investigationPlanDecisionSchema,
   investigationSynthesisSchema
@@ -15,6 +16,7 @@ import type {
 } from "../types.js";
 
 const INVESTIGATOR_SYSTEM_PROMPT = [
+  SCOPE_GUIDANCE,
   "You are a project-history investigation planner.",
   "Choose exactly one next action from the allowed typed action set.",
   "Search temporary working context before durable memory when the task looks like continuation after compaction.",
@@ -28,6 +30,7 @@ const INVESTIGATOR_SYSTEM_PROMPT = [
 ].join(" ");
 
 const SYNTHESIS_SYSTEM_PROMPT = [
+  SCOPE_GUIDANCE,
   "You are synthesizing a project-history answer from explicit evidence.",
   "Use only the provided evidence and trace summary.",
   "Label temporary memory as working context unless corroborated by durable evidence.",
@@ -109,6 +112,8 @@ function summarizePlannerState(state: InvestigationPlannerState): Record<string,
     relatedDecisions: state.relatedDecisions.slice(0, 5).map((decision) => ({
       id: decision.id,
       topic: decision.topic,
+      scope: decision.scope,
+      applicability: decision.applicability,
       decision: decision.decision,
       reason: decision.reason
     })),
@@ -116,6 +121,8 @@ function summarizePlannerState(state: InvestigationPlannerState): Record<string,
       id: memory.id,
       kind: memory.kind,
       title: memory.title,
+      scope: memory.scope,
+      applicability: memory.applicability,
       summary: memory.summary,
       details: memory.details,
       relatedFiles: memory.relatedFiles,
@@ -126,6 +133,8 @@ function summarizePlannerState(state: InvestigationPlannerState): Record<string,
       id: memory.id,
       type: memory.type,
       title: memory.title,
+      scope: memory.scope,
+      applicability: memory.applicability,
       summary: memory.summary,
       reason: memory.reason,
       relatedFiles: memory.relatedFiles,
@@ -135,6 +144,8 @@ function summarizePlannerState(state: InvestigationPlannerState): Record<string,
       id: memory.id,
       type: memory.type,
       title: memory.title,
+      scope: memory.scope,
+      applicability: memory.applicability,
       summary: memory.summary,
       reason: memory.reason,
       relatedFiles: memory.relatedFiles,

@@ -52,6 +52,7 @@ const METADATA_CATEGORIES = new Set([
 ]);
 
 const METADATA_KEYS: Record<OperationType, ReadonlySet<string>> = {
+  scope_change: new Set(["memoryIdHash", "reasonHash", "category"]),
   migration: new Set(["migrationVersion"]),
   lifecycle_change: new Set(["memoryIdHash", "previousStatus", "newStatus", "replacementMemoryIdHash"]),
   redaction: new Set(["identifier", "count", "category"]),
@@ -292,7 +293,7 @@ function validateMetadataValue(key: string, value: unknown): void {
     }
   } else if (key === "sourceType") {
     assertSourceType(value);
-  } else if (key === "sourceIdHash" || key === "memoryIdHash" || key === "replacementMemoryIdHash") {
+  } else if (key === "reasonHash" || key === "sourceIdHash" || key === "memoryIdHash" || key === "replacementMemoryIdHash") {
     if (typeof value !== "string" || !HASH_PATTERN.test(value)) {
       throw new Error(`${key} operation metadata must be a SHA-256 hex digest`);
     }

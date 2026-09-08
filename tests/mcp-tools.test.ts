@@ -442,7 +442,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("registers and invokes 21 MCP tools with lifecycle validation and wiring", async () => {
+  it("registers and invokes 22 MCP tools with lifecycle validation and wiring", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
@@ -474,7 +474,7 @@ describe("MCP tool handlers", () => {
       now: () => new Date("2026-07-12T16:05:00.000Z")
     });
 
-    expect(registrations).toHaveLength(21);
+    expect(registrations).toHaveLength(22);
     expect(registrations.map((registration) => registration.name)).toContain("update_memory_status");
     expect(registrations.map((registration) => registration.name)).toContain("list_source_failures");
     const find = registrations.find((registration) => registration.name === "find_memories")!;
@@ -540,16 +540,16 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("keeps the architecture copies consistent with the complete 21-tool list", () => {
+  it("keeps the architecture copies consistent with the complete 22-tool list", () => {
     const architecture = readFileSync(join(process.cwd(), "architecture.html"), "utf8");
     const published = readFileSync(join(process.cwd(), "docs", "public", "architecture.html"), "utf8");
     const toolNames = [...architecture.matchAll(/<div class="mcp-tool-name">([^<]+)<\/div>/g)]
       .map((match) => match[1]);
 
     expect(published).toBe(architecture);
-    expect(architecture).toContain("MCP Tools (21)");
-    expect(architecture).toContain("21 exposed tools");
-    expect(toolNames).toHaveLength(21);
+    expect(architecture).toContain("MCP Tools (22)");
+    expect(architecture).toContain("22 exposed tools");
+    expect(toolNames).toHaveLength(22);
     expect([...toolNames].sort()).toEqual([
       "cleanup_temporary_memory",
       "current_project",
@@ -571,6 +571,7 @@ describe("MCP tool handlers", () => {
       "summarize_project_state",
       "summarize_recent_activity",
       "sync_project_memory",
+      "update_memory_scope",
       "update_memory_status"
     ].sort());
   });

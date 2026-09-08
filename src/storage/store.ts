@@ -1,8 +1,11 @@
+import { registerDatabaseHandle } from "../cloud/gate.js";
+import { normalizeScope, parseScope, sanitizeScope, scopeKey, assessApplicability } from "../memory/scope.js";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { parseMemoryOrigin, sanitizeMemoryOrigin } from "../memory/origin.js";
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
 import {
   createEmbeddingContentHash,
@@ -58,6 +61,7 @@ import type {
   InvestigationEntityLink,
   InvestigationEntityRef,
   MemoryCandidate,
+  MemoryOrigin,
   MemoryChunk,
   MemoryLifecycleStatus,
   MemoryPromotionState,
@@ -102,6 +106,7 @@ function sanitizeCommit(policy: StorageContentPolicy, commit: CommitRecord): Com
 
 function sanitizeDecision(policy: StorageContentPolicy, decision: DecisionRecord): DecisionRecord {
   return {
+    scope: sanitizeScope(policy, decision.scope),
     id: policy.identifier(decision.id),
     topic: policy.text(decision.topic),
     decision: policy.text(decision.decision),
@@ -114,6 +119,8 @@ function sanitizeDecision(policy: StorageContentPolicy, decision: DecisionRecord
 
 function sanitizeExtractedMemory(policy: StorageContentPolicy, memory: ExtractedMemory): ExtractedMemory {
   return {
+    scope: sanitizeScope(policy, memory.scope),
+    origin: sanitizeMemoryOrigin(policy, memory.origin),
     type: memory.type,
     title: policy.text(memory.title),
     summary: policy.text(memory.summary),
@@ -130,6 +137,8 @@ function sanitizeTemporaryMemory(
   input: TemporaryMemoryUpsertInput
 ): TemporaryMemoryUpsertInput {
   return {
+    scope: sanitizeScope(policy, input.scope),
+    origin: sanitizeMemoryOrigin(policy, input.origin),
     ...(input.id === undefined ? {} : { id: policy.identifier(input.id) }),
     ...(input.projectId === undefined ? {} : { projectId: policy.path(input.projectId) }),
     ...(input.threadId === undefined ? {} : { threadId: policy.identifier(input.threadId) }),
@@ -379,7 +388,7 @@ export interface MemoryStore {
     }
   ): MemoryCandidate;
   promoteMemoryCandidate(candidateId: string, source?: DurableMemory["source"]): DurableMemory;
-  upsertManualDecisionMemory(decision: DecisionRecord): DurableMemory;
+  upsertManualDecisionMemory(decision: DecisionRecord, origin?: MemoryOrigin): DurableMemory;
   readMemory(id: string): DurableMemory | undefined;
   updateMemoryLifecycle(
     id: string,
@@ -514,6 +523,9 @@ interface SourceFailureRow {
 }
 
 interface MemoryCandidateRow {
+  scope_json: string;
+  scope_key: string;
+  origin_json: string | null;
   id: string;
   type: MemoryType;
   title: string;
@@ -533,6 +545,9 @@ interface MemoryCandidateRow {
 }
 
 interface MemoryRow {
+  scope_json: string;
+  scope_key: string;
+  origin_json: string | null;
   id: string;
   type: MemoryType;
   title: string;
@@ -558,6 +573,10 @@ interface MemoryRow {
 }
 
 interface TemporaryMemoryRow {
+  base_id: string;
+  scope_json: string;
+  scope_key: string;
+  origin_json: string | null;
   id: string;
   project_id: string;
   thread_id: string | null;
@@ -652,7 +671,10 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
   const databasePath = join(dataDir, "memory.sqlite");
   mkdirSync(dataDir, { recursive: true });
 
-  const db = new DatabaseSync(databasePath);
+  const releaseHandle = registerDatabaseHandle(dataDir);
+  let db: DatabaseSync;
+  try { db = new DatabaseSync(databasePath); }
+  catch (error) { releaseHandle(); throw error; }
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA journal_mode = WAL");
@@ -683,6 +705,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         );
       }
       db.close();
+      releaseHandle();
     },
     beginOperation(input) {
       return beginOperation(db, input);
@@ -1466,13 +1489,13 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         const now = new Date().toISOString();
         const existing = db
           .prepare(
-            `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+            `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                     dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                     created_at, updated_at
              from memory_candidates
-             where dedupe_key = ?`
+             where dedupe_key = ? and scope_key = ?`
           )
-          .get(memory.dedupeKey) as MemoryCandidateRow | undefined;
+          .get(memory.dedupeKey, scopeKey(memory.scope)) as MemoryCandidateRow | undefined;
         const candidateId = existing?.id ?? `candidate-${randomUUID()}`;
         const promotionState = options?.promotionState ?? existing?.promotion_state ?? "candidate";
         const qualityStatus = options?.qualityStatus ?? existing?.quality_status ?? "active";
@@ -1480,11 +1503,11 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         const lastVerifiedAt = options?.lastVerifiedAt ?? existing?.last_verified_at ?? null;
         db.prepare(
           `insert into memory_candidates
-             (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+             (scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
               dedupe_key, promotion_state, evidence_signature, quality_status, quality_reasons_json,
               last_verified_at, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           on conflict(dedupe_key) do update set
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(dedupe_key, scope_key) do update set
              type = excluded.type,
              title = excluded.title,
              summary = excluded.summary,
@@ -1499,6 +1522,8 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
              last_verified_at = excluded.last_verified_at,
              updated_at = excluded.updated_at`
         ).run(
+          JSON.stringify(normalizeScope(memory.scope)), scopeKey(memory.scope),
+          memory.origin ? JSON.stringify(memory.origin) : null,
           candidateId,
           memory.type,
           memory.title,
@@ -1519,7 +1544,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         rebuildMemoryLinks(db, "candidate", candidateId, memory.evidence, memory.relatedFiles);
         const row = db
           .prepare(
-            `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+            `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                     dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                     created_at, updated_at
              from memory_candidates
@@ -1533,7 +1558,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       return withTransaction(db, () => {
         const candidate = db
           .prepare(
-            `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+            `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                     dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                     created_at, updated_at
              from memory_candidates
@@ -1544,6 +1569,8 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
           throw new Error(`Unknown memory candidate: ${candidateId}`);
         }
         const memory = upsertMemoryRow(db, {
+          scope: parseScope(candidate.scope_json),
+          origin: parseMemoryOrigin(candidate.origin_json),
           id: candidate.promoted_memory_id ?? undefined,
           type: candidate.type,
           title: candidate.title,
@@ -1567,11 +1594,13 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         return memory;
       });
     },
-    upsertManualDecisionMemory(decision) {
+    upsertManualDecisionMemory(decision, origin) {
       return withTransaction(db, () => {
         decision = sanitizeDecision(contentPolicy, decision);
         return upsertMemoryRow(db, {
-          id: `memory-manual-${decision.id}`,
+          scope: decision.scope,
+          origin: sanitizeMemoryOrigin(contentPolicy, origin),
+          id: `memory-manual-${decision.id}${scopeKey(decision.scope) === "unspecified" ? "" : `-scope-${scopeKey(decision.scope)}`}`,
           type: "decision",
           title: decision.topic,
           summary: decision.decision,
@@ -1616,7 +1645,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
     listMemoryCandidates(input = {}) {
       const rows = db
         .prepare(
-          `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                   dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                   created_at, updated_at
            from memory_candidates
@@ -1637,7 +1666,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       if (input.status === "candidate") return [];
       const rows = db
         .prepare(
-          `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                   dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
                   subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                   lifecycle_generation,
@@ -1674,17 +1703,11 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       return withTransaction(db, () => {
         input = sanitizeTemporaryMemory(contentPolicy, input);
         const now = input.updatedAt ?? new Date().toISOString();
-        const existing = input.id
-          ? db
-              .prepare(
-                `select id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
-                        related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
-                 from temporary_memories
-                 where id = ?`
-              )
-              .get(input.id) as TemporaryMemoryRow | undefined
-          : undefined;
-        const id = input.id ?? `temporary-${randomUUID()}`;
+        const existingById = input.id ? db.prepare("select base_id from temporary_memories where id = ?").get(input.id) as { base_id: string } | undefined : undefined;
+        const baseId = existingById?.base_id ?? input.id ?? `temporary-${randomUUID()}`;
+        const key = scopeKey(input.scope);
+        const existing = db.prepare("select * from temporary_memories where base_id = ? and scope_key = ?").get(baseId, key) as unknown as TemporaryMemoryRow | undefined;
+        const id = existing?.id ?? (key === "unspecified" ? baseId : `temporary-${randomUUID()}`);
         const projectId = input.projectId ?? existing?.project_id ?? store.paths.rootDir;
         const createdAt = input.createdAt ?? existing?.created_at ?? now;
         const defaultExpiresAt = new Date(Date.parse(now) + TEMPORARY_MEMORY_DEFAULT_TTL_MS).toISOString();
@@ -1696,10 +1719,10 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
 
         db.prepare(
           `insert into temporary_memories
-             (id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+             (base_id, scope_json, scope_key, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
               related_files_json, evidence_json, confidence, created_at, updated_at, expires_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           on conflict(id) do update set
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(base_id, scope_key) do update set
              project_id = excluded.project_id,
              thread_id = excluded.thread_id,
              session_id = excluded.session_id,
@@ -1714,6 +1737,8 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
              updated_at = excluded.updated_at,
              expires_at = excluded.expires_at`
         ).run(
+          baseId, JSON.stringify(normalizeScope(input.scope)), scopeKey(input.scope),
+          input.origin ? JSON.stringify(input.origin) : null,
           id,
           projectId,
           input.threadId ?? existing?.thread_id ?? null,
@@ -1746,7 +1771,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         rebuildTemporaryMemoryFts(db, ftsInput);
         const row = db
           .prepare(
-            `select id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+            `select base_id, scope_json, scope_key, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
                     related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
              from temporary_memories
              where id = ?`
@@ -1761,6 +1786,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       const rows = db
         .prepare(
           `select
+             m.base_id, m.scope_json, m.scope_key, m.origin_json,
              m.id,
              m.project_id,
              m.thread_id,
@@ -1796,7 +1822,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       const now = input.now ?? new Date().toISOString();
       const rows = db
         .prepare(
-          `select id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+          `select base_id, scope_json, scope_key, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
                   related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
            from temporary_memories
            where project_id = ? and expires_at > ?
@@ -1867,7 +1893,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       if (memoryIds.length === 0) return [];
       const rows = chunked(memoryIds, SQLITE_READ_BATCH_SIZE).flatMap((batch) =>
         db.prepare(
-          `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                   dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
                   subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                   lifecycle_generation, created_at, promoted_at
@@ -1916,6 +1942,8 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
 function upsertMemoryRow(
   db: DatabaseSync,
   input: {
+    scope?: import("../types.js").MemoryScope | undefined;
+    origin?: MemoryOrigin | null;
     id?: string | undefined;
     type: MemoryType;
     title: string;
@@ -1936,14 +1964,14 @@ function upsertMemoryRow(
   const existing = input.id
     ? readMemoryRowRaw(db, input.id)
     : db.prepare(
-        `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+        `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                 dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
                 subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                 lifecycle_generation,
                 created_at, promoted_at
          from memories
-         where dedupe_key = ? and evidence_signature = ? and source = ?`
-      ).get(input.dedupeKey, evidenceSignature, input.source) as MemoryRow | undefined;
+         where dedupe_key = ? and evidence_signature = ? and source = ? and scope_key = ?`
+      ).get(input.dedupeKey, evidenceSignature, input.source, scopeKey(input.scope)) as MemoryRow | undefined;
   const id = existing?.id ?? input.id ?? `memory-${randomUUID()}`;
   const subjectKey = createMemorySubjectKey(input.type, input.title);
   if (existing) {
@@ -1964,12 +1992,14 @@ function upsertMemoryRow(
     const lifecycleGeneration = randomUUID();
     db.prepare(
       `insert into memories
-         (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+         (scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
           dedupe_key, evidence_signature, source, quality_status, quality_reasons_json,
           last_verified_at, subject_key, lifecycle_status, valid_from, valid_until,
           status_reason, status_changed_at, lifecycle_generation, created_at, promoted_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?, ?)`
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?, ?)`
     ).run(
+      JSON.stringify(normalizeScope(input.scope)), scopeKey(input.scope),
+      input.origin ? JSON.stringify(input.origin) : null,
       id, input.type, input.title, input.summary, input.reason, input.confidence,
       JSON.stringify(input.evidence), JSON.stringify(input.relatedFiles), input.dedupeKey,
       evidenceSignature, input.source, input.qualityStatus, JSON.stringify(input.qualityReasons),
@@ -1983,7 +2013,7 @@ function upsertMemoryRow(
 
 function readMemoryRowRaw(db: DatabaseSync, id: string): MemoryRow | undefined {
   return db.prepare(
-    `select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+    `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
             dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
             subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
             lifecycle_generation,
@@ -2340,6 +2370,9 @@ function formatCommitSearchText(commit: CommitRecord): string {
 
 function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
   return {
+    scope: parseScope(row.scope_json),
+    applicability: assessApplicability(parseScope(row.scope_json)),
+    origin: parseMemoryOrigin(row.origin_json),
     id: row.id,
     type: row.type,
     title: row.title,
@@ -2361,6 +2394,9 @@ function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
 
 function memoryFromRow(row: MemoryRow): DurableMemory {
   return {
+    scope: parseScope(row.scope_json),
+    applicability: assessApplicability(parseScope(row.scope_json)),
+    origin: parseMemoryOrigin(row.origin_json),
     id: row.id,
     type: row.type,
     title: row.title,
@@ -2397,6 +2433,9 @@ function memorySearchResult(
   });
   const result: MemorySearchResult = {
     kind,
+    scope: normalizeScope(memory.scope),
+    applicability: assessApplicability(memory.scope),
+    origin: memory.origin ?? null,
     id: memory.id,
     type: memory.type,
     title: memory.title,
@@ -2432,6 +2471,9 @@ function memorySearchResult(
 
 function temporaryMemoryFromRow(row: TemporaryMemoryRow): TemporaryMemory {
   const memory: TemporaryMemory = {
+    scope: parseScope(row.scope_json),
+    applicability: assessApplicability(parseScope(row.scope_json)),
+    origin: parseMemoryOrigin(row.origin_json),
     id: row.id,
     projectId: row.project_id,
     kind: row.kind,

@@ -1,3 +1,5 @@
+import { withApplicability } from "../memory/scope.js";
+import type { TargetEnvironment } from "../types.js";
 import { createProviderFingerprint, createProviderKey, createEmbeddingEndpointHash } from "../embeddings/fingerprint.js";
 import { createOpenAICompatibleEmbeddingProvider, isLoopbackEmbeddingEndpoint } from "../embeddings/provider.js";
 import { redactSensitiveText } from "../privacy/redaction.js";
@@ -18,6 +20,7 @@ export interface SearchServiceOptions {
 }
 
 export interface MemorySearchInput {
+  targetEnvironment?: TargetEnvironment;
   query?: string;
   type?: MemoryType;
   status?: "promoted" | "candidate";
@@ -29,7 +32,7 @@ export interface MemorySearchInput {
 export async function searchProjectMemory(
   store: MemoryStore,
   config: ProjectConfig,
-  input: { query: string; sourceTypes?: SourceType[]; limit?: number },
+  input: { query: string; sourceTypes?: SourceType[]; limit?: number; targetEnvironment?: TargetEnvironment },
   options: SearchServiceOptions = {}
 ): Promise<{ memories: MemorySearchResult[]; results: SearchResult[] }> {
   const memoryInput: MemorySearchInput = {
@@ -41,14 +44,14 @@ export async function searchProjectMemory(
     results: store.search(input)
   };
   const semantic = await prepareSemanticSearch(store, config, input.query, options);
-  if (!semantic) return lexical;
+  if (!semantic) return withApplicability(lexical, input.targetEnvironment);
   try {
     const results = fuseRawResults(store, lexical.results, semantic, input.sourceTypes, input.limit, config.retrieval.rrfK);
     const memories = fuseMemoryResults(store, lexical.memories, semantic, memoryInput, config.retrieval.rrfK);
-    if (results === undefined && memories === undefined) return lexical;
-    return { results: results ?? lexical.results, memories: memories ?? lexical.memories };
+    if (results === undefined && memories === undefined) return withApplicability(lexical, input.targetEnvironment);
+    return withApplicability({ results: results ?? lexical.results, memories: memories ?? lexical.memories }, input.targetEnvironment);
   } catch {
-    return lexical;
+    return withApplicability(lexical, input.targetEnvironment);
   }
 }
 
@@ -63,13 +66,13 @@ export async function findProjectMemories(
     !input.query
     || input.status === "candidate"
     || (input.lifecycleStatus !== undefined && input.lifecycleStatus !== "current")
-  ) return lexical;
+  ) return withApplicability(lexical, input.targetEnvironment);
   const semantic = await prepareSemanticSearch(store, config, input.query, options);
-  if (!semantic) return lexical;
+  if (!semantic) return withApplicability(lexical, input.targetEnvironment);
   try {
-    return fuseMemoryResults(store, lexical, semantic, input, config.retrieval.rrfK) ?? lexical;
+    return withApplicability(fuseMemoryResults(store, lexical, semantic, input, config.retrieval.rrfK) ?? lexical, input.targetEnvironment);
   } catch {
-    return lexical;
+    return withApplicability(lexical, input.targetEnvironment);
   }
 }
 

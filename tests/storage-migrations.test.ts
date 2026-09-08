@@ -31,7 +31,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(10);
+    expect(CURRENT_SCHEMA_VERSION).toBe(12);
     expect(store.db.prepare("pragma table_info(source_failures)").all()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "adapter" }),
@@ -61,7 +61,7 @@ describe("ordered storage migrations", () => {
       ])
     );
     const migrationOperations = store.listOperations({ operationType: "migration" });
-    expect(migrationOperations).toHaveLength(2);
+    expect(migrationOperations).toHaveLength(4);
     expect(migrationOperations).toEqual(expect.arrayContaining([
       expect.objectContaining({
         operationType: "migration",
@@ -283,16 +283,13 @@ describe("ordered storage migrations", () => {
       },
       chunks: [{ text: "Legacy content" }]
     });
-    legacyStore.upsertMemoryCandidate({
-      type: "decision",
-      title: "Legacy memory",
-      summary: "Keep this memory.",
-      reason: "Migration coverage.",
-      confidence: 1,
-      evidence: [{ sourceType: "conversation", sourceId: "legacy-source" }],
-      relatedFiles: [],
-      dedupeKey: "legacy-memory"
-    });
+    // Seed the historical schema directly; current store writes require current migrations.
+    legacyStore.db.exec(`insert into memory_candidates
+      (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+       dedupe_key, promotion_state, evidence_signature, created_at, updated_at)
+      values ('legacy-candidate', 'decision', 'Legacy memory', 'Keep this memory.',
+       'Migration coverage.', 1, '[]', '[]', 'legacy-memory', 'candidate',
+       'legacy-signature', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z')`);
     legacyStore.db.prepare(
       `insert into memories
          (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
@@ -319,7 +316,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(10);
+    expect(CURRENT_SCHEMA_VERSION).toBe(12);
     expect(store.db.prepare("select count(*) as count from sources").get()).toEqual(before.sources);
     expect(store.db.prepare("select count(*) as count from chunks").get()).toEqual(before.chunks);
     expect(store.db.prepare("select count(*) as count from memories").get()).toEqual(before.memories);

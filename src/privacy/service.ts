@@ -1,7 +1,9 @@
+import { parseScope, sanitizeScope, scopeKey } from "../memory/scope.js";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { parseMemoryOrigin, sanitizeMemoryOrigin } from "../memory/origin.js";
 import {
   createRecoveryBackup,
   purgeDatabaseBackups,
@@ -560,13 +562,13 @@ const PRIVACY_EXPORT_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   sync_sources: ["source", "enabled", "last_sync_at", "last_success_at", "last_error", "metadata_json"],
   sync_cursors: ["source", "cursor_key", "cursor_value", "updated_at"],
   memory_candidates: [
-    "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
+    "scope_json", "scope_key", "origin_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
     "related_files_json", "dedupe_key", "promotion_state", "promoted_memory_id",
     "evidence_signature", "quality_status", "quality_reasons_json", "last_verified_at",
     "created_at", "updated_at"
   ],
   memories: [
-    "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
+    "scope_json", "scope_key", "origin_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
     "related_files_json", "dedupe_key", "evidence_signature", "source", "quality_status",
     "quality_reasons_json", "last_verified_at", "subject_key", "lifecycle_status",
     "valid_from", "valid_until", "status_reason", "status_changed_at",
@@ -574,7 +576,8 @@ const PRIVACY_EXPORT_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   ],
   memory_links: ["id", "owner_kind", "owner_id", "target_type", "target_id", "locator", "metadata_json"],
   temporary_memories: [
-    "id", "project_id", "thread_id", "session_id", "source_adapter", "kind", "title",
+    "base_id",
+    "scope_json", "scope_key", "origin_json", "id", "project_id", "thread_id", "session_id", "source_adapter", "kind", "title",
     "summary", "details", "related_files_json", "evidence_json", "confidence", "created_at",
     "updated_at", "expires_at"
   ],
@@ -627,6 +630,16 @@ const RESTORE_TABLE_ORDER = [
 ] as const;
 
 function insertRow(store: MemoryStore, table: string, row: Record<string, unknown>): void {
+  if (["memory_candidates", "memories", "temporary_memories"].includes(table)) {
+    if (row.scope_json != null && typeof row.scope_json !== "string") throw new Error("Invalid memory scope metadata");
+    const scope = sanitizeScope(store.contentPolicy, parseScope(row.scope_json as string | undefined));
+    row = { ...row, scope_json: JSON.stringify(scope), scope_key: scopeKey(scope) };
+    if (table === "temporary_memories") row.base_id ??= row.id;
+  }
+  if (["memory_candidates", "memories", "temporary_memories"].includes(table) && row.origin_json != null) {
+    if (typeof row.origin_json !== "string") throw new Error("Invalid memory origin metadata");
+    row = { ...row, origin_json: JSON.stringify(sanitizeMemoryOrigin(store.contentPolicy, parseMemoryOrigin(row.origin_json))) };
+  }
   if (table === "operation_log") row = validateImportedOperation(row);
   row = redactExportValue(row, store) as Record<string, unknown>;
   const columns = Object.keys(row);
@@ -729,6 +742,15 @@ function scrubStoredContent(store: MemoryStore): number {
     title: "text", summary: "text", reason: "text", evidence_json: "json",
     related_files_json: "json", quality_reasons_json: "json", status_reason: "text"
   });
+  for (const table of ["memories", "memory_candidates", "temporary_memories"]) {
+    const rows = store.db.prepare(`select id, scope_json from ${table}`).all() as Array<{ id: string; scope_json: string }>;
+    for (const row of rows) {
+      const scope = sanitizeScope(store.contentPolicy, parseScope(row.scope_json));
+      const next = JSON.stringify(scope);
+      if (next !== row.scope_json) redactions += 1;
+      store.db.prepare(`update ${table} set scope_json = ?, scope_key = ? where id = ?`).run(next, scopeKey(scope), row.id);
+    }
+  }
   update("memory_links", "id", { locator: "text", metadata_json: "json" });
   update("temporary_memories", "id", {
     project_id: "text", thread_id: "text", session_id: "text", source_adapter: "text",
@@ -981,14 +1003,14 @@ function deleteSourceData(
       .map((memory) => [memory.id, memory])
   );
   if (input.sourceType === "decision") {
-    const manualMemory = store.db.prepare(
+    const manualMemories = store.db.prepare(
       `select id, evidence_json from memories
        where id = ? or dedupe_key = ?`
-    ).get(
+    ).all(
       `memory-manual-${input.sourceId}`,
       `manual-decision:${input.sourceId}`
-    ) as { id: string; evidence_json: string } | undefined;
-    if (manualMemory) {
+    ) as Array<{ id: string; evidence_json: string }>;
+    for (const manualMemory of manualMemories) {
       affectedMemoriesById.set(manualMemory.id, {
         id: manualMemory.id,
         evidence: parseEvidence(manualMemory.evidence_json)

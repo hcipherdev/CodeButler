@@ -1,3 +1,4 @@
+import { normalizeScope, memoryScopeSchema, targetEnvironmentSchema, SCOPE_GUIDANCE } from "../../memory/scope.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -11,8 +12,9 @@ export function registerMemoryToolGroup(
   handlers: ProjectMemoryToolHandlers
 ): void {
   server.registerTool("find_memories", {
-    description: "Find promoted or candidate durable project memories.",
+    description: "Find promoted or candidate durable project memories." + SCOPE_GUIDANCE,
     inputSchema: {
+      targetEnvironment: targetEnvironmentSchema.optional(),
       query: z.string().optional(),
       type: memoryType.optional(),
       status: z.enum(["promoted", "candidate"]).optional(),
@@ -27,6 +29,7 @@ export function registerMemoryToolGroup(
   server.registerTool("remember_project_memory", {
     description: "Store an explicit user-requested durable project memory without inspecting local database internals.",
     inputSchema: {
+      scope: memoryScopeSchema.optional(),
       type: memoryType,
       text: z.string().min(1),
       title: z.string().min(1).optional(),
@@ -35,9 +38,19 @@ export function registerMemoryToolGroup(
       promote: z.boolean().optional(),
       supersedesMemoryId: z.string().min(1).optional()
     }
-  }, async (input) => asJsonContent(handlers.remember_project_memory(
+  }, async (input) => asJsonContent(await handlers.remember_project_memory(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["remember_project_memory"]>[0]>(input)
   )));
+
+  server.registerTool("update_memory_scope", {
+    description: "Correct memory scope explicitly; requires a reason and preserves generation origin.",
+    inputSchema: {
+      memoryId: z.string().min(1),
+      category: z.enum(["candidate", "promoted", "temporary"]),
+      scope: memoryScopeSchema,
+      reason: z.string().trim().min(1)
+    }
+  }, async input => asJsonContent(await handlers.update_memory_scope({ ...input, scope: normalizeScope(input.scope) })));
 
   server.registerTool("update_memory_status", {
     description: "Mark a durable memory current, superseded, or retracted while preserving lifecycle history.",
@@ -47,12 +60,12 @@ export function registerMemoryToolGroup(
       reason: z.string().trim().min(1),
       replacementMemoryId: z.string().min(1).optional()
     }
-  }, async (input) => asJsonContent(handlers.update_memory_status(
+  }, async (input) => asJsonContent(await handlers.update_memory_status(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["update_memory_status"]>[0]>(input)
   )));
 
   server.registerTool("summarize_memory_health", {
     description: "Summarize durable memory quality status and top quality-review reasons.",
     inputSchema: {}
-  }, async () => asJsonContent(handlers.summarize_memory_health()));
+  }, async () => asJsonContent(await handlers.summarize_memory_health()));
 }

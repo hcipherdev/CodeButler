@@ -1,3 +1,4 @@
+import { createMemoryOrigin, type OriginFactory } from "../memory/origin.js";
 import { createAnthropicAwsExtractor } from "../extract/anthropic-aws.js";
 import { createOpenAICompatibleExtractor } from "../extract/openai.js";
 import { extractDeterministicMemories } from "../deterministic/triggers.js";
@@ -54,6 +55,7 @@ export interface SyncRunResult {
 export type SyncEmbeddingBuilder = typeof buildEmbeddings;
 
 export interface SyncProjectMemoryOptions {
+  originFactory?: OriginFactory;
   source?: SyncSourceName | "all";
   extractorProvider?: ExtractorProvider;
   embeddingProvider?: EmbeddingProvider | undefined;
@@ -165,7 +167,8 @@ export async function syncProjectMemory(
     extractTemporaryMemories(importedConversations, {
       projectId: store.paths.rootDir,
       now: new Date(startedAt)
-    }).memories
+    }).memories,
+    options.originFactory
   );
 
   const deterministicProcessed = processDeterministicMemories(
@@ -176,7 +179,8 @@ export async function syncProjectMemory(
         commits: importedCommits
       },
       { deterministic: config.deterministic, repoPath: config.sources.git.repoPath }
-    )
+    ),
+    options.originFactory
   );
 
   const extractor = options.extractorProvider ?? buildConfiguredExtractor(config);
@@ -215,7 +219,7 @@ export async function syncProjectMemory(
       conversations: importedConversations,
       commits: importedCommits
     });
-    const processed = processExtractedMemories(store, config, extracted.memories);
+    const processed = processExtractedMemories(store, config, extracted.memories, options.originFactory);
     result.memories = {
       candidates: deterministicProcessed.candidates + processed.candidates,
       promoted: deterministicProcessed.promoted + processed.promoted,
@@ -328,7 +332,8 @@ const SOURCE_NAMES: SyncSourceName[] = ["git", "codex", "claude"];
 
 function processDeterministicMemories(
   store: MemoryStore,
-  extraction: { memories: ExtractedMemory[]; promoteDedupeKeys: string[] }
+  extraction: { memories: ExtractedMemory[]; promoteDedupeKeys: string[] },
+  originFactory: OriginFactory = createMemoryOrigin
 ): { candidates: number; promoted: number; rejected: number } {
   const promoteDedupeKeys = new Set(extraction.promoteDedupeKeys);
   let promoted = 0;
@@ -340,7 +345,7 @@ function processDeterministicMemories(
       rejected += 1;
       continue;
     }
-    const candidate = store.upsertMemoryCandidate(memory, {
+    const candidate = store.upsertMemoryCandidate({ ...memory, origin: originFactory({ method: "deterministic", channel: "sync" }) }, {
       qualityStatus: assessment.status,
       qualityReasons: assessment.reasons,
       lastVerifiedAt: assessment.lastVerifiedAt
@@ -358,9 +363,9 @@ function processDeterministicMemories(
   };
 }
 
-function processTemporaryMemories(store: MemoryStore, memories: ReturnType<typeof extractTemporaryMemories>["memories"]): number {
+function processTemporaryMemories(store: MemoryStore, memories: ReturnType<typeof extractTemporaryMemories>["memories"], originFactory: OriginFactory = createMemoryOrigin): number {
   for (const memory of memories) {
-    store.upsertTemporaryMemory(memory);
+    store.upsertTemporaryMemory({ ...memory, origin: originFactory({ method: "deterministic", channel: "sync" }) });
   }
   return memories.length;
 }
@@ -368,7 +373,8 @@ function processTemporaryMemories(store: MemoryStore, memories: ReturnType<typeo
 function processExtractedMemories(
   store: MemoryStore,
   config: ProjectConfig,
-  memories: ExtractedMemory[]
+  memories: ExtractedMemory[],
+  originFactory: OriginFactory = createMemoryOrigin
 ): { candidates: number; promoted: number; rejected: number } {
   let promoted = 0;
   let candidates = 0;
@@ -379,7 +385,15 @@ function processExtractedMemories(
       rejected += 1;
       continue;
     }
-    const candidate = store.upsertMemoryCandidate(memory, {
+    const origin = originFactory({
+      method: "llm",
+      channel: "sync",
+      generator: {
+        ...(config.extractor.provider ? { provider: config.extractor.provider } : {}),
+        ...(config.extractor.model ? { model: config.extractor.model } : {})
+      }
+    });
+    const candidate = store.upsertMemoryCandidate({ ...memory, origin }, {
       qualityStatus: assessment.status,
       qualityReasons: assessment.reasons,
       lastVerifiedAt: assessment.lastVerifiedAt

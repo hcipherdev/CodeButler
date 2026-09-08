@@ -1,13 +1,23 @@
+import { inferScope, normalizeScope, scopeKey } from "./scope.js";
 import { createHash } from "node:crypto";
 
+import { createMemoryOrigin, type OriginFactory } from "./origin.js";
 import { assessMemoryQuality } from "./quality.js";
 import { cleanMemoryText, titleFromMemoryText } from "./directives.js";
 import { updateMemoryStatus } from "./lifecycle-service.js";
 import type { MemoryStore } from "../storage/store.js";
 import { withTransaction } from "../storage/transactions.js";
-import type { DurableMemory, MemoryCandidate, MemoryType, OperationActor } from "../types.js";
+import type { DurableMemory, MemoryCandidate, MemoryType, MemoryOrigin, OperationActor } from "../types.js";
+
+interface RememberOptions {
+  now?: () => Date;
+  actor?: OperationActor;
+  originFactory?: OriginFactory;
+  client?: MemoryOrigin["client"];
+}
 
 export interface RememberProjectMemoryInput {
+  scope?: import("../types.js").MemoryScope;
   type: MemoryType;
   text: string;
   title?: string | undefined;
@@ -26,7 +36,7 @@ export interface RememberProjectMemoryResult {
 export function rememberProjectMemory(
   store: MemoryStore,
   input: RememberProjectMemoryInput,
-  options: { now?: () => Date; actor?: OperationActor } = {}
+  options: RememberOptions = {}
 ): RememberProjectMemoryResult {
   const shouldPromote = input.promote ?? true;
   if (input.supersedesMemoryId !== undefined && !shouldPromote) {
@@ -39,7 +49,7 @@ export function rememberProjectMemory(
 function rememberProjectMemoryAtomically(
   store: MemoryStore,
   input: RememberProjectMemoryInput,
-  options: { now?: () => Date; actor?: OperationActor },
+  options: RememberOptions,
   shouldPromote: boolean
 ): RememberProjectMemoryResult {
   const summary = cleanMemoryText(input.text);
@@ -50,8 +60,9 @@ function rememberProjectMemoryAtomically(
   const relatedFiles = normalizeRelatedFiles(input.relatedFiles);
   const reason = cleanMemoryText(input.reason ?? "Captured from explicit user memory request.");
   const now = (options.now ?? (() => new Date()))().toISOString();
+  const scope = normalizeScope(input.scope ?? inferScope(summary));
   const stableId = stableMemoryId(type, summary);
-  const sourceId = `manual-memory:${type}:${stableId}`;
+  const sourceId = `manual-memory:${type}:${stableId}${scopeKey(scope) === "unspecified" ? "" : `:scope:${scopeKey(scope)}`}`;
   const locator = `${sourceId}:chunk:0`;
 
   store.addSourceWithChunks({
@@ -80,6 +91,7 @@ function rememberProjectMemoryAtomically(
   });
 
   const extracted = {
+    scope,
     type,
     title,
     summary,
@@ -93,7 +105,15 @@ function rememberProjectMemoryAtomically(
   if (assessment.rejected) {
     throw new Error(`Memory rejected by quality gate: ${assessment.reasons.join(", ")}`);
   }
-  const candidate = store.upsertMemoryCandidate(extracted, {
+  const context = {
+    method: "manual" as const,
+    channel: options.actor === "mcp" ? "mcp" as const : "cli" as const,
+    ...(options.client ? { client: options.client } : {})
+  };
+  const origin = options.originFactory
+    ? options.originFactory(context)
+    : createMemoryOrigin(context, { now: () => new Date(now) });
+  const candidate = store.upsertMemoryCandidate({ ...extracted, origin }, {
     qualityStatus: assessment.status,
     qualityReasons: assessment.reasons,
     lastVerifiedAt: assessment.lastVerifiedAt ?? now

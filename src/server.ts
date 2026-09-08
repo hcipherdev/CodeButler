@@ -1,3 +1,6 @@
+import { binding } from "./cloud/state.js";
+import { projectOperation, startCloudScheduler, syncQuietly } from "./cloud/client.js";
+import { createProjectMemoryToolHandlers, registerProjectMemoryHandlers, type ProjectMemoryToolHandlers } from "./mcp/tools.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { existsSync } from "node:fs";
@@ -13,6 +16,8 @@ import { syncProjectMemory } from "./sync/service.js";
 export interface ProjectMemoryServer {
   server: McpServer;
   store: MemoryStore;
+  cloudManaged?: boolean;
+  stopCloud?: () => void;
 }
 
 export interface ProjectMemoryServerOptions {
@@ -24,7 +29,8 @@ class RecoverableProjectMemoryShutdownError extends Error {}
 
 export async function closeProjectMemoryServer(projectServer: ProjectMemoryServer): Promise<void> {
   try {
-    projectServer.store.close();
+    projectServer.stopCloud?.();
+    if (!projectServer.cloudManaged) projectServer.store.close();
   } catch (error) {
     if (error instanceof MemoryStoreCheckpointBusyError) {
       throw new RecoverableProjectMemoryShutdownError(error.message);
@@ -53,6 +59,34 @@ export async function createProjectMemoryServer(
     configCreated: !existsSync(join(rootDir, ".code-butler", "config.json")),
     databaseCreated: !existsSync(join(rootDir, ".code-butler", "memory.sqlite"))
   };
+  if (binding(rootDir)?.enabled) {
+    await syncQuietly(rootDir);
+    const store = await projectOperation(rootDir, async () => {
+      const bootstrap = openConfiguredMemoryStore(rootDir);
+      try {
+        bootstrap.init();
+        const config = loadProjectConfig(rootDir);
+        if (config.sync.autoSyncOnServerStart) await syncProjectMemory(bootstrap, config);
+        return bootstrap;
+      } finally { bootstrap.close(); }
+    });
+    const server = new McpServer({ name: "project-memory", version: "0.1.0" });
+    const handlers = new Proxy({} as ProjectMemoryToolHandlers, {
+      get(_target, name) {
+        return (...args: unknown[]) => projectOperation(rootDir, async () => {
+          const current = openConfiguredMemoryStore(rootDir);
+          try {
+            current.init();
+            const live = createProjectMemoryToolHandlers(current, { rootDir, startupMetadata, clientInfo: () => server.server.getClientVersion() });
+            const handler = Reflect.get(live, name) as (...values: unknown[]) => unknown;
+            return await handler(...args);
+          } finally { current.close(); }
+        });
+      }
+    });
+    registerProjectMemoryHandlers(server, handlers);
+    return { server, store, cloudManaged: true, stopCloud: startCloudScheduler(rootDir) };
+  }
   const store = openConfiguredMemoryStore(rootDir);
   store.init();
   const config = loadProjectConfig(rootDir);

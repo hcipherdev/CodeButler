@@ -1,3 +1,5 @@
+import { withApplicability, scopeLabel } from "../memory/scope.js";
+import type { TargetEnvironment } from "../types.js";
 import { findDecisions } from "../decisions/store.js";
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
 import type { MemoryStore } from "../storage/store.js";
@@ -55,9 +57,10 @@ interface InvestigationRuntime {
 
 export async function explainCodeChange(
   store: MemoryStore,
-  input: { filePath: string; lineNumber?: number; question?: string },
+  input: { filePath: string; lineNumber?: number; question?: string; targetEnvironment?: TargetEnvironment },
   options: InvestigationRunOptions = {}
 ): Promise<InvestigationResult> {
+  store = scopeAwareStore(store, input.targetEnvironment);
   const question = input.question?.trim() || `Why did we modify ${input.filePath}?`;
   const anchors = deriveInvestigationAnchors(question, { filePath: input.filePath });
   const provider = resolveInvestigatorProvider(options);
@@ -74,9 +77,10 @@ export async function explainCodeChange(
 
 export async function investigateProjectHistory(
   store: MemoryStore,
-  input: { question: string; limit?: number },
+  input: { question: string; limit?: number; targetEnvironment?: TargetEnvironment },
   options: InvestigationRunOptions = {}
 ): Promise<InvestigationResult> {
+  store = scopeAwareStore(store, input.targetEnvironment);
   const anchors = deriveInvestigationAnchors(input.question);
   const provider = resolveInvestigatorProvider(options);
   if (!options.config?.investigator.enabled || !provider) {
@@ -980,16 +984,16 @@ function buildFileAnswer(
 ): string {
   const lines = [`Found project history for ${filePath}.`];
   if (temporaryMemories.length > 0) {
-    lines.push(`Temporary working context: ${temporaryMemories[0]?.summary}`);
+    lines.push(`Temporary working context: ${temporaryMemories[0]?.summary} [${scopeLabel(temporaryMemories[0]?.scope)}]`);
   }
   if (memories.length > 0) {
-    lines.push(`Promoted memory: ${memories[0]?.summary}`);
+    lines.push(`Promoted memory: ${memories[0]?.summary} [${scopeLabel(memories[0]?.scope)}]`);
   }
   if (commits.length > 0) {
     lines.push(`Most recent related commit: ${commits[0]?.message} (${commits[0]?.hash}).`);
   }
   if (decisions.length > 0) {
-    lines.push(`Relevant decision: ${decisions[0]?.decision} because ${decisions[0]?.reason}.`);
+    lines.push(`Relevant decision: ${decisions[0]?.decision} [${scopeLabel(decisions[0]?.scope)}] because ${decisions[0]?.reason}.`);
   }
   if (searchResults.length > 0) {
     lines.push(`Relevant discussion: ${searchResults[0]?.text}`);
@@ -1010,10 +1014,10 @@ function buildQuestionAnswer(
 ): string {
   const lines = [`Investigated: ${question}`];
   if (temporaryMemories.length > 0) {
-    lines.push(`Temporary working context: ${temporaryMemories[0]?.summary}`);
+    lines.push(`Temporary working context: ${temporaryMemories[0]?.summary} [${scopeLabel(temporaryMemories[0]?.scope)}]`);
   }
   if (memories.length > 0) {
-    lines.push(`Promoted memory: ${memories[0]?.summary}`);
+    lines.push(`Promoted memory: ${memories[0]?.summary} [${scopeLabel(memories[0]?.scope)}]`);
   }
   if (searchResults.length > 0) {
     lines.push(`Most relevant evidence: ${searchResults[0]?.text}`);
@@ -1022,7 +1026,7 @@ function buildQuestionAnswer(
     lines.push(`Related commit: ${commits[0]?.message} (${commits[0]?.hash}).`);
   }
   if (decisions.length > 0) {
-    lines.push(`Related decision: ${decisions[0]?.decision}.`);
+    lines.push(`Related decision: ${decisions[0]?.decision} [${scopeLabel(decisions[0]?.scope)}].`);
   }
   if (lines.length === 1) {
     lines.push("No matching local project memory was found.");
@@ -1167,4 +1171,18 @@ function isDefinedLocatorEvidence(
   evidence: EvidenceRef | { sourceType: "conversation"; sourceId: string; locator: string | undefined }
 ): evidence is EvidenceRef {
   return typeof evidence.locator === "string" && evidence.locator.length > 0;
+}
+
+function scopeAwareStore(store: MemoryStore, target?: TargetEnvironment): MemoryStore {
+  const memoryReaders = new Set([
+    "readMemory", "listMemories", "listMemoryCandidates", "searchMemoryLayer",
+    "readMemorySearchResultsByIds", "searchTemporaryMemory", "listActiveTemporaryMemory"
+  ]);
+  return new Proxy(store, {
+    get(object, key) {
+      const member = Reflect.get(object, key);
+      if (typeof member !== "function" || !memoryReaders.has(String(key))) return member;
+      return (...args: unknown[]) => withApplicability(Reflect.apply(member, object, args), target);
+    }
+  });
 }

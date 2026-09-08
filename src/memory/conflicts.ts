@@ -1,3 +1,4 @@
+import { scopesDisjoint } from "./scope.js";
 import { createEvidenceSignature } from "./evidence-signature.js";
 import type { MemoryStore } from "../storage/store.js";
 import { withTransaction } from "../storage/transactions.js";
@@ -131,6 +132,7 @@ function findConflictPairs(memories: DurableMemory[]): MemoryConflictPair[] {
     const left = memories[leftIndex] as DurableMemory;
     for (let rightIndex = leftIndex + 1; rightIndex < memories.length; rightIndex += 1) {
       const right = memories[rightIndex] as DurableMemory;
+      if (scopesDisjoint(left.scope, right.scope)) continue;
       if (normalizeSummary(left.summary) === normalizeSummary(right.summary)) continue;
       if (createEvidenceSignature(left.evidence) === createEvidenceSignature(right.evidence)) continue;
       pairs.push(canonicalPair(left.id, right.id));

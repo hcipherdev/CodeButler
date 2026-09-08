@@ -1,3 +1,6 @@
+import { withApplicability } from "../memory/scope.js";
+import { updateMemoryScope, type UpdateMemoryScopeInput } from "../memory/scope-service.js";
+import type { TargetEnvironment, MemoryScope } from "../types.js";
 import { execFileSync } from "node:child_process";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -126,6 +129,7 @@ export interface CurrentProjectInfo {
 export interface ProjectMemoryToolHandlers {
   current_project(): CurrentProjectInfo;
   search_project_memory(input: {
+    targetEnvironment?: TargetEnvironment;
     query: string;
     sourceTypes?: SourceType[];
     limit?: number;
@@ -135,6 +139,7 @@ export interface ProjectMemoryToolHandlers {
   }>;
   read_memory_source(input: { sourceId: string }): ReturnType<MemoryStore["readSource"]>;
   find_memories(input: {
+    targetEnvironment?: TargetEnvironment;
     query?: string;
     type?: MemoryType;
     status?: "promoted" | "candidate";
@@ -144,7 +149,9 @@ export interface ProjectMemoryToolHandlers {
   }): Promise<{
     results: ReturnType<MemoryStore["searchMemoryLayer"]>;
   }>;
+  update_memory_scope(input: UpdateMemoryScopeInput): ReturnType<typeof updateMemoryScope>;
   remember_project_memory(input: {
+    scope?: MemoryScope;
     type: MemoryType;
     text: string;
     title?: string;
@@ -165,18 +172,20 @@ export interface ProjectMemoryToolHandlers {
     memory: ReturnType<typeof updateMemoryStatus>;
     relations: ReturnType<MemoryStore["listMemoryRelations"]>;
   };
-  find_decisions(input: { topic?: string; limit?: number }): ReturnType<typeof findDecisions>;
+  find_decisions(input: { targetEnvironment?: TargetEnvironment; topic?: string; limit?: number }): ReturnType<typeof findDecisions>;
   find_related_commits(input: {
     query?: string;
     filePath?: string;
     limit?: number;
   }): ReturnType<MemoryStore["findCommits"]>;
   explain_code_change(input: {
+    targetEnvironment?: TargetEnvironment;
     filePath: string;
     lineNumber?: number;
     question?: string;
   }): Promise<Awaited<ReturnType<typeof explainCodeChange>>>;
   investigate_project_history(input: {
+    targetEnvironment?: TargetEnvironment;
     question: string;
     limit?: number;
   }): Promise<Awaited<ReturnType<typeof investigateProjectHistory>>>;
@@ -186,6 +195,7 @@ export interface ProjectMemoryToolHandlers {
     includeWorkingTree?: boolean;
   }): RecentActivitySummary;
   search_temporary_memory(input: {
+    targetEnvironment?: TargetEnvironment;
     query: string;
     threadId?: string;
     sessionId?: string;
@@ -194,6 +204,7 @@ export interface ProjectMemoryToolHandlers {
     results: ReturnType<MemoryStore["searchTemporaryMemory"]>;
   };
   summarize_active_context(input: {
+    targetEnvironment?: TargetEnvironment;
     threadId?: string;
     sessionId?: string;
     projectOnly?: boolean;
@@ -234,6 +245,7 @@ export function createProjectMemoryToolHandlers(
     projectSummaryGenerator?: ProjectSummaryGenerator;
     now?: () => Date;
     warn?: (line: string) => void;
+    clientInfo?: () => { name: string; version: string } | undefined;
     startupMetadata?: ProjectStartupMetadata | undefined;
     searchService?: SearchServiceOptions | undefined;
   } = {}
@@ -253,7 +265,7 @@ export function createProjectMemoryToolHandlers(
       };
     },
     async search_project_memory(input) {
-      const result = await searchProjectMemory(store, config, normalizeSearchInput(input), options.searchService);
+      const result = withApplicability(await searchProjectMemory(store, config, normalizeSearchInput(input), options.searchService), input.targetEnvironment);
       return {
         memories: result.memories,
         results: result.results.map((item) => decorateSearchResult(store, item))
@@ -264,14 +276,15 @@ export function createProjectMemoryToolHandlers(
     },
     async find_memories(input) {
       return {
-        results: await findProjectMemories(store, config, normalizeMemorySearchInput(input), options.searchService)
+        results: withApplicability(await findProjectMemories(store, config, normalizeMemorySearchInput(input), options.searchService), input.targetEnvironment)
       };
     },
+    update_memory_scope(input) { return updateMemoryScope(store, input, "mcp"); },
     remember_project_memory(input) {
       const remembered = rememberProjectMemory(
         store,
-        normalizeRememberMemoryInput(input),
-        { ...(options.now === undefined ? {} : { now: options.now }), actor: "mcp" }
+        { ...normalizeRememberMemoryInput(input), ...(input.scope === undefined ? {} : { scope: input.scope }) },
+        { ...(options.now === undefined ? {} : { now: options.now }), actor: "mcp", client: options.clientInfo?.() }
       );
       const memoryId = remembered.memory?.id ?? remembered.candidate.id;
       const status = remembered.memory ? "promoted" : "candidate";
@@ -307,30 +320,30 @@ export function createProjectMemoryToolHandlers(
       return { memory, relations };
     },
     find_decisions(input) {
-      return findDecisions(store, normalizeDecisionInput(input));
+      return withApplicability(findDecisions(store, normalizeDecisionInput(input)), input.targetEnvironment);
     },
     find_related_commits(input) {
       return store.findCommits(normalizeCommitInput(input));
     },
     async explain_code_change(input) {
-      return explainCodeChange(store, normalizeExplainInput(input), { config });
+      return explainCodeChange(store, { ...normalizeExplainInput(input), ...(input.targetEnvironment === undefined ? {} : { targetEnvironment: input.targetEnvironment }) }, { config });
     },
     async investigate_project_history(input) {
-      return investigateProjectHistory(store, normalizeInvestigationInput(input), { config });
+      return investigateProjectHistory(store, { ...normalizeInvestigationInput(input), ...(input.targetEnvironment === undefined ? {} : { targetEnvironment: input.targetEnvironment }) }, { config });
     },
     summarize_recent_activity(input) {
       return summarizeRecentActivity(store, rootDir, normalizeRecentActivityInput(input), options.now);
     },
     search_temporary_memory(input) {
       return {
-        results: store.searchTemporaryMemory({
+        results: withApplicability(store.searchTemporaryMemory({
           ...normalizeTemporarySearchInput(input),
           now: nowIso(options.now)
-        })
+        }), input.targetEnvironment)
       };
     },
     summarize_active_context(input) {
-      return summarizeActiveContext(store, normalizeActiveContextInput(input), options.now);
+      return withApplicability(summarizeActiveContext(store, normalizeActiveContextInput(input), options.now), input.targetEnvironment);
     },
     cleanup_temporary_memory(input) {
       const normalized = normalizeTemporaryCleanupInput(input);
@@ -380,7 +393,11 @@ export function registerProjectMemoryTools(
     startupMetadata?: ProjectStartupMetadata | undefined;
   } = {}
 ): void {
-  const handlers = createProjectMemoryToolHandlers(store, options);
+  const handlers = createProjectMemoryToolHandlers(store, { ...options, clientInfo: () => server.server.getClientVersion() });
+  registerProjectMemoryHandlers(server, handlers);
+}
+
+export function registerProjectMemoryHandlers(server: McpServer, handlers: ProjectMemoryToolHandlers): void {
   registerSourceToolGroup(server, handlers);
   registerMemoryToolGroup(server, handlers);
   registerInvestigationToolGroup(server, handlers);

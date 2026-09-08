@@ -16,7 +16,7 @@ The MCP server resolves the target Git repository and creates internal project-l
 
 ## Common Tools
 
-The MCP server exposes 21 tools. Lifecycle and operations calls include:
+The MCP server exposes 22 tools. Lifecycle and operations calls include:
 
 - `sync_project_memory`
 - `list_source_failures`
@@ -26,6 +26,7 @@ The MCP server exposes 21 tools. Lifecycle and operations calls include:
 - `search_project_memory`
 - `find_memories`
 - `remember_project_memory`
+- `update_memory_scope({ memoryId, category, scope, reason })`
 - `update_memory_status`
 - `explain_code_change`
 - `investigate_project_history`

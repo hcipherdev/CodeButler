@@ -367,7 +367,7 @@ describe("doctor service", () => {
     expect(report.nextActions).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ command: "code-butler sources status" }),
-        expect.objectContaining({ command: "edit ~/.config/code-butler/.env" })
+        expect.objectContaining({ command: `edit ${process.env.CODE_BUTLER_HOME ?? "~/.config/code-butler"}/.env` })
       ])
     );
   });

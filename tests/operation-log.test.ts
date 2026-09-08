@@ -73,7 +73,7 @@ describe("privacy-safe operation log", () => {
         metadata: input.metadata as never
       })).toThrow(/metadata/i);
     }
-    expect(store.listOperations()).toHaveLength(2); // Schema migrations 9 and 10 only.
+    expect(store.listOperations()).toHaveLength(4); // Schema migrations 9 through 12.
     store.close();
   });
 

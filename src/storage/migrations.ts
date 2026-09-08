@@ -375,8 +375,55 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
           on private_identity_mappings(stored_identity);
       `);
     }
+  },
+  {
+    version: 11,
+    name: "add memory generation origin",
+    up(db) {
+      for (const table of ["memory_candidates", "memories", "temporary_memories"]) {
+        ensureColumn(db, table, "origin_json", "text");
+      }
+    }
+  },
+  {
+    version: 12,
+    name: "add memory scope and applicability",
+    up(db) {
+      db.exec(BASE_SCHEMA);
+      for (const table of ["memory_candidates", "memories", "temporary_memories"]) {
+        ensureColumn(db, table, "origin_json", "text");
+        ensureColumn(db, table, "scope_json", "text not null default '{\"kind\":\"unspecified\"}'");
+        ensureColumn(db, table, "scope_key", "text not null default 'unspecified'");
+      }
+      rebuildScopedTable(db, "memory_candidates", sql => sql
+        .replace(/dedupe_key text not null unique/i, "dedupe_key text not null")
+        .replace(/\)\s*$/, ", unique(dedupe_key, scope_key))"));
+      rebuildScopedTable(db, "memories", sql => {
+        const pattern = /unique\s*\(\s*dedupe_key\s*,\s*evidence_signature\s*,\s*source\s*\)/i;
+        return pattern.test(sql)
+          ? sql.replace(pattern, "unique(dedupe_key, evidence_signature, source, scope_key)")
+          : sql.replace(/\)\s*$/, ", unique(dedupe_key, evidence_signature, source, scope_key))");
+      });
+      ensureColumn(db, "temporary_memories", "base_id", "text not null default ''");
+      db.exec("update temporary_memories set base_id = id where base_id = ''");
+      db.exec("create unique index idx_temporary_scope_identity on temporary_memories(base_id, scope_key)");
+      rebuildScopedTable(db, "operation_log", sql => sql.replace("'retention_prune', 'recovery'", "'retention_prune', 'recovery', 'scope_change'"));
+    }
   }
 ] as const;
+
+/** Rebuild with FKs disabled by initializeSchema; retain indexes, triggers and IDs. */
+function rebuildScopedTable(db: DatabaseSync, table: string, transform: (sql: string) => string): void {
+  const schema = db.prepare("select sql from sqlite_master where type = 'table' and name = ?").get(table) as { sql: string };
+  const objects = db.prepare("select sql from sqlite_master where tbl_name = ? and type in ('index', 'trigger') and sql is not null").all(table) as Array<{ sql: string }>;
+  const sql = transform(schema.sql);
+  if (sql === schema.sql) throw new Error(`Cannot migrate scoped table ${table}`);
+  db.exec(sql.replace(new RegExp(`CREATE TABLE(?: IF NOT EXISTS)? ["\x60]?${table}["\x60]?`, "i"), `CREATE TABLE ${table}_scope_next`));
+  db.exec(`insert into ${table}_scope_next select * from ${table}`);
+  db.exec(`drop table ${table}`);
+  db.exec(`alter table ${table}_scope_next rename to ${table}`);
+  for (const object of objects) db.exec(object.sql);
+}
 
 export const CURRENT_SCHEMA_VERSION = SCHEMA_MIGRATIONS.at(-1)?.version ?? 0;
 
@@ -405,9 +452,11 @@ export function initializeSchema(
     )
   `);
 
-  db.exec("BEGIN IMMEDIATE");
+  const foreignKeys = Number((db.prepare("pragma foreign_keys").get() as { foreign_keys: number }).foreign_keys);
+  db.exec("PRAGMA foreign_keys = OFF");
   let backupPath: string | undefined;
   try {
+    db.exec("BEGIN IMMEDIATE");
     const applied = validateAppliedMigrations(readAppliedMigrations(db), migrations);
     const pending = migrations.filter((migration) => !applied.has(migration.version));
     if (pending.length === 0) {
@@ -428,11 +477,14 @@ export function initializeSchema(
         recordCompletedMigrationOperation(db, migration.version, appliedAt);
       }
     }
+    if (db.prepare("pragma foreign_key_check").all().length) throw new Error("Migration failed foreign-key verification");
     db.exec("COMMIT");
     if (backupPath) pruneMigrationBackups(databasePath, options.backupRetention ?? 2);
   } catch (error) {
     if (db.isTransaction) db.exec("ROLLBACK");
     throw error;
+  } finally {
+    db.exec(`PRAGMA foreign_keys = ${foreignKeys ? "ON" : "OFF"}`);
   }
 }
 
