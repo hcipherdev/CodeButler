@@ -53,7 +53,6 @@ const PROJECT_CODE_BUTLER_IGNORE = [
   "/*",
   "!/.gitignore",
   "!/config.json",
-  "!/memory.sqlite",
   "!/project-summary.md",
   ""
 ].join("\n");

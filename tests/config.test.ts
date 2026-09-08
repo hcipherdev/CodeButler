@@ -66,7 +66,7 @@ describe("project config", () => {
     });
     expect(existsSync(join(rootDir, ".code-butler", ".gitignore"))).toBe(true);
     expect(readFileSync(join(rootDir, ".code-butler", ".gitignore"), "utf8")).toBe(
-      ["/*", "!/.gitignore", "!/config.json", "!/memory.sqlite", "!/project-summary.md", ""].join("\n")
+      ["/*", "!/.gitignore", "!/config.json", "!/project-summary.md", ""].join("\n")
     );
     expect(existsSync(join(rootDir, ".code-butler", ".env.example"))).toBe(true);
     expect(existsSync(join(rootDir, ".code-butler", "config.examples.json"))).toBe(true);
@@ -365,7 +365,7 @@ describe("project config", () => {
     ensureProjectConfig(rootDir);
 
     expect(readFileSync(gitignorePath, "utf8")).toBe(
-      ["/*", "!/.gitignore", "!/config.json", "!/memory.sqlite", "!/project-summary.md", ""].join("\n")
+      ["/*", "!/.gitignore", "!/config.json", "!/project-summary.md", ""].join("\n")
     );
   });
 
