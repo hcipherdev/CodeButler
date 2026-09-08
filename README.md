@@ -1,11 +1,11 @@
 # Code Butler
 
-Code Butler gives coding agents a project memory they can actually use.
+Code Butler gives coding agents an evidence-backed memory of your project.
 
 It is a local-first Project Memory MCP server for Codex, Claude Code, and other
-MCP clients. Code Butler indexes local evidence from Git commits, Codex
-sessions, Claude sessions, and manual decision records, then exposes that
-memory through tools an agent can call before it edits your code.
+MCP clients. It turns the reasoning already present in local Git history,
+coding-agent sessions, and manual decisions into searchable context that an
+agent can consult before it changes code.
 
 Ask questions like:
 
@@ -15,8 +15,9 @@ Ask questions like:
 - Which decision led to this implementation?
 - Did we already reject another approach?
 
-Project memory stays local by default in each repository's `.code-butler/`
-directory.
+In short: Git tells an agent what changed; Code Butler helps it recover why it
+changed, what was decided, and which constraints still apply. Project memory
+stays local by default in each repository's `.code-butler/` directory.
 
 ## Why Use It
 
@@ -279,6 +280,44 @@ Use Code Butler to explain why src/cache.ts changed and what discussion led to i
 For durable instructions, keep `AGENTS.md` and `CLAUDE.md` short. They should
 tell agents how to consult Code Butler, not try to store the project's memory
 themselves.
+
+## Cloud Sync Beta (Optional)
+
+Cloud sync is an opt-in way to carry a project's Code Butler memory between
+your devices. It synchronizes snapshots of Butler's portable project state; it
+does not run your agent or MCP tools in the cloud. Local MCP and offline use
+continue to work if cloud sync is unavailable.
+
+You need a beta code for the Code Butler cloud service. On your first device,
+connect from inside the project, enter that code at the hidden prompt, and
+enable the project:
+
+```bash
+code-butler cloud connect --server https://cloud.codebutler.dev
+code-butler cloud enable
+code-butler cloud status
+```
+
+On another device, clone or open the code repository first. Then connect with
+the same beta code, choose the existing cloud project, and enable it:
+
+```bash
+code-butler cloud connect --server https://cloud.codebutler.dev
+code-butler cloud projects
+code-butler cloud enable --project PROJECT_UUID
+```
+
+Restart MCP sessions that were already running after enabling cloud sync. If
+both devices make offline changes, synchronization pauses rather than merging
+SQLite databases; resolve it explicitly with `code-butler cloud resolve --keep
+local` or `code-butler cloud resolve --keep cloud`.
+
+Cloud sync is a beta service, not end-to-end encrypted storage: the server can
+read uploaded snapshots, so keep the beta code private and review project-memory
+files before enabling it. Device-local credentials, source roots, and sync
+cursors are not uploaded. If a conflict appears, both versions are preserved;
+pick the version you want to keep explicitly. Disable sync for a checkout with
+`code-butler cloud disable`; local memory remains on disk.
 
 ## Manual Memory
 

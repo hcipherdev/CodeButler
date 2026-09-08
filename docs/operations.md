@@ -33,15 +33,25 @@ Exact source overrides take precedence. `null` retains indefinitely. Preview fir
 
 ## Git sharing
 
-New project folders expose `.code-butler/.gitignore`, `config.json`,
-`memory.sqlite`, and `project-summary.md` to Git. Credentials, imports,
-metadata, migration and recovery backups, and SQLite WAL/SHM sidecars remain
-ignored. Stop Code Butler before committing, push before opening the project on
-another device, and do not run independent writers on two devices. SQLite files
-are binary: do not merge a Git conflict; recover one complete database instead.
-If shutdown reports a busy WAL checkpoint, close the other SQLite reader and
-retry shutdown; do not commit until it succeeds. The database contains project
-memory, so use only a trusted remote.
+Code Butler project state lives under `.code-butler/`. Treat that directory as
+local runtime state by default. Only commit files that are intentionally useful
+to collaborators, such as `.code-butler/.gitignore`,
+`.code-butler/project-summary.md`, and a secret-free `.code-butler/config.json`.
+
+Never commit `.code-butler/memory.sqlite`, SQLite WAL/SHM sidecars, sync
+metadata, imports, logs, staging files, or migration and recovery backups. If a
+database file was already staged or tracked, stop Code Butler and remove it from
+Git while keeping the local copy:
+
+```bash
+git rm --cached --ignore-unmatch .code-butler/memory.sqlite
+git rm --cached --ignore-unmatch .code-butler/memory.sqlite-wal .code-butler/memory.sqlite-shm
+```
+
+Then commit the ignore-file and documentation changes. SQLite files are binary;
+do not resolve database conflicts by merging them. Keep one complete database
+copy, restore from a backup or export when needed, and restart Code Butler after
+the Git operation is clean.
 
 ## Portable backups
 
