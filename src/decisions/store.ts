@@ -1,11 +1,14 @@
+import { inferScope, normalizeScope, assessApplicability } from "../memory/scope.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 
+import { createMemoryOrigin, type OriginFactory } from "../memory/origin.js";
 import type { DecisionRecord, EvidenceRef } from "../types.js";
 import type { MemoryStore } from "../storage/store.js";
 import { withTransaction } from "../storage/transactions.js";
 
 export interface DecisionInput {
+  scope?: import("../types.js").MemoryScope;
   topic: string;
   decision: string;
   reason: string;
@@ -13,11 +16,12 @@ export interface DecisionInput {
   evidence: EvidenceRef[];
 }
 
-export function addDecision(store: MemoryStore, input: DecisionInput): DecisionRecord {
+export function addDecision(store: MemoryStore, input: DecisionInput, originFactory: OriginFactory = createMemoryOrigin): DecisionRecord {
   return withTransaction(store.db, () => {
     const id = nextDecisionId(store);
     const createdAt = new Date().toISOString();
     const record: DecisionRecord = {
+      scope: normalizeScope(input.scope ?? inferScope(input.decision)),
       id,
       topic: store.contentPolicy.text(input.topic),
       decision: store.contentPolicy.text(input.decision),
@@ -58,7 +62,7 @@ export function addDecision(store: MemoryStore, input: DecisionInput): DecisionR
         }
       ]
     });
-    store.upsertManualDecisionMemory(record);
+    store.upsertManualDecisionMemory(record, originFactory({ method: "manual", channel: "cli" }));
 
     const insertRelation = store.db.prepare(
       `insert into relations (id, from_type, from_id, relation, to_type, to_id, locator)
@@ -94,7 +98,12 @@ export function findDecisions(
     .all() as unknown as DecisionRow[];
   const topic = input.topic?.toLowerCase();
   const manualDecisions = rows
-    .map(decisionFromRow)
+    .map(row => {
+      const decision = decisionFromRow(row);
+      const memory = store.readMemory(`memory-manual-${decision.id}`)
+        ?? store.listMemories({ limit: null }).find(m => m.dedupeKey === `manual-decision:${decision.id}`);
+      return { ...decision, scope: normalizeScope(memory?.scope), applicability: memory?.applicability ?? assessApplicability(memory?.scope) };
+    })
     .filter((decision) => {
       if (!topic) return true;
       return [decision.topic, decision.decision, decision.reason].join(" ").toLowerCase().includes(topic);
@@ -109,6 +118,8 @@ export function findDecisions(
     .listMemories(promotedMemoryQuery)
     .filter((memory) => memory.source === "auto")
     .map<DecisionRecord>((memory) => ({
+      scope: normalizeScope(memory.scope),
+      applicability: memory.applicability ?? assessApplicability(memory.scope),
       id: memory.id,
       topic: memory.title,
       decision: memory.summary,

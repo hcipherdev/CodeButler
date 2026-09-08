@@ -1,3 +1,4 @@
+import { inferScope } from "../memory/scope.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -82,6 +83,7 @@ function extractConversationDirectiveMemories(
   return matches.map((match, index) => {
     const dedupeKey = `deterministic:conversation:${conversation.sourceId}:${index}`;
     const memory: ExtractedMemory = {
+      scope: inferScope(match.text),
       type: match.type,
       title: titleFromText(match.text),
       summary: match.text,

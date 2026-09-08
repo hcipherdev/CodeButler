@@ -1,3 +1,4 @@
+import { memoryScopeSchema, targetEnvironmentSchema, SCOPE_GUIDANCE } from "../../memory/scope.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
@@ -11,11 +12,12 @@ export function registerSourceToolGroup(
   server.registerTool("current_project", {
     description: "Report which project-local Code Butler store this MCP server is using.",
     inputSchema: {}
-  }, async () => asJsonContent(handlers.current_project()));
+  }, async () => asJsonContent(await handlers.current_project()));
 
   server.registerTool("search_project_memory", {
-    description: "Search local project memory. Promoted memories are returned ahead of raw source matches.",
+    description: "Search local project memory. Promoted memories are returned ahead of raw source matches." + SCOPE_GUIDANCE,
     inputSchema: {
+      targetEnvironment: targetEnvironmentSchema.optional(),
       query: z.string().min(1),
       sourceTypes: z.array(z.enum(["conversation", "commit", "decision"])).optional(),
       limit: z.number().int().positive().max(100).optional()
@@ -27,15 +29,16 @@ export function registerSourceToolGroup(
   server.registerTool("read_memory_source", {
     description: "Read the raw stored source for a memory source id.",
     inputSchema: { sourceId: z.string().min(1) }
-  }, async (input) => asJsonContent(handlers.read_memory_source(input)));
+  }, async (input) => asJsonContent(await handlers.read_memory_source(input)));
 
   server.registerTool("find_decisions", {
-    description: "Find project decisions from manual records and promoted decision memories.",
+    description: "Find project decisions from manual records and promoted decision memories." + SCOPE_GUIDANCE,
     inputSchema: {
+      targetEnvironment: targetEnvironmentSchema.optional(),
       topic: z.string().optional(),
       limit: z.number().int().positive().max(100).optional()
     }
-  }, async (input) => asJsonContent(handlers.find_decisions(
+  }, async (input) => asJsonContent(await handlers.find_decisions(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["find_decisions"]>[0]>(input)
   )));
 
@@ -46,7 +49,7 @@ export function registerSourceToolGroup(
       filePath: z.string().optional(),
       limit: z.number().int().positive().max(100).optional()
     }
-  }, async (input) => asJsonContent(handlers.find_related_commits(
+  }, async (input) => asJsonContent(await handlers.find_related_commits(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["find_related_commits"]>[0]>(input)
   )));
 
@@ -60,7 +63,7 @@ export function registerSourceToolGroup(
   server.registerTool("summarize_project_state", {
     description: "Summarize the current local project memory index and sync state.",
     inputSchema: {}
-  }, async () => asJsonContent(handlers.summarize_project_state()));
+  }, async () => asJsonContent(await handlers.summarize_project_state()));
 
   server.registerTool("list_source_failures", {
     description: "List persisted source parsing failures and their repair status.",
@@ -69,14 +72,14 @@ export function registerSourceToolGroup(
       resolved: z.boolean().optional(),
       limit: z.number().int().min(1).max(100).optional()
     }
-  }, async (input) => asJsonContent(handlers.list_source_failures(
+  }, async (input) => asJsonContent(await handlers.list_source_failures(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["list_source_failures"]>[0]>(input)
   )));
 
   server.registerTool("run_doctor", {
     description: "Run a read-only Code Butler health check for the current project.",
     inputSchema: {}
-  }, async () => asJsonContent(handlers.run_doctor()));
+  }, async () => asJsonContent(await handlers.run_doctor()));
 
   server.registerTool("summarize_project_brief", {
     description: "Read the local project narrative summary and freshness metadata without mutating files.",

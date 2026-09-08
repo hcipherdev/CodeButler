@@ -1,3 +1,4 @@
+import { SCOPE_GUIDANCE } from "../memory/scope.js";
 import {
   anthropicAwsRequestConfig,
   readAnthropicAwsText,
@@ -11,6 +12,7 @@ import type { ProjectSummaryGenerator, ProjectSummaryGeneratorInput } from "./se
 type SummaryProviderConfig = ExtractorConfig | InvestigatorConfig;
 
 const PROJECT_SUMMARY_SYSTEM_PROMPT = [
+  SCOPE_GUIDANCE,
   "You generate a project narrative summary for Code Butler.",
   "Treat AGENTS.md and CLAUDE.md as stale historical hints, not truth.",
   "Verify facts against the supplied manifests, docs, inventory, memories, commits, and sync state.",

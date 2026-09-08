@@ -1,3 +1,4 @@
+import { scopeLabel } from "../memory/scope.js";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -989,7 +990,7 @@ function createFallbackProjectSummaryGenerator(error: unknown): ProjectSummaryGe
       const inventory = input.codeContext.inventory.slice(0, 30).map((entry) => `- ${entry}`).join("\n") || "- none indexed";
       const memories = input.codeContext.memories
         .slice(0, 10)
-        .map((memory) => `- ${memory.type}: ${memory.title} - ${memory.summary}`)
+        .map((memory) => `- [${scopeLabel(memory.scope)}] ${memory.type}: ${memory.title} - ${memory.summary}`)
         .join("\n") || "- none indexed";
       const commits = input.codeContext.commits
         .slice(0, 10)
@@ -1150,6 +1151,8 @@ function fingerprintProjectSummaryInputs(input: Omit<ProjectSummaryGeneratorInpu
           id: memory.id,
           type: memory.type,
           title: memory.title,
+          scope: memory.scope,
+          applicability: memory.applicability,
           summary: memory.summary,
           reason: memory.reason,
           relatedFiles: memory.relatedFiles

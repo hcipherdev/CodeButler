@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { createMemoryOrigin } from "../src/memory/origin.js";
 import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
 import {
   createEmbeddingEndpointHash,
@@ -167,11 +168,15 @@ describe("automatic sync", () => {
       }
     };
 
-    const first = await syncProjectMemory(store, config, { extractorProvider: provider });
+    const first = await syncProjectMemory(store, config, {
+      extractorProvider: provider,
+      originFactory: context => createMemoryOrigin(context, { directory: rootDir, platform: "win32" })
+    });
     expect(first.sources.git.imported).toBe(1);
     expect(first.sources.codex.imported).toBe(1);
     expect(first.sources.claude.imported).toBe(1);
     expect(first.memories.promoted).toBe(1);
+    expect(store.listMemories()[0]!.origin).toMatchObject({ method: "llm", channel: "sync", platform: "win32" });
     expect(store.listMemories({ status: "promoted" })).toHaveLength(1);
 
     const second = await syncProjectMemory(store, config, { extractorProvider: provider });
@@ -535,6 +540,7 @@ describe("automatic sync", () => {
     expect(result.memories.promoted).toBe(1);
     expect(store.listMemories({ status: "promoted" })[0]).toMatchObject({
       type: "decision",
+      origin: expect.objectContaining({ method: "deterministic", channel: "sync" }),
       summary: "Use SQLite for project memory.",
       confidence: 1,
       evidence: [
@@ -564,12 +570,13 @@ describe("automatic sync", () => {
     store.init();
     const config = loadProjectConfig(rootDir);
 
-    await syncProjectMemory(store, config, { source: "claude" });
+    await syncProjectMemory(store, config, { source: "claude", originFactory: context => createMemoryOrigin(context, { directory: rootDir, platform: "win32" }) });
     await syncProjectMemory(store, config, { source: "claude" });
 
     expect(store.listMemoryCandidates()).toHaveLength(1);
     expect(store.listMemoryCandidates()[0]).toMatchObject({
       type: "constraint",
+      origin: expect.objectContaining({ platform: "win32", method: "deterministic", channel: "sync" }),
       summary: "Low-confidence memories should stay candidates.",
       confidence: 0.75,
       promotionState: "candidate"
@@ -619,6 +626,7 @@ describe("automatic sync", () => {
 
     expect(result.temporary.upserted).toBeGreaterThan(0);
     expect(temporary[0]).toMatchObject({
+      origin: expect.objectContaining({ method: "deterministic", channel: "sync" }),
       kind: "user_instruction",
       sessionId: "codex-temp-task",
       relatedFiles: ["src/mcp/tools.ts"],

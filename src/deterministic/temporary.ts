@@ -1,3 +1,4 @@
+import { inferScope } from "../memory/scope.js";
 import type {
   EvidenceRef,
   ExtractorConversationInput,
@@ -77,7 +78,7 @@ export function extractTemporaryMemories(
     }
   }
 
-  return { memories: dedupeTemporaryMemories(memories) };
+  return { memories: dedupeTemporaryMemories(memories).map(memory => ({ ...memory, scope: inferScope(memory.summary) })) };
 }
 
 function chunkTimestamp(chunk: MemoryChunk): Date | undefined {

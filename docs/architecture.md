@@ -14,3 +14,11 @@ Embedding jobs are persisted as pending, complete, or failed and remain retryabl
 Project summaries use deterministic Git-tracked context: manifest entrypoints, files linked by current promoted memories, recent commit files, then stable path order. The selector excludes symlinks, binary/ignored/generated/dependency files, environment and credential material, and secret-bearing content. It caps code at 12 files, 20,000 characters each, and 120,000 characters total while hashing full bytes. `.code-butler/project-summary-notes.md` is user-owned. Separate input and output hashes let normal refresh protect manual edits; forced replacement creates a recovery backup when the output is edited or lacks a trusted baseline.
 
 Schema v8 adds deduplicated `source_failures` records with adapter/path/error identity, sanitized messages, first/last occurrence, attempts, and resolution time. Failed parses do not advance cursors, and successful reparsing resolves prior failures. CLI `sources failures`, MCP `list_source_failures`, and Doctor expose repair state without raw source content.
+
+
+## Memory scope
+
+Memories carry project-wide, conditional, or unspecified applicability separately
+from generation origin. Retrieval labels OS, architecture, and shell mismatches
+without filtering history. The `update_memory_scope` tool corrects scope atomically
+with linked candidate/durable records. See [memory scope and applicability](./privacy.md#memory-scope-and-applicability).

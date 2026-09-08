@@ -1,4 +1,5 @@
 # Logs
+.DS_Store
 logs
 *.log
 npm-debug.log*
@@ -34,6 +35,9 @@ dist/
 # Tool caches
 .cache/
 .vite/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+docs/.vitepress/.temp/
 .eslintcache
 .stylelintcache
 

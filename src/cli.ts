@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { runCloudCommand } from "./cloud/cli.js";
+import { binding } from "./cloud/state.js";
+import { projectOperation, startCloudScheduler, syncQuietly } from "./cloud/client.js";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -61,6 +64,20 @@ export interface CliOptions {
 }
 
 export async function runCli(args = process.argv.slice(2), options: CliOptions = {}): Promise<number> {
+  const root = options.cwd ?? process.cwd();
+  const command = args[0] ?? "help";
+  try {
+    if (binding(root)?.enabled && !["cloud", "watch", "mcp", "serve", "help", "--help", "-h"].includes(command)) {
+      return await projectOperation(root, () => runCliOperation(args, options));
+    }
+    return await runCliOperation(args, options);
+  } catch (error) {
+    (options.stderr ?? console.error)(error instanceof Error ? error.message : "Cloud coordination failed");
+    return 1;
+  }
+}
+
+async function runCliOperation(args: string[], options: CliOptions): Promise<number> {
   const cwd = options.cwd ?? process.cwd();
   const stdout = options.stdout ?? ((line: string) => console.log(line));
   const stderr = options.stderr ?? ((line: string) => console.error(line));
@@ -72,6 +89,8 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
       stdout(usage());
       return 0;
     }
+
+    if (command === "cloud") return await runCloudCommand(rest, cwd, stdout);
 
     if (command === "init") {
       const store = openConfiguredMemoryStore(cwd);
@@ -214,10 +233,11 @@ async function runMcp(
   const configCreated = !existsSync(configPath);
   const databaseCreated = !existsSync(databasePath);
 
-  const store = openConfiguredMemoryStore(resolved.rootDir);
-  store.init();
-  store.close();
-  ensureProjectConfig(resolved.rootDir);
+  await projectOperation(resolved.rootDir, () => {
+    const store = openConfiguredMemoryStore(resolved.rootDir);
+    try { store.init(); } finally { store.close(); }
+    ensureProjectConfig(resolved.rootDir);
+  });
 
   stderr(`Starting Code Butler MCP for project ${resolved.rootDir}`);
   await options.startServer({
@@ -441,9 +461,8 @@ async function runWatch(
 
   const source = parseSyncSourceFlag(args);
   const intervalSeconds = parseNumberFlag(args, "--interval") ?? 30;
-  const store = openConfiguredMemoryStore(cwd);
-  store.init();
-  const config = loadProjectConfig(cwd);
+  await syncQuietly(cwd, stdout);
+  const stopCloud = startCloudScheduler(cwd, stdout);
   let running = false;
   const controller = options.signal ? undefined : new AbortController();
   const activeSignal = options.signal ?? controller!.signal;
@@ -459,34 +478,39 @@ async function runWatch(
     if (running) return;
     running = true;
     try {
-      const result = await syncProjectMemory(store, config, { source });
-      stdout(
-        `Synced project memory at ${result.completedAt} (git=${result.sources.git.imported}, codex=${result.sources.codex.imported}, claude=${result.sources.claude.imported}, promoted=${result.memories.promoted})`
-      );
-      if (readProjectBrief(config.sources.git.repoPath).exists) {
+      await projectOperation(cwd, async () => {
+        const store = openConfiguredMemoryStore(cwd);
         try {
-          const summaryResult = await refreshProjectSummaryIfDue(store, config, {
-            ...projectSummaryOperationOptions(options)
-          });
-          if (summaryResult.checked) {
-            stdout(
-              summaryResult.generated
-                ? `Refreshed project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
-                : `Checked project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
-            );
+          store.init();
+          const config = loadProjectConfig(cwd);
+          const result = await syncProjectMemory(store, config, { source });
+          stdout(
+            `Synced project memory at ${result.completedAt} (git=${result.sources.git.imported}, codex=${result.sources.codex.imported}, claude=${result.sources.claude.imported}, promoted=${result.memories.promoted})`
+          );
+          if (readProjectBrief(config.sources.git.repoPath).exists) {
+            try {
+              const summaryResult = await refreshProjectSummaryIfDue(store, config, {
+                ...projectSummaryOperationOptions(options)
+              });
+              if (summaryResult.checked) {
+                stdout(
+                  summaryResult.generated
+                    ? `Refreshed project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
+                    : `Checked project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
+                );
+              }
+            } catch (error) {
+              stdout(`Project summary refresh skipped: ${error instanceof Error ? error.message : String(error)}`);
+            }
           }
-        } catch (error) {
-          stdout(`Project summary refresh skipped: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
+        } finally { store.close(); }
+      });
     } finally {
       running = false;
     }
   }
 
-  const close = (): void => {
-    store.close();
-  };
+  const close = (): void => { stopCloud(); };
 
   try {
     await runOnce();
@@ -741,12 +765,20 @@ function usage(): string {
     "  code-butler init",
     "  code-butler config init",
     "  code-butler config global init",
+    "  code-butler cloud connect --server <https-origin>",
+    "  code-butler cloud projects",
+    "  code-butler cloud enable [--project <uuid>] [--name <name>]",
+    "  code-butler cloud status",
+    "  code-butler cloud sync",
+    "  code-butler cloud disable",
+    "  code-butler cloud resolve --keep <local|cloud>",
     "  code-butler ingest conversation <file>",
     "  code-butler ingest git <repo> [--max-commits <n>]",
     "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",
     "  code-butler decision import <markdown-file>",
     "  code-butler memory audit [--fix] [--json]",
-    "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>]",
+    "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>] [--scope-json <json>] [--json]",
+    "  code-butler memory scope --id <id> --category <candidate|promoted|temporary> --scope-json <json> --reason <text> [--json]",
     "  code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]",
     "  code-butler memory conflicts [--fix] [--json]",
     "  code-butler doctor [--json] [--strict]",

@@ -126,6 +126,8 @@ export interface CommitRecord {
 }
 
 export interface DecisionRecord {
+  scope?: MemoryScope;
+  applicability?: Applicability;
   id: string;
   topic: string;
   decision: string;
@@ -135,7 +137,37 @@ export interface DecisionRecord {
   createdAt: string;
 }
 
+export type MemoryScope = { kind: "project" } | { kind: "unspecified" } | {
+  kind: "conditional";
+  platforms?: string[];
+  architectures?: string[];
+  shells?: string[];
+  condition?: string;
+};
+export interface TargetEnvironment { platform?: string; arch?: string; shell?: string; }
+export interface Applicability {
+  status: "project_wide" | "matches" | "mismatch" | "needs_verification";
+  environment: TargetEnvironment;
+  source: "explicit" | "butler_host_default";
+  reasons: string[];
+}
+
+/** Where Butler generated a memory, not where its advice applies. */
+export interface MemoryOrigin {
+  deviceId: string;
+  platform: string;
+  arch: string;
+  generatedAt: string;
+  method: "deterministic" | "llm" | "manual";
+  channel: "sync" | "cli" | "mcp";
+  client?: { name: string; version?: string };
+  generator?: { provider?: string; model?: string };
+}
+
 export interface ExtractedMemory {
+  scope?: MemoryScope;
+  applicability?: Applicability;
+  origin?: MemoryOrigin | null;
   type: MemoryType;
   title: string;
   summary: string;
@@ -184,6 +216,9 @@ export interface MemoryRelation {
 }
 
 export interface MemorySearchResult {
+  scope?: MemoryScope;
+  applicability?: Applicability;
+  origin?: MemoryOrigin | null;
   kind: "candidate" | "promoted";
   id: string;
   type: MemoryType;
@@ -209,6 +244,9 @@ export interface MemorySearchResult {
 }
 
 export interface TemporaryMemory {
+  scope?: MemoryScope;
+  applicability?: Applicability;
+  origin?: MemoryOrigin | null;
   id: string;
   projectId: string;
   threadId?: string;
@@ -234,6 +272,9 @@ export interface TemporaryMemorySearchResult extends TemporaryMemory {
 }
 
 export interface TemporaryMemoryUpsertInput {
+  scope?: MemoryScope;
+  applicability?: Applicability;
+  origin?: MemoryOrigin | null;
   id?: string;
   projectId?: string;
   threadId?: string;
