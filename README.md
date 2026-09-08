@@ -172,22 +172,142 @@ code-butler doctor
 
 ## MCP Setup
 
-Configure your MCP client to launch Code Butler with `npx`:
+MCP is how Codex, Claude Code, VS Code, and other agents call Code Butler's
+memory tools. The safest setup is to point the client at one project
+explicitly:
 
 ```bash
 npx -y code-butler mcp --project-root /absolute/path/to/project
 ```
 
-Or use a global install:
+If you installed the CLI globally, use:
 
 ```bash
 code-butler mcp --project-root /absolute/path/to/project
 ```
 
-`code-butler mcp` resolves the target Git repository and creates project-local
-internal memory storage on first launch. It does not create `AGENTS.md`,
-`CLAUDE.md`, or `.code-butler/project-summary.md`; run `code-butler init` when
-you are ready for that explicit setup.
+If your MCP client launches servers from inside the active project directory,
+you can omit `--project-root`; `code-butler mcp` will resolve the current Git
+repository. In either mode, Code Butler creates project-local internal memory
+storage on first launch. It does not create `AGENTS.md`, `CLAUDE.md`, or
+`.code-butler/project-summary.md`; run `code-butler init` when you are ready
+for that explicit setup.
+
+### Add to Codex
+
+Edit `~/.codex/config.toml` and add a server entry:
+
+```toml
+[mcp_servers.code-butler]
+command = "npx"
+args = [
+  "-y",
+  "code-butler",
+  "mcp",
+  "--project-root",
+  "/absolute/path/to/project"
+]
+```
+
+If you installed Code Butler globally, use:
+
+```toml
+[mcp_servers.code-butler]
+command = "code-butler"
+args = ["mcp", "--project-root", "/absolute/path/to/project"]
+```
+
+Restart the Codex session after editing the config so it starts the MCP server.
+
+### Add to Claude Code
+
+Add Code Butler as a user-scoped Claude Code MCP server:
+
+```bash
+claude mcp add --scope user code-butler -- \
+  npx -y code-butler mcp --project-root /absolute/path/to/project
+```
+
+If your Claude Code version uses the short scope flag:
+
+```bash
+claude mcp add -s user code-butler -- \
+  npx -y code-butler mcp --project-root /absolute/path/to/project
+```
+
+With a global Code Butler install, replace the command after `--`:
+
+```bash
+claude mcp add --scope user code-butler -- \
+  code-butler mcp --project-root /absolute/path/to/project
+```
+
+To remove an older Claude entry first:
+
+```bash
+claude mcp list
+claude mcp remove code-butler --scope user
+```
+
+If the old server was project-scoped, run the remove command from that project
+folder and use the scope shown by `claude mcp list`.
+
+### Add to VS Code
+
+If Codex or Claude Code is the only agent you use, the client-specific config
+above is enough. To use Code Butler from VS Code, create or edit
+`.vscode/mcp.json` inside your project:
+
+```json
+{
+  "servers": {
+    "code-butler": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "code-butler",
+        "mcp",
+        "--project-root",
+        "/absolute/path/to/project"
+      ]
+    }
+  }
+}
+```
+
+Reload VS Code, or run **MCP: Restart Server** from the command palette.
+
+### Source Builds and Older Configs
+
+If you built Code Butler from source, point clients at the built CLI instead of
+the npm package:
+
+```bash
+node /absolute/path/to/code-butler/dist/cli.js mcp --project-root /absolute/path/to/project
+```
+
+For example, a source-built Codex entry would be:
+
+```toml
+[mcp_servers.code-butler]
+command = "node"
+args = [
+  "/absolute/path/to/code-butler/dist/cli.js",
+  "mcp",
+  "--project-root",
+  "/absolute/path/to/project"
+]
+```
+
+After upgrading Code Butler or rebuilding from source, restart any already-open
+Codex, Claude, or VS Code MCP sessions. You do not need to re-add the server
+unless the command path changed.
+
+If you have older project-local MCP files such as `.mcp.json` or
+`.vscode/mcp.json` that point directly at `dist/server.js` or `code-butler
+serve`, update them to launch `code-butler mcp` or the built `dist/cli.js`
+command shown above.
 
 Once connected, agents can call tools such as:
 
