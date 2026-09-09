@@ -30,14 +30,13 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "vitest run",
-    "test:migrations": "vitest run tests/storage-migrations.test.ts",
+    "test:publish": "vitest run --no-file-parallelism --maxWorkers=1 --minWorkers=1",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "docs:dev": "vitepress docs --host 127.0.0.1",
     "docs:build": "vitepress build docs",
-    "eval:retrieval": "node --import tsx scripts/eval-retrieval.ts",
     "serve": "node dist/server.js",
     "prepack": "npm run build",
-    "prepublishOnly": "npm run typecheck && npm test"
+    "prepublishOnly": "npm run typecheck && npm run test:publish"
   },
   "engines": {
     "node": ">=24.0.0"
