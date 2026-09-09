@@ -981,7 +981,7 @@ function isInsideRoot(rootRealPath: string, candidatePath: string): boolean {
   );
 }
 
-function createFallbackProjectSummaryGenerator(error: unknown): ProjectSummaryGenerator {
+export function createFallbackProjectSummaryGenerator(error: unknown): ProjectSummaryGenerator {
   return {
     name: "fallback",
     async generate(input): Promise<string> {

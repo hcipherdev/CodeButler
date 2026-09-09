@@ -17,6 +17,7 @@ export interface ConversationSourceRootStatus {
   indexed: number;
   pending: number;
   ignored: number;
+  unsupported: number;
   parseFailures: number;
   latestLogAt?: string | undefined;
 }
@@ -31,6 +32,7 @@ export interface ConversationSourceStatus {
     indexed: number;
     pending: number;
     ignored: number;
+    unsupported: number;
     parseFailures: number;
   };
 }
@@ -98,6 +100,11 @@ function syncConversationLogSource(
       }
       const result = parser(filePath);
       if (!result.ok) {
+        if (result.errorCode === "no_supported_messages") {
+          store.resolveSourceFailures(sourceName, filePath);
+          store.setSyncCursor(sourceName, filePath, signature);
+          continue;
+        }
         store.recordSourceFailure({
           adapter: sourceName,
           path: filePath,
@@ -147,6 +154,7 @@ function getConversationSourceStatus(
       indexed: 0,
       pending: 0,
       ignored: 0,
+      unsupported: 0,
       parseFailures: 0
     };
     let latestMtime = 0;
@@ -154,6 +162,10 @@ function getConversationSourceStatus(
       latestMtime = Math.max(latestMtime, statSync(filePath).mtimeMs);
       const result = parser(filePath);
       if (!result.ok) {
+        if (result.errorCode === "no_supported_messages") {
+          status.unsupported += 1;
+          continue;
+        }
         status.parseFailures += 1;
         continue;
       }
@@ -185,9 +197,10 @@ function getConversationSourceStatus(
         indexed: totals.indexed + root.indexed,
         pending: totals.pending + root.pending,
         ignored: totals.ignored + root.ignored,
+        unsupported: totals.unsupported + root.unsupported,
         parseFailures: totals.parseFailures + root.parseFailures
       }),
-      { found: 0, indexed: 0, pending: 0, ignored: 0, parseFailures: 0 }
+      { found: 0, indexed: 0, pending: 0, ignored: 0, unsupported: 0, parseFailures: 0 }
     )
   };
 }

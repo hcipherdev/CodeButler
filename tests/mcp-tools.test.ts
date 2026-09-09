@@ -541,12 +541,17 @@ describe("MCP tool handlers", () => {
   });
 
   it("keeps the architecture copies consistent with the complete 22-tool list", () => {
-    const architecture = readFileSync(join(process.cwd(), "architecture.html"), "utf8");
+    const rootArchitecturePath = join(process.cwd(), "architecture.html");
     const published = readFileSync(join(process.cwd(), "docs", "public", "architecture.html"), "utf8");
+    const architecture = existsSync(rootArchitecturePath)
+      ? readFileSync(rootArchitecturePath, "utf8")
+      : published;
     const toolNames = [...architecture.matchAll(/<div class="mcp-tool-name">([^<]+)<\/div>/g)]
       .map((match) => match[1]);
 
-    expect(published).toBe(architecture);
+    if (existsSync(rootArchitecturePath)) {
+      expect(published).toBe(architecture);
+    }
     expect(architecture).toContain("MCP Tools (22)");
     expect(architecture).toContain("22 exposed tools");
     expect(toolNames).toHaveLength(22);

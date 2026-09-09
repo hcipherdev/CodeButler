@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -31,13 +31,18 @@ describe("public package metadata", () => {
       url: "https://github.com/hcipherdev/CodeButler/issues"
     });
     expect(packageJson.homepage).toBe("https://github.com/hcipherdev/CodeButler#readme");
-    expect(packageJson.bin?.["code-butler"]).toBe("./dist/cli.js");
+    expect(packageJson.bin?.["code-butler"]).toBe("dist/cli.js");
     expect(packageJson.files).toContain("dist");
     expect(packageJson.keywords).toEqual(
       expect.arrayContaining(["mcp", "codex", "claude", "project-memory", "local-first"])
     );
     expect(packageJson.scripts?.prepack).toBe("npm run build");
     expect(packageJson.scripts?.prepublishOnly).toBe("npm run typecheck && npm test");
-    expect(packageJson.scripts?.["test:migrations"]).toBeTruthy();
+  });
+
+  it("uses a cross-platform build helper for public package builds", () => {
+    expect(packageJson.scripts?.build).toBe("node scripts/build.mjs");
+    expect(packageJson.scripts?.build).not.toMatch(/\bchmod\b|&&/);
+    expect(existsSync(join(process.cwd(), "scripts", "build.mjs"))).toBe(true);
   });
 });

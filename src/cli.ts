@@ -22,6 +22,7 @@ import { auditMemoryQuality } from "./memory/quality.js";
 import { rememberProjectMemory } from "./memory/remember.js";
 import {
   getProjectSummaryStatus,
+  createFallbackProjectSummaryGenerator,
   initializeProjectSummary,
   readProjectBrief,
   refreshProjectSummary,
@@ -112,7 +113,8 @@ async function runCliOperation(args: string[], options: CliOptions): Promise<num
           stdout(watchServiceLocationLine(watcher));
           stdout(`logs=${watcher.logsDir}`);
         } catch (error) {
-          throw new Error(`Failed to install Code Butler background watcher: ${error instanceof Error ? error.message : String(error)}`);
+          stdout(`Warning: Failed to install Code Butler background watcher: ${error instanceof Error ? error.message : String(error)}`);
+          stdout("Code Butler is ready for manual and MCP use. Run `code-butler watch install` after fixing scheduler permissions, or keep `code-butler watch` running in a terminal.");
         }
         return 0;
       } finally {
@@ -386,7 +388,7 @@ async function runProjectSummary(
 ): Promise<number> {
   const [subcommand, ...rest] = args;
   if (!subcommand || !["refresh", "status"].includes(subcommand)) {
-    throw new Error("Usage: code-butler project-summary <refresh|status> [--force]");
+    throw new Error("Usage: code-butler project-summary <refresh|status> [--force] [--fallback]");
   }
 
   if (subcommand === "status") {
@@ -420,10 +422,18 @@ async function runProjectSummary(
   store.init();
   try {
     const config = loadProjectConfig(cwd);
+    const force = rest.includes("--force");
+    const fallback = rest.includes("--fallback");
+    const unknownFlag = rest.find((arg) => arg !== "--force" && arg !== "--fallback");
+    if (unknownFlag) throw new Error(`Unknown project-summary refresh option: ${unknownFlag}`);
+    if (fallback && !force) throw new Error("Usage: code-butler project-summary refresh --force --fallback");
     const operationOptions = projectSummaryOperationOptions(options);
+    if (fallback) {
+      operationOptions.generator = createFallbackProjectSummaryGenerator(new Error("local fallback requested"));
+    }
     const result = await refreshProjectSummary(store, config, {
       ...operationOptions,
-      force: rest.includes("--force")
+      force
     });
     if (result.generated) {
       stdout(`Refreshed project summary at ${relativeSummaryPath(cwd, result.summaryPath)}`);
@@ -796,7 +806,7 @@ function usage(): string {
     "  code-butler watch [--interval <seconds>] [--source <git|codex|claude|all>]",
     "  code-butler watch status",
     "  code-butler watch uninstall",
-    "  code-butler project-summary refresh [--force]",
+    "  code-butler project-summary refresh [--force] [--fallback]",
     "  code-butler project-summary status",
     "  code-butler hooks install",
     "  code-butler mcp [--project-root <path>] [--init-here]",

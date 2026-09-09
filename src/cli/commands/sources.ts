@@ -66,9 +66,9 @@ function formatConversationStatus(
   source: string,
   enabled: boolean,
   projectOnly: boolean,
-  totals: { found: number; indexed: number; pending: number; ignored: number; parseFailures: number }
+  totals: { found: number; indexed: number; pending: number; ignored: number; unsupported: number; parseFailures: number }
 ): string {
-  return `${source}: enabled=${enabled} projectOnly=${projectOnly} found=${totals.found} indexed=${totals.indexed} pending=${totals.pending} ignored=${totals.ignored} parseFailures=${totals.parseFailures}`;
+  return `${source}: enabled=${enabled} projectOnly=${projectOnly} found=${totals.found} indexed=${totals.indexed} pending=${totals.pending} ignored=${totals.ignored} unsupported=${totals.unsupported} parseFailures=${totals.parseFailures}`;
 }
 
 function formatRootStatus(root: {
@@ -78,8 +78,9 @@ function formatRootStatus(root: {
   indexed: number;
   pending: number;
   ignored: number;
+  unsupported: number;
   parseFailures: number;
   latestLogAt?: string | undefined;
 }): string {
-  return `  ${root.root}: exists=${root.exists} found=${root.found} indexed=${root.indexed} pending=${root.pending} ignored=${root.ignored} parseFailures=${root.parseFailures} latest=${root.latestLogAt ?? "n/a"}`;
+  return `  ${root.root}: exists=${root.exists} found=${root.found} indexed=${root.indexed} pending=${root.pending} ignored=${root.ignored} unsupported=${root.unsupported} parseFailures=${root.parseFailures} latest=${root.latestLogAt ?? "n/a"}`;
 }

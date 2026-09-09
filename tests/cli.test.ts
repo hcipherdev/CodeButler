@@ -68,7 +68,7 @@ describe("CLI", () => {
       "  code-butler watch [--interval <seconds>] [--source <git|codex|claude|all>]",
       "  code-butler watch status",
       "  code-butler watch uninstall",
-      "  code-butler project-summary refresh [--force]",
+      "  code-butler project-summary refresh [--force] [--fallback]",
       "  code-butler project-summary status",
       "  code-butler hooks install",
       "  code-butler mcp [--project-root <path>] [--init-here]",
@@ -379,23 +379,32 @@ describe("CLI", () => {
 
     const createCommand = commands.find((item) => item.command === "schtasks.exe" && item.args.includes("/Create"));
     const runCommand = commands.find((item) => item.command === "schtasks.exe" && item.args.includes("/Run"));
-    expect(createCommand?.args).toEqual(expect.arrayContaining(["/SC", "ONLOGON", "/F"]));
-    expect(createCommand?.args.join(" ")).toContain("C:\\CodeButler\\dist\\cli.js");
-    expect(createCommand?.args.join(" ")).toContain("watch --interval 30 --source all");
+    const hash = createHash("sha256").update(rootDir).digest("hex").slice(0, 16);
+    const launcherPath = join(rootDir, ".code-butler", `code-butler-watch-${hash}.cmd`);
+    expect(createCommand?.args).toEqual(expect.arrayContaining(["/TN", `CodeButler-watch-${hash}`, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"]));
+    expect(createCommand?.args).not.toContain(`\\CodeButler\\watch-${hash}`);
+    expect(createCommand?.args.join(" ")).toContain(launcherPath);
     expect(runCommand?.args).toEqual(expect.arrayContaining(["/TN"]));
+    const launcher = readFileSync(launcherPath, "utf8");
+    expect(launcher).toContain(`cd /d "${rootDir}"`);
+    expect(launcher).toContain('"C:\\CodeButler\\dist\\cli.js" "watch" "--interval" "30" "--source" "all"');
+    expect(launcher).toContain("watch.out.log");
+    expect(launcher).toContain("watch.err.log");
     expect(output.join("\n")).toContain("Background watcher installed");
   });
 
-  it("init reports a clear error when background watcher installation fails", async () => {
+  it("init warns and succeeds when background watcher installation fails", async () => {
     const rootDir = makeTempDir();
     const launchdHomeDir = makeTempDir();
     tempDirs.push(rootDir, launchdHomeDir);
     writeFileSync(join(rootDir, "README.md"), "# Failing Watch Project\n");
+    const output: string[] = [];
     const errors: string[] = [];
 
     await expect(
       runCli(["init"], {
         cwd: rootDir,
+        stdout: (line) => output.push(line),
         stderr: (line) => errors.push(line),
         projectSummaryGenerator: unavailableSummaryGenerator,
         watchServiceHomeDir: launchdHomeDir,
@@ -404,11 +413,13 @@ describe("CLI", () => {
           throw new Error("launchctl unavailable");
         }
       })
-    ).resolves.toBe(1);
+    ).resolves.toBe(0);
 
     expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(true);
-    expect(errors.join("\n")).toContain("Failed to install Code Butler background watcher");
-    expect(errors.join("\n")).toContain("launchctl unavailable");
+    expect(output.join("\n")).toContain("Warning: Failed to install Code Butler background watcher");
+    expect(output.join("\n")).toContain("launchctl unavailable");
+    expect(output.join("\n")).toContain("Code Butler is ready for manual and MCP use");
+    expect(errors).toEqual([]);
   });
 
   it("initializes config and syncs configured sources", async () => {
@@ -1439,6 +1450,72 @@ describe("CLI", () => {
     expect(existsSync(join(launchAgentsDir, plistFiles[0]!))).toBe(false);
   });
 
+  it("keeps explicit watch install failures nonzero", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const errors: string[] = [];
+
+    await expect(
+      runCli(["watch", "install"], {
+        cwd: rootDir,
+        stderr: (line) => errors.push(line),
+        watchServicePlatform: "win32",
+        watchServiceCommandRunner() {
+          throw new Error("scheduler denied");
+        }
+      })
+    ).resolves.toBe(1);
+
+    expect(errors.join("\n")).toContain("scheduler denied");
+  });
+
+  it("detects and removes legacy Windows scheduled task names", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const hash = createHash("sha256").update(rootDir).digest("hex").slice(0, 16);
+    const currentName = `CodeButler-watch-${hash}`;
+    const legacyName = `\\CodeButler\\watch-${hash}`;
+    const commands: Array<{ command: string; args: string[] }> = [];
+    const output: string[] = [];
+
+    await expect(
+      runCli(["watch", "status"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        watchServicePlatform: "win32",
+        watchServiceCommandRunner(command, args) {
+          commands.push({ command, args });
+          if (args.includes("/Query") && args.includes(legacyName)) return;
+          throw new Error("task not found");
+        }
+      })
+    ).resolves.toBe(0);
+
+    expect(output.join("\n")).toContain(`task=${legacyName}`);
+    expect(output.join("\n")).toContain("installed=true");
+    expect(commands.map((item) => item.args.join(" "))).toEqual([
+      `/Query /TN ${currentName}`,
+      `/Query /TN ${legacyName}`
+    ]);
+
+    const uninstallCommands: Array<{ command: string; args: string[] }> = [];
+    await expect(
+      runCli(["watch", "uninstall"], {
+        cwd: rootDir,
+        watchServicePlatform: "win32",
+        watchServiceCommandRunner(command, args) {
+          uninstallCommands.push({ command, args });
+        }
+      })
+    ).resolves.toBe(0);
+
+    const uninstallArgs = uninstallCommands.map((item) => item.args.join(" "));
+    expect(uninstallArgs).toContain(`/End /TN ${currentName}`);
+    expect(uninstallArgs).toContain(`/Delete /TN ${currentName} /F`);
+    expect(uninstallArgs).toContain(`/End /TN ${legacyName}`);
+    expect(uninstallArgs).toContain(`/Delete /TN ${legacyName} /F`);
+  });
+
   it("rejects removed project summary install command", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -1452,6 +1529,46 @@ describe("CLI", () => {
     ).resolves.toBe(1);
 
     expect(errors.join("\n")).toContain("project-summary <refresh|status>");
+  });
+
+  it("refreshes a project summary with an explicit forced local fallback", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, "README.md"), "# Fallback Refresh Project\n");
+    writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Existing summary\n");
+    const output: string[] = [];
+
+    await expect(
+      runCli(["project-summary", "refresh", "--force", "--fallback"], {
+        cwd: rootDir,
+        stdout: (line) => output.push(line),
+        projectSummaryGenerator: unavailableSummaryGenerator,
+        now: () => new Date("2026-06-18T12:34:56Z")
+      })
+    ).resolves.toBe(0);
+
+    expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain("Fallback Project Summary");
+    expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "project-summary.meta.json"), "utf8"))).toMatchObject({
+      provider: "fallback"
+    });
+    expect(output.join("\n")).toContain("Refreshed project summary");
+    expect(output.join("\n")).toContain("backupPath=.code-butler/backups/project-summary/project-summary-2026-06-18T12-34-56-000Z.md");
+  });
+
+  it("requires force for local fallback project summary refreshes", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const errors: string[] = [];
+
+    await expect(
+      runCli(["project-summary", "refresh", "--fallback"], {
+        cwd: rootDir,
+        stderr: (line) => errors.push(line)
+      })
+    ).resolves.toBe(1);
+
+    expect(errors.join("\n")).toContain("project-summary refresh --force --fallback");
   });
 
   it("reports project summary status", async () => {
