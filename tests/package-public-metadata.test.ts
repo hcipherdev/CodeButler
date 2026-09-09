@@ -37,7 +37,8 @@ describe("public package metadata", () => {
       expect.arrayContaining(["mcp", "codex", "claude", "project-memory", "local-first"])
     );
     expect(packageJson.scripts?.prepack).toBe("npm run build");
-    expect(packageJson.scripts?.prepublishOnly).toBe("npm run typecheck && npm test");
+    expect(packageJson.scripts?.["test:publish"]).toBe("vitest run --no-file-parallelism --maxWorkers=1 --minWorkers=1");
+    expect(packageJson.scripts?.prepublishOnly).toBe("npm run typecheck && npm run test:publish");
   });
 
   it("uses a cross-platform build helper for public package builds", () => {
