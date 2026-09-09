@@ -81,8 +81,17 @@ export function getWatchServiceStatus(options: WatchServiceOptions): WatchServic
   }
 
   if (service.platform === "win32") {
-    const taskName = scheduledTaskName(service);
-    const installed = service.runCommands ? commandSucceeds(service, "schtasks.exe", ["/Query", "/TN", taskName]) : false;
+    let taskName = scheduledTaskName(service);
+    let installed = false;
+    if (service.runCommands) {
+      for (const name of scheduledTaskNames(service)) {
+        if (commandSucceeds(service, "schtasks.exe", ["/Query", "/TN", name])) {
+          taskName = name;
+          installed = true;
+          break;
+        }
+      }
+    }
     return { platform: service.platform, label: service.label, taskName, logsDir: service.logsDir, installed };
   }
 
@@ -156,9 +165,10 @@ function uninstallSystemdService(service: ResolvedWatchService): WatchServiceRes
 function installScheduledTask(service: ResolvedWatchService): WatchServiceResult {
   const taskName = scheduledTaskName(service);
   const taskCommand = windowsTaskCommand(service);
+  writeFileSync(windowsLauncherPath(service), windowsLauncher(service));
 
   if (service.runCommands) {
-    run(service, "schtasks.exe", ["/Create", "/TN", taskName, "/TR", taskCommand, "/SC", "ONLOGON", "/F"]);
+    run(service, "schtasks.exe", ["/Create", "/TN", taskName, "/TR", taskCommand, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"]);
     run(service, "schtasks.exe", ["/Run", "/TN", taskName]);
   }
 
@@ -168,9 +178,12 @@ function installScheduledTask(service: ResolvedWatchService): WatchServiceResult
 function uninstallScheduledTask(service: ResolvedWatchService): WatchServiceResult {
   const taskName = scheduledTaskName(service);
   if (service.runCommands) {
-    runIgnoringFailure(service, "schtasks.exe", ["/End", "/TN", taskName]);
-    runIgnoringFailure(service, "schtasks.exe", ["/Delete", "/TN", taskName, "/F"]);
+    for (const name of scheduledTaskNames(service)) {
+      runIgnoringFailure(service, "schtasks.exe", ["/End", "/TN", name]);
+      runIgnoringFailure(service, "schtasks.exe", ["/Delete", "/TN", name, "/F"]);
+    }
   }
+  rmSync(windowsLauncherPath(service), { force: true });
   return { platform: service.platform, label: service.label, taskName, logsDir: service.logsDir, installed: false };
 }
 
@@ -239,11 +252,34 @@ function systemdService(service: ResolvedWatchService): string {
 }
 
 function scheduledTaskName(service: ResolvedWatchService): string {
+  return `CodeButler-watch-${service.hash}`;
+}
+
+function legacyScheduledTaskName(service: ResolvedWatchService): string {
   return `\\CodeButler\\watch-${service.hash}`;
 }
 
+function scheduledTaskNames(service: ResolvedWatchService): string[] {
+  return [scheduledTaskName(service), legacyScheduledTaskName(service)];
+}
+
 function windowsTaskCommand(service: ResolvedWatchService): string {
-  return watchArgs(service).map(windowsArg).join(" ");
+  return windowsArg(windowsLauncherPath(service));
+}
+
+function windowsLauncherPath(service: ResolvedWatchService): string {
+  return join(service.cwd, ".code-butler", `code-butler-watch-${service.hash}.cmd`);
+}
+
+function windowsLauncher(service: ResolvedWatchService): string {
+  const outLog = join(service.logsDir, "watch.out.log");
+  const errLog = join(service.logsDir, "watch.err.log");
+  return [
+    "@echo off",
+    `cd /d ${windowsCmdArg(service.cwd)}`,
+    "if errorlevel 1 exit /b %errorlevel%",
+    `${watchArgs(service).map(windowsCmdArg).join(" ")} >> ${windowsCmdArg(outLog)} 2>> ${windowsCmdArg(errLog)}`
+  ].join("\r\n") + "\r\n";
 }
 
 function watchArgs(service: ResolvedWatchService): string[] {
@@ -283,6 +319,10 @@ function systemdArg(value: string): string {
 function windowsArg(value: string): string {
   if (!/[\s"]/.test(value)) return value;
   return `"${value.replaceAll('"', '\\"')}"`;
+}
+
+function windowsCmdArg(value: string): string {
+  return `"${value.replaceAll('"', '""')}"`;
 }
 
 function xmlEscape(value: string): string {

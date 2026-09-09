@@ -1,4 +1,5 @@
 import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +12,7 @@ import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 describe("doctor service", () => {
   let tempDirs: string[] = [];
   const originalCodeButlerHome = process.env.CODE_BUTLER_HOME;
+  const originalHome = process.env.HOME;
 
   afterEach(() => {
     for (const dir of tempDirs) cleanupTempDir(dir);
@@ -20,6 +22,11 @@ describe("doctor service", () => {
       delete process.env.CODE_BUTLER_HOME;
     } else {
       process.env.CODE_BUTLER_HOME = originalCodeButlerHome;
+    }
+    if (originalHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = originalHome;
     }
   });
 
@@ -370,6 +377,84 @@ describe("doctor service", () => {
         expect.objectContaining({ command: `edit ${process.env.CODE_BUTLER_HOME ?? "~/.config/code-butler"}/.env` })
       ])
     );
+  });
+
+  it("does not warn when only default conversation roots are absent", () => {
+    const rootDir = makeTempDir();
+    const homeDir = makeTempDir();
+    tempDirs.push(rootDir, homeDir);
+    process.env.HOME = homeDir;
+    const codexSessions = join(homedir(), ".codex", "sessions");
+    const codexArchived = join(homedir(), ".codex", "archived_sessions");
+    const claudeProjects = join(homedir(), ".claude", "projects");
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir, {
+      sources: {
+        git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
+        codex: { enabled: true, roots: [codexSessions, codexArchived], includeDefaultRoots: false, projectOnly: true },
+        claude: { enabled: true, roots: [claudeProjects], projectOnly: true }
+      }
+    });
+    writeFreshSummary(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+
+    expect(report.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "sources:codex",
+          status: "ok",
+          metadata: expect.objectContaining({
+            missingRoots: [],
+            optionalMissingRoots: [codexSessions, codexArchived]
+          })
+        }),
+        expect.objectContaining({
+          id: "sources:claude",
+          status: "ok",
+          metadata: expect.objectContaining({
+            missingRoots: [],
+            optionalMissingRoots: [claudeProjects]
+          })
+        })
+      ])
+    );
+    expect(report.nextActions).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ command: "code-butler sources status" })
+    ]));
+  });
+
+  it("reports stale summary credential blockers and the explicit fallback action", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    writeConfig(rootDir);
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Legacy summary without baseline\n");
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+
+    expect(report.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "summary:freshness",
+        status: "warning",
+        detail: expect.stringContaining("outputBaselineMissing=true")
+      }),
+      expect.objectContaining({
+        id: "summary:credentials",
+        status: "warning",
+        detail: "missing=summary:TEST_CODE_BUTLER_API_KEY"
+      })
+    ]));
+    expect(report.nextActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ command: "TEST_CODE_BUTLER_API_KEY" }),
+      expect.objectContaining({ command: "code-butler project-summary refresh --force --fallback" })
+    ]));
   });
 
   it("reports missing project profiles as config errors", () => {

@@ -119,6 +119,13 @@ projects. It creates project-local memory, writes
 bootstrap instructions. It also installs and starts the per-project background
 watcher so local memory and the project summary stay fresh after setup.
 
+If the background watcher cannot be installed, `init` still leaves the project
+ready for manual and MCP use. Run `code-butler watch install` again after
+fixing scheduler permissions, or keep `code-butler watch` running in a terminal.
+On Windows, Code Butler installs a per-user Scheduled Task through a
+project-local `.cmd` launcher under `.code-butler/` so the watcher starts in the
+right repository.
+
 Those bootstrap files are what make future Codex or Claude sessions naturally
 use Code Butler before editing. The project summary gives agents a fast
 starting brief, while the MCP tools provide the detailed evidence behind it.
@@ -151,6 +158,10 @@ Inspect source status:
 code-butler sources status
 ```
 
+Valid JSONL files without supported Codex or Claude messages are reported as
+`unsupported` in source status; malformed or unreadable logs appear in
+`code-butler sources failures`.
+
 Refresh the project narrative summary manually:
 
 ```bash
@@ -162,6 +173,13 @@ If `init` created a fallback summary, add the configured API key and run:
 
 ```bash
 code-butler project-summary refresh --force
+```
+
+If you want to replace a stale or legacy summary with the local fallback summary
+while provider credentials are unavailable, run:
+
+```bash
+code-butler project-summary refresh --force --fallback
 ```
 
 Check setup health:
@@ -362,16 +380,18 @@ Check the installed background watcher:
 code-butler watch status
 ```
 
-The watcher installed by `code-butler init` runs the same watch loop
-automatically. It syncs local sources and refreshes
-`.code-butler/project-summary.md` when the daily gated fingerprint check says
-the summary is due. It does not rewrite `AGENTS.md` or `CLAUDE.md`; those
-bootstrap files are installed only by explicit `code-butler init`.
+When watcher installation succeeds, the watcher installed by
+`code-butler init` runs the same watch loop automatically. It syncs local
+sources and refreshes `.code-butler/project-summary.md` when the daily gated
+fingerprint check says the summary is due. It does not rewrite `AGENTS.md` or
+`CLAUDE.md`; those bootstrap files are installed only by explicit
+`code-butler init`.
 
 Use `watch status` to confirm whether the per-project background watcher is
 installed. Code Butler does not silently install a daemon when MCP starts or
-when a project is opened; installation happens during explicit
-`code-butler init`.
+when a project is opened; installation is attempted during explicit
+`code-butler init`. On Windows, `watch install` creates a per-user Scheduled
+Task plus a project-local `.cmd` launcher under `.code-butler/`.
 
 Remove the watcher:
 

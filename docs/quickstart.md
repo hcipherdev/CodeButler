@@ -21,7 +21,7 @@ Run `init` in each repository where you want the full Code Butler workflow:
 code-butler init
 ```
 
-`init` creates project-local memory, writes `.code-butler/project-summary.md`, installs short agent bootstrap instructions, and starts the per-project background watcher.
+`init` creates project-local memory, writes `.code-butler/project-summary.md`, installs short agent bootstrap instructions, and tries to start the per-project background watcher.
 
 ## Sync Memory
 
@@ -89,12 +89,24 @@ code-butler project-summary refresh
 
 Put durable human guidance in `.code-butler/project-summary-notes.md`; refresh reads it but never rewrites it. Code context is selected deterministically from safe Git-tracked entrypoints, promoted-memory links, and recent commit files. Normal refresh protects manual edits to the generated summary; use `project-summary status` to inspect the state and `refresh --force` only when you intend to replace it with a timestamped recovery backup.
 
+If provider credentials are unavailable and you want a local fallback summary instead of waiting, use:
+
+```bash
+code-butler project-summary refresh --force --fallback
+```
+
+Background watcher installation is best effort during `init`. If the scheduler step fails, Code Butler remains usable through manual commands and MCP; run `code-butler watch install` after fixing scheduler permissions, or keep `code-butler watch` open in a terminal. On Windows, the watcher uses a per-user Scheduled Task that runs a project-local `.cmd` launcher from `.code-butler/`.
+
 Inspect persisted conversation parsing failures after repairing source files:
 
 ```bash
 code-butler sources failures
 code-butler sources failures --json
 ```
+
+Valid JSONL files that contain no supported Codex or Claude messages are counted
+as unsupported in `code-butler sources status`; they are not persisted as
+unresolved failures.
 
 ## Build From Source
 

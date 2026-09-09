@@ -11,6 +11,7 @@ import {
   createProviderKey
 } from "../src/embeddings/fingerprint.js";
 import type { EmbeddingBuildResult } from "../src/embeddings/service.js";
+import { getClaudeSourceStatus, getCodexSourceStatus } from "../src/sources/codex.js";
 import type { EmbeddingProvider, ExtractorProvider } from "../src/types.js";
 import { syncProjectMemory } from "../src/sync/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
@@ -300,7 +301,7 @@ describe("automatic sync", () => {
     store.close();
   });
 
-  it("records valid non-object JSONL rows as structured unsupported-message failures", async () => {
+  it("treats valid JSONL rows without supported messages as unsupported status instead of failures", async () => {
     const { rootDir, codexDir, claudeDir } = createFixtureWorkspace();
     const codexPath = join(codexDir, "null.jsonl");
     const claudePath = join(claudeDir, "null.jsonl");
@@ -313,10 +314,17 @@ describe("automatic sync", () => {
 
     await expect(syncProjectMemory(store, config, { source: "all", extractorProvider })).resolves.toBeDefined();
 
-    expect(store.listSourceFailures({ limit: null })).toEqual(expect.arrayContaining([
-      expect.objectContaining({ adapter: "codex", path: codexPath, errorCode: "no_supported_messages" }),
-      expect.objectContaining({ adapter: "claude", path: claudePath, errorCode: "no_supported_messages" })
-    ]));
+    expect(store.listSourceFailures({ limit: null })).toEqual([]);
+    expect(store.getSyncCursor("codex", codexPath)).toBeDefined();
+    expect(store.getSyncCursor("claude", claudePath)).toBeDefined();
+    expect(getCodexSourceStatus(store, config.sources.codex, config.sources.git.repoPath).totals).toMatchObject({
+      unsupported: 1,
+      parseFailures: 0
+    });
+    expect(getClaudeSourceStatus(store, config.sources.claude, config.sources.git.repoPath).totals).toMatchObject({
+      unsupported: 1,
+      parseFailures: 0
+    });
     store.close();
   });
 

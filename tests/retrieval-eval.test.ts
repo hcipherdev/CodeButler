@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { computeRetrievalMetrics, hybridRecallGate } from "../scripts/eval-retrieval.js";
+import { computeRetrievalMetrics, hybridRecallGate } from "../src/search/eval-metrics.js";
 
 describe("retrieval evaluation metrics", () => {
   it("computes mean recall at K and reciprocal rank", () => {

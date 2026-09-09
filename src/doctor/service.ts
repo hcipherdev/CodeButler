@@ -1,4 +1,5 @@
 import { existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -166,7 +167,7 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
       addExtractorChecks(config, addCheck, addAction);
       addEmbeddingChecks(config, storage, addCheck, addAction);
     }
-    addSummaryCheck(projectRoot, now, addCheck, addAction);
+    addSummaryCheck(projectRoot, now, config, addCheck, addAction);
     addMemoryCheck(storage, addCheck, addAction);
   } finally {
     storage.db?.close();
@@ -662,7 +663,7 @@ function addSourceChecks(
         source === "codex"
           ? getCodexSourceStatus(cursorStore, config.sources.codex, config.sources.git.repoPath)
           : getClaudeSourceStatus(cursorStore, config.sources.claude, config.sources.git.repoPath);
-      addConversationSourceCheck(status, addCheck, addAction);
+      addConversationSourceCheck(status, optionalConversationSourceRoots(source), addCheck, addAction);
     } catch (error) {
       addCheck({
         id: `sources:${source}`,
@@ -682,14 +683,17 @@ function addSourceChecks(
 
 function addConversationSourceCheck(
   status: ConversationSourceStatus,
+  optionalMissingRootCandidates: Set<string>,
   addCheck: (check: DoctorCheck) => void,
   addAction: (action: DoctorNextAction) => void
 ): void {
   const missingRoots = status.roots.filter((root) => !root.exists);
+  const actionableMissingRoots = missingRoots.filter((root) => !optionalMissingRootCandidates.has(root.root));
+  const optionalMissingRoots = missingRoots.filter((root) => optionalMissingRootCandidates.has(root.root));
   const hasParseFailures = status.totals.parseFailures > 0;
   const checkStatus: DoctorStatus = !status.enabled
     ? "ok"
-    : missingRoots.length > 0 || hasParseFailures
+    : actionableMissingRoots.length > 0 || hasParseFailures
       ? "warning"
       : "ok";
   const detail = [
@@ -699,6 +703,7 @@ function addConversationSourceCheck(
     `indexed=${status.totals.indexed}`,
     `pending=${status.totals.pending}`,
     `ignored=${status.totals.ignored}`,
+    `unsupported=${status.totals.unsupported}`,
     `parseFailures=${status.totals.parseFailures}`
   ].join(" ");
 
@@ -715,7 +720,8 @@ function addConversationSourceCheck(
     detail,
     metadata: {
       roots: status.roots,
-      missingRoots: missingRoots.map((root) => root.root),
+      missingRoots: actionableMissingRoots.map((root) => root.root),
+      optionalMissingRoots: optionalMissingRoots.map((root) => root.root),
       totals: status.totals
     }
   });
@@ -727,6 +733,14 @@ function addConversationSourceCheck(
       reason: "Review missing roots or parse failures in configured conversation sources."
     });
   }
+}
+
+function optionalConversationSourceRoots(source: "codex" | "claude"): Set<string> {
+  const home = homedir();
+  if (source === "codex") {
+    return new Set([join(home, ".codex", "sessions"), join(home, ".codex", "archived_sessions")]);
+  }
+  return new Set([join(home, ".claude", "projects")]);
 }
 
 function addSyncChecks(
@@ -808,17 +822,21 @@ function addSyncChecks(
 function addSummaryCheck(
   rootDir: string,
   now: Date,
+  config: ProjectConfig | undefined,
   addCheck: (check: DoctorCheck) => void,
   addAction: (action: DoctorNextAction) => void
 ): void {
   const status = getProjectSummaryStatus(rootDir, { now: () => now });
   const needsRefresh = !status.exists || status.stale || status.due;
+  const missingSummaryCredentials = config !== undefined
+    ? missingProviderEnvVars("summary", projectSummaryProviderConfig(config))
+    : [];
   addCheck({
     id: "summary:freshness",
     category: "summary",
     status: needsRefresh ? "warning" : "ok",
     title: needsRefresh ? "Project summary needs refresh" : "Project summary is fresh",
-    detail: `exists=${status.exists} due=${status.due} stale=${status.stale}`,
+    detail: `exists=${status.exists} due=${status.due} stale=${status.stale} manualEditsDetected=${status.manualEditsDetected} outputBaselineMissing=${status.outputBaselineMissing}`,
     metadata: recordFrom(status)
   });
   if (needsRefresh) {
@@ -827,6 +845,26 @@ function addSummaryCheck(
       command: "code-butler project-summary refresh",
       reason: "Refresh the narrative project summary used by agents."
     });
+    if (missingSummaryCredentials.length > 0) {
+      addCheck({
+        id: "summary:credentials",
+        category: "summary",
+        status: "warning",
+        title: "Project summary provider credentials are missing",
+        detail: `missing=${missingSummaryCredentials.join(",")}`,
+        metadata: { missing: missingSummaryCredentials }
+      });
+      addAction({
+        priority: "medium",
+        command: missingSummaryCredentials.map((item) => item.replace(/^summary:/, "")).join(" "),
+        reason: "Set the missing environment variable(s), then rerun `code-butler project-summary refresh --force`."
+      });
+      addAction({
+        priority: "low",
+        command: "code-butler project-summary refresh --force --fallback",
+        reason: "Replace the stale summary with a local fallback summary until provider credentials are available."
+      });
+    }
   }
 }
 
@@ -991,7 +1029,11 @@ function readMemoryHealth(db: DatabaseSync): MemoryHealthSummary {
   };
 }
 
-function missingProviderEnvVars(label: "extractor" | "investigator", config: ExtractorConfig | InvestigatorConfig): string[] {
+function projectSummaryProviderConfig(config: ProjectConfig): ExtractorConfig | InvestigatorConfig {
+  return config.investigator.enabled ? config.investigator : config.extractor;
+}
+
+function missingProviderEnvVars(label: string, config: ExtractorConfig | InvestigatorConfig): string[] {
   const vars = [config.apiKeyEnv];
   if (config.provider === "anthropic-aws") {
     vars.push(config.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID");
