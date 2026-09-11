@@ -64,15 +64,79 @@ The pass runs after automatic promotion on every sync, so knowledge that has ear
 `code-butler memory retention --history`. Set `retention.layers.enabled: false` to turn
 it off.
 
+## Artifact retention
+
+Non-memory runtime artifacts are bounded automatically. The pass is conservative,
+touches nothing under `memory.sqlite`, `memory.sqlite-wal`, or `memory.sqlite-shm`,
+and removes a file only when it is provably replaceable.
+
+```json
+{
+  "retention": {
+    "artifacts": {
+      "logs": { "maxBytes": 5242880, "maxFiles": 3 },
+      "projectSummaryBackups": { "maxFiles": 5 },
+      "recoveryBackups": { "maxFiles": 5, "minAgeDays": 7 },
+      "cloudHandles": { "reapStale": true }
+    }
+  }
+}
+```
+
+- `logs/watch.out.log` and `logs/watch.err.log` rotate at watcher startup and before
+  each watcher sync cycle once they exceed `logs.maxBytes`, keeping `logs.maxFiles`
+  rotated copies.
+- `backups/project-summary/*.md` is pruned to the newest `projectSummaryBackups.maxFiles`
+  after a successful summary refresh.
+- `memory.sqlite.recovery-*.sqlite` is pruned to the newest `recoveryBackups.maxFiles`
+  and only among backups older than `recoveryBackups.minAgeDays`, so a fresh recovery
+  copy is never removed.
+- `.cloud-handles/*.json` and `.cloud-owner-*` files are reaped only when the recorded
+  PID is not alive.
+
+Preview with `code-butler maintenance status --json` or
+`code-butler maintenance prune --dry-run`; mutation requires
+`code-butler maintenance prune --apply`. `doctor` reports the same findings under the
+`maintenance` category. Database migration backup retention stays under
+`retention.migrationBackups`.
+
+## Portable config and local overrides
+
+Shared `.code-butler/config.json` carries project policy only: retention, privacy
+redaction rules, deterministic settings, promotion, retrieval mode, sync sharing
+policy, and per-source `enabled`, `projectOnly`, and max limits. Machine-specific
+settings belong in the ignored `.code-butler/config.local.json`, which uses the same
+schema and is layered last: defaults and global provider profiles, then `config.json`,
+then `config.local.json`. Relative paths in either file resolve against the project
+root.
+
+Local-only keys are `sources.git.repoPath`, `sources.git.hookInstall`,
+`sources.*.roots`, `sources.codex.includeDefaultRoots`, and the `embeddings`,
+`extractor`, and `investigator` provider blocks. Existing configs that keep those keys
+in `config.json` still load; `doctor` raises a `config:portable` warning and points at
+the migration:
+
+```bash
+code-butler config migrate-local --dry-run --json
+code-butler config migrate-local --apply
+```
+
+Apply moves only local-only keys, preserves values already present in
+`config.local.json`, reports any differing value as a conflict instead of overwriting
+it, and is idempotent. Cloud sync excludes `config.local.json` from snapshots and
+rejects non-portable incoming shared config.
+
 ## Git sharing
 
 Code Butler project state lives under `.code-butler/`. Treat that directory as
 local runtime state by default. Only commit files that are intentionally useful
 to collaborators, such as `.code-butler/.gitignore`,
-`.code-butler/project-summary.md`, and a secret-free `.code-butler/config.json`.
+`.code-butler/project-summary.md`, and a secret-free, portable
+`.code-butler/config.json`.
 
-Never commit `.code-butler/memory.sqlite`, SQLite WAL/SHM sidecars, sync
-metadata, imports, logs, staging files, or migration and recovery backups. If a
+Never commit `.code-butler/memory.sqlite`, SQLite WAL/SHM sidecars,
+`.code-butler/config.local.json`, sync metadata, imports, logs, staging files, or
+migration and recovery backups. If a
 database file was already staged or tracked, stop Code Butler and remove it from
 Git while keeping the local copy:
 

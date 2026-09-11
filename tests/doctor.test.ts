@@ -37,9 +37,24 @@ describe("doctor service", () => {
       JSON.stringify(
         {
           sources: {
-            git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
-            codex: { enabled: false, roots: [], includeDefaultRoots: false, projectOnly: true },
-            claude: { enabled: false, roots: [], projectOnly: true }
+            git: { enabled: false, maxCommits: 50, maxDiffChars: 12000 },
+            codex: { enabled: false, projectOnly: true },
+            claude: { enabled: false, projectOnly: true }
+          },
+          ...overrides
+        },
+        null,
+        2
+      )
+    );
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.local.json"),
+      JSON.stringify(
+        {
+          sources: {
+            git: { repoPath: ".", hookInstall: false },
+            codex: { roots: [], includeDefaultRoots: false },
+            claude: { roots: [] }
           },
           extractor: {
             provider: "openai-compatible",
@@ -54,8 +69,7 @@ describe("doctor service", () => {
             baseUrl: "https://example.test/v1",
             model: "gpt-test",
             apiKeyEnv: "TEST_CODE_BUTLER_API_KEY"
-          },
-          ...overrides
+          }
         },
         null,
         2
@@ -157,6 +171,45 @@ describe("doctor service", () => {
     expect(JSON.stringify(report)).not.toContain("sk-proj-");
     expect(report.nextActions).toEqual(expect.arrayContaining([
       expect.objectContaining({ command: "code-butler sources failures" })
+    ]));
+  });
+
+  it("warns about non-portable shared config keys and unbounded runtime artifacts", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
+    writeConfig(rootDir, { sources: { git: { enabled: false, repoPath: "." }, codex: { enabled: false, roots: [] } } });
+    writeFreshSummary(rootDir);
+    const dataDir = join(rootDir, ".code-butler");
+    mkdirSync(join(dataDir, "logs"), { recursive: true });
+    writeFileSync(join(dataDir, "logs", "watch.out.log"), "x".repeat(5 * 1024 * 1024 + 1));
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.close();
+
+    const report = runDoctor(rootDir, { now: () => new Date("2026-06-24T12:00:00.000Z") });
+
+    expect(report.checks.find((item) => item.id === "config:portable")).toMatchObject({
+      status: "warning",
+      metadata: {
+        issues: expect.arrayContaining([
+          { path: "sources.git.repoPath", reason: "device_local_path" },
+          { path: "sources.codex.roots", reason: "device_local_path" }
+        ])
+      }
+    });
+    expect(report.checks.find((item) => item.id === "maintenance:artifacts")).toMatchObject({
+      category: "maintenance",
+      status: "warning",
+      metadata: {
+        items: expect.arrayContaining([
+          expect.objectContaining({ category: "logs", action: "rotate" })
+        ])
+      }
+    });
+    expect(report.nextActions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ command: "code-butler config migrate-local --dry-run" }),
+      expect.objectContaining({ command: "code-butler maintenance prune --dry-run" })
     ]));
   });
 
@@ -351,11 +404,23 @@ describe("doctor service", () => {
     tempDirs.push(rootDir);
     writeConfig(rootDir, {
       sources: {
-        git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
-        codex: { enabled: true, roots: ["./missing-codex"], includeDefaultRoots: false, projectOnly: true },
-        claude: { enabled: true, roots: ["./missing-claude"], projectOnly: true }
+        git: { enabled: false, maxCommits: 50, maxDiffChars: 12000 },
+        codex: { enabled: true, projectOnly: true },
+        claude: { enabled: true, projectOnly: true }
       }
     });
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.local.json"),
+      JSON.stringify({
+        sources: {
+          git: { repoPath: ".", hookInstall: false },
+          codex: { roots: ["./missing-codex"], includeDefaultRoots: false },
+          claude: { roots: ["./missing-claude"] }
+        },
+        extractor: { provider: "openai-compatible", baseUrl: "https://example.test/v1", model: "gpt-test", apiKeyEnv: "TEST_CODE_BUTLER_API_KEY" },
+        investigator: { enabled: true, mode: "native-rlm", provider: "openai-compatible", baseUrl: "https://example.test/v1", model: "gpt-test", apiKeyEnv: "TEST_CODE_BUTLER_API_KEY" }
+      })
+    );
     writeFreshSummary(rootDir);
     const store = openMemoryStore(rootDir);
     store.init();
@@ -390,11 +455,23 @@ describe("doctor service", () => {
     process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
     writeConfig(rootDir, {
       sources: {
-        git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
-        codex: { enabled: true, roots: [codexSessions, codexArchived], includeDefaultRoots: false, projectOnly: true },
-        claude: { enabled: true, roots: [claudeProjects], projectOnly: true }
+        git: { enabled: false, maxCommits: 50, maxDiffChars: 12000 },
+        codex: { enabled: true, projectOnly: true },
+        claude: { enabled: true, projectOnly: true }
       }
     });
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.local.json"),
+      JSON.stringify({
+        sources: {
+          git: { repoPath: ".", hookInstall: false },
+          codex: { roots: [codexSessions, codexArchived], includeDefaultRoots: false },
+          claude: { roots: [claudeProjects] }
+        },
+        extractor: { provider: "openai-compatible", baseUrl: "https://example.test/v1", model: "gpt-test", apiKeyEnv: "TEST_CODE_BUTLER_API_KEY" },
+        investigator: { enabled: true, mode: "native-rlm", provider: "openai-compatible", baseUrl: "https://example.test/v1", model: "gpt-test", apiKeyEnv: "TEST_CODE_BUTLER_API_KEY" }
+      })
+    );
     writeFreshSummary(rootDir);
     const store = openMemoryStore(rootDir);
     store.init();

@@ -6,7 +6,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFile
 import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { ensureGlobalConfig, ensureProjectConfig, loadProjectConfig } from "./config.js";
+import { ensureGlobalConfig, ensureProjectConfig, loadProjectConfig, migrateSharedConfigToLocal } from "./config.js";
 import { runEmbeddingsCommand } from "./cli/commands/embeddings.js";
 import { runMemoryCommand } from "./cli/commands/memory.js";
 import { runPrivacyCommand } from "./cli/commands/privacy.js";
@@ -20,6 +20,7 @@ import { auditMemoryConflicts } from "./memory/conflicts.js";
 import { updateMemoryStatus } from "./memory/lifecycle-service.js";
 import { auditMemoryQuality } from "./memory/quality.js";
 import { rememberProjectMemory } from "./memory/remember.js";
+import { inspectArtifactMaintenance, runArtifactMaintenance, type ArtifactMaintenanceResult } from "./maintenance/artifacts.js";
 import {
   getProjectSummaryStatus,
   createFallbackProjectSummaryGenerator,
@@ -124,6 +125,10 @@ async function runCliOperation(args: string[], options: CliOptions): Promise<num
 
     if (command === "config") {
       return runConfig(rest, cwd, stdout);
+    }
+
+    if (command === "maintenance") {
+      return runMaintenance(rest, cwd, stdout, { now: options.now });
     }
 
     if (command === "ingest") {
@@ -253,7 +258,7 @@ async function runMcp(
 }
 
 async function runConfig(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
-  const [subcommand, nested] = args;
+  const [subcommand, nested, ...rest] = args;
   if (subcommand === "init" && nested === undefined) {
     const configPath = ensureProjectConfig(cwd);
     stdout(`Initialized project config at ${configPath}`);
@@ -264,7 +269,69 @@ async function runConfig(args: string[], cwd: string, stdout: (line: string) => 
     stdout(`Initialized global config at ${configPath}`);
     return 0;
   }
-  throw new Error("Usage: code-butler config <init|global init>");
+  if (subcommand === "migrate-local") {
+    const json = args.includes("--json");
+    const dryRun = args.includes("--dry-run");
+    const apply = args.includes("--apply");
+    const unknown = args.find((arg) => arg.startsWith("--") && arg !== "--json" && arg !== "--dry-run" && arg !== "--apply");
+    if (unknown) throw new Error(`Unknown config migrate-local option: ${unknown}`);
+    if (nested && !nested.startsWith("--")) throw new Error("Usage: code-butler config migrate-local [--dry-run|--apply] [--json]");
+    if (rest.some((arg) => !arg.startsWith("--"))) throw new Error("Usage: code-butler config migrate-local [--dry-run|--apply] [--json]");
+    if (dryRun === apply) throw new Error("Usage: code-butler config migrate-local [--dry-run|--apply] [--json]");
+    const result = migrateSharedConfigToLocal(cwd, { apply });
+    if (json) stdout(JSON.stringify(result, null, 2));
+    else printConfigMigration(result, cwd, stdout);
+    return 0;
+  }
+  throw new Error("Usage: code-butler config <init|global init|migrate-local>");
+}
+
+function printConfigMigration(
+  result: ReturnType<typeof migrateSharedConfigToLocal>,
+  cwd: string,
+  stdout: (line: string) => void
+): void {
+  stdout(result.dryRun ? "Config local migration dry run" : "Config local migration applied");
+  stdout(`shared=${relativeSummaryPath(cwd, result.sharedConfigPath)}`);
+  stdout(`local=${relativeSummaryPath(cwd, result.localConfigPath)}`);
+  stdout(`moved=${result.moved.length} unchanged=${result.unchanged.length} conflicts=${result.conflicts.length}`);
+  for (const path of result.moved) stdout(`  move ${path}`);
+  for (const path of result.unchanged) stdout(`  keep-local ${path}`);
+  for (const path of result.conflicts) stdout(`  conflict ${path}`);
+}
+
+function runMaintenance(
+  args: string[],
+  cwd: string,
+  stdout: (line: string) => void,
+  options: Pick<CliOptions, "now"> = {}
+): number {
+  const [subcommand, ...rest] = args;
+  if (!subcommand || !["status", "prune"].includes(subcommand)) {
+    throw new Error("Usage: code-butler maintenance <status|prune> [--dry-run|--apply] [--json]");
+  }
+  const json = rest.includes("--json");
+  const dryRun = rest.includes("--dry-run");
+  const apply = rest.includes("--apply");
+  const unknown = rest.find((arg) => arg !== "--json" && arg !== "--dry-run" && arg !== "--apply");
+  if (unknown) throw new Error(`Unknown maintenance option: ${unknown}`);
+  if (subcommand === "status" && (dryRun || apply)) throw new Error("Usage: code-butler maintenance status [--json]");
+  if (subcommand === "prune" && dryRun === apply) throw new Error("Usage: code-butler maintenance prune <--dry-run|--apply> [--json]");
+  const config = loadProjectConfig(cwd);
+  const now = options.now?.() ?? new Date();
+  const result = subcommand === "status"
+    ? inspectArtifactMaintenance(cwd, config.retention!.artifacts, { now })
+    : runArtifactMaintenance(cwd, config.retention!.artifacts, { apply, now });
+  if (json) stdout(JSON.stringify(result, null, 2));
+  else printMaintenanceResult(result, stdout);
+  return 0;
+}
+
+function printMaintenanceResult(result: ArtifactMaintenanceResult, stdout: (line: string) => void): void {
+  stdout(result.dryRun ? "Maintenance status" : "Maintenance applied");
+  stdout(`scanned=${result.scanned} planned=${result.items.length} removed=${result.removed} rotated=${result.rotated}`);
+  for (const item of result.items) stdout(`  ${item.action} ${item.path} (${item.reason})`);
+  for (const warning of result.warnings) stdout(`warning=${warning}`);
 }
 
 async function runIngest(args: string[], cwd: string, stdout: (line: string) => void): Promise<number> {
@@ -471,6 +538,7 @@ async function runWatch(
 
   const source = parseSyncSourceFlag(args);
   const intervalSeconds = parseNumberFlag(args, "--interval") ?? 30;
+  runArtifactMaintenanceQuietly(cwd, stdout, options.now);
   await syncQuietly(cwd, stdout);
   const stopCloud = startCloudScheduler(cwd, stdout);
   let running = false;
@@ -488,6 +556,7 @@ async function runWatch(
     if (running) return;
     running = true;
     try {
+      runArtifactMaintenanceQuietly(cwd, stdout, options.now);
       let projectBriefExists = false;
       await projectOperation(cwd, async () => {
         const store = openConfiguredMemoryStore(cwd);
@@ -545,6 +614,25 @@ async function runWatch(
       process.removeListener("SIGTERM", handleProcessSignal);
     }
     close();
+  }
+}
+
+function runArtifactMaintenanceQuietly(
+  cwd: string,
+  stdout: (line: string) => void,
+  now: (() => Date) | undefined
+): void {
+  try {
+    const config = loadProjectConfig(cwd);
+    const result = runArtifactMaintenance(cwd, config.retention!.artifacts, {
+      apply: true,
+      now: now?.() ?? new Date()
+    });
+    if (result.rotated > 0 || result.removed > 0) {
+      stdout(`Pruned Code Butler artifacts (removed=${result.removed}, rotated=${result.rotated})`);
+    }
+  } catch (error) {
+    stdout(`Artifact cleanup skipped: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -729,7 +817,7 @@ function printDoctorReport(report: DoctorReport, stdout: (line: string) => void)
   stdout(`Generated: ${report.generatedAt}`);
   stdout(`Overall: ${report.status}`);
 
-  const categories: DoctorCheckCategory[] = ["project", "storage", "sources", "sync", "summary", "extractor", "retrieval", "memory"];
+  const categories: DoctorCheckCategory[] = ["project", "storage", "sources", "sync", "summary", "extractor", "retrieval", "memory", "maintenance"];
   for (const category of categories) {
     const checks = report.checks.filter((check) => check.category === category);
     if (checks.length === 0) continue;
@@ -784,6 +872,7 @@ function usage(): string {
     "  code-butler init",
     "  code-butler config init",
     "  code-butler config global init",
+    "  code-butler config migrate-local <--dry-run|--apply> [--json]",
     "  code-butler cloud connect --server <https-origin>",
     "  code-butler cloud projects",
     "  code-butler cloud enable [--project <uuid>] [--name <name>]",
@@ -806,6 +895,8 @@ function usage(): string {
     "  code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]",
     "  code-butler memory conflicts [--fix] [--json]",
     "  code-butler doctor [--json] [--strict]",
+    "  code-butler maintenance status [--json]",
+    "  code-butler maintenance prune <--dry-run|--apply> [--json]",
     "  code-butler embeddings build [--json]",
     "  code-butler embeddings status [--json]",
     "  code-butler privacy audit [--json]",

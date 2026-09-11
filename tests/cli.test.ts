@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -38,6 +38,7 @@ describe("CLI", () => {
       "  code-butler init",
       "  code-butler config init",
       "  code-butler config global init",
+      "  code-butler config migrate-local <--dry-run|--apply> [--json]",
       "  code-butler cloud connect --server <https-origin>",
       "  code-butler cloud projects",
       "  code-butler cloud enable [--project <uuid>] [--name <name>]",
@@ -60,6 +61,8 @@ describe("CLI", () => {
     "  code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]",
       "  code-butler memory conflicts [--fix] [--json]",
       "  code-butler doctor [--json] [--strict]",
+      "  code-butler maintenance status [--json]",
+      "  code-butler maintenance prune <--dry-run|--apply> [--json]",
       "  code-butler embeddings build [--json]",
       "  code-butler embeddings status [--json]",
       "  code-butler privacy audit [--json]",
@@ -167,9 +170,23 @@ describe("CLI", () => {
       JSON.stringify(
         {
           sources: {
-            git: { enabled: false, repoPath: ".", hookInstall: false, maxCommits: 50, maxDiffChars: 12000 },
-            codex: { enabled: false, roots: [], includeDefaultRoots: false, projectOnly: true },
-            claude: { enabled: false, roots: [], projectOnly: true }
+            git: { enabled: false, maxCommits: 50, maxDiffChars: 12000 },
+            codex: { enabled: false, projectOnly: true },
+            claude: { enabled: false, projectOnly: true }
+          }
+        },
+        null,
+        2
+      )
+    );
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.local.json"),
+      JSON.stringify(
+        {
+          sources: {
+            git: { repoPath: ".", hookInstall: false },
+            codex: { roots: [], includeDefaultRoots: false },
+            claude: { roots: [] }
           },
           extractor: {
             provider: "openai-compatible",
@@ -489,6 +506,79 @@ describe("CLI", () => {
       }
     });
     expect(output.join("\n")).toContain(`Initialized global config at ${join(globalHome, "config.json")}`);
+  });
+
+  it("migrates local-only shared config through the CLI", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const output: string[] = [];
+    await expect(runCli(["config", "init"], { cwd: rootDir, stdout: () => undefined })).resolves.toBe(0);
+    const configPath = join(rootDir, ".code-butler", "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        sources: {
+          git: { enabled: true, repoPath: ".", hookInstall: true, maxCommits: 12 },
+          codex: { roots: ["./codex"], includeDefaultRoots: false, projectOnly: true }
+        },
+        embeddings: { enabled: true, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "local", batchSize: 2 }
+      }, null, 2)
+    );
+
+    await expect(runCli(["config", "migrate-local", "--dry-run", "--json"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
+    expect(JSON.parse(output.join("\n")).moved).toContain("sources.git.repoPath");
+    expect(existsSync(join(rootDir, ".code-butler", "config.local.json"))).toBe(false);
+
+    output.length = 0;
+    await expect(runCli(["config", "migrate-local", "--apply", "--json"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
+    const result = JSON.parse(output.join("\n"));
+    const shared = JSON.parse(readFileSync(configPath, "utf8"));
+    const local = JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.local.json"), "utf8"));
+    expect(result.moved).toContain("embeddings");
+    expect(shared.sources.git).toEqual({ enabled: true, maxCommits: 12 });
+    expect(shared.sources.codex).toEqual({ projectOnly: true });
+    expect(shared.embeddings).toBeUndefined();
+    expect(local.sources.git.repoPath).toBe(".");
+    expect(local.sources.git.hookInstall).toBe(true);
+    expect(local.sources.codex.roots).toEqual(["./codex"]);
+    expect(local.embeddings.model).toBe("local");
+  });
+
+  it("reports and applies artifact maintenance through the CLI", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    await expect(runCli(["config", "init"], { cwd: rootDir, stdout: () => undefined })).resolves.toBe(0);
+    const now = new Date("2026-06-20T00:00:00.000Z");
+    const dataDir = join(rootDir, ".code-butler");
+    mkdirSync(join(dataDir, "logs"), { recursive: true });
+    mkdirSync(join(dataDir, "backups", "project-summary"), { recursive: true });
+    writeFileSync(join(dataDir, "logs", "watch.out.log"), "x".repeat(5 * 1024 * 1024 + 1));
+    for (let index = 0; index < 6; index += 1) {
+      const backup = join(dataDir, "backups", "project-summary", `project-summary-2026-06-1${index}T00-00-00-000Z.md`);
+      writeFileSync(backup, `backup ${index}`);
+      utimesSync(backup, new Date(`2026-06-1${index}T00:00:00.000Z`), new Date(`2026-06-1${index}T00:00:00.000Z`));
+    }
+    for (let index = 0; index < 6; index += 1) {
+      const recovery = join(dataDir, `memory.sqlite.recovery-2026-06-0${index + 1}T00-00-00-000Z-test.sqlite`);
+      writeFileSync(recovery, `recovery ${index}`);
+      utimesSync(recovery, new Date(`2026-06-0${index + 1}T00:00:00.000Z`), new Date(`2026-06-0${index + 1}T00:00:00.000Z`));
+    }
+    writeFileSync(join(dataDir, `.cloud-owner-test`), JSON.stringify({ pid: 99999999 }));
+
+    const dryRunOutput: string[] = [];
+    await expect(runCli(["maintenance", "prune", "--dry-run", "--json"], { cwd: rootDir, stdout: (line) => dryRunOutput.push(line), now: () => now })).resolves.toBe(0);
+    const dryRun = JSON.parse(dryRunOutput.join("\n"));
+    expect(dryRun.items.some((item: { action: string; path: string }) => item.action === "rotate" && item.path.endsWith("watch.out.log"))).toBe(true);
+    expect(existsSync(join(dataDir, "logs", "watch.out.log"))).toBe(true);
+
+    const applyOutput: string[] = [];
+    await expect(runCli(["maintenance", "prune", "--apply", "--json"], { cwd: rootDir, stdout: (line) => applyOutput.push(line), now: () => now })).resolves.toBe(0);
+    const applied = JSON.parse(applyOutput.join("\n"));
+    expect(applied.rotated).toBe(1);
+    expect(existsSync(join(dataDir, "logs", "watch.out.log"))).toBe(false);
+    expect(readdirSync(join(dataDir, "backups", "project-summary")).filter((name) => name.endsWith(".md"))).toHaveLength(5);
+    expect(readdirSync(dataDir).filter((name) => name.startsWith("memory.sqlite.recovery-"))).toHaveLength(5);
+    expect(existsSync(join(dataDir, ".cloud-owner-test"))).toBe(false);
   });
 
   it("sync does not bootstrap an uninitialized project", async () => {

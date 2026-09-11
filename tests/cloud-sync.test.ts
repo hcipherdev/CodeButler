@@ -176,9 +176,10 @@ it("snapshots retain memories and origins while excluding local settings, secret
   vi.stubEnv("CODE_BUTLER_HOME", temp()); const a = temp(); initialize(a);
   const saved = remember(a, "Use SQLite to preserve offline project history.");
   writeFileSync(join(a, ".code-butler", ".env"), "SECRET=private");
+  writeFileSync(join(a, ".code-butler", "config.local.json"), JSON.stringify({ sources: { git: { repoPath: a } } }));
   mkdirSync(join(a, ".code-butler", "logs")); writeFileSync(join(a, ".code-butler", "logs", "secret.log"), "private");
   const first = await captureSnapshot(a, randomUUID(), 0);
-  expect(snapshotPaths(first.snapshot).some(path => path === ".env" || path.startsWith("logs/"))).toBe(false);
+  expect(snapshotPaths(first.snapshot).some(path => path === ".env" || path === "config.local.json" || path.startsWith("logs/"))).toBe(false);
   expect(readdirSync(stateDirectory(a)).filter(name => name.startsWith("capture-"))).toEqual([]);
   expect(portableConfig({ extractor: { baseUrl: "http://secret" }, sources: { git: { repoPath: a, enabled: true } } })).toEqual({ sources: { git: { enabled: true } } });
   expect(decodeSnapshot(first.bytes).fingerprint).toBe(first.snapshot.fingerprint);
