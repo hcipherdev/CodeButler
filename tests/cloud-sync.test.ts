@@ -176,6 +176,14 @@ it("includes cloud error response details", async () => {
 it("snapshots retain memories and origins while excluding local settings, secrets, logs and journals", async () => {
   vi.stubEnv("CODE_BUTLER_HOME", temp()); const a = temp(); initialize(a);
   const saved = remember(a, "Use SQLite to preserve offline project history.");
+  const sharedConfig = [
+    "{",
+    "  \"sources\": { \"git\": { \"enabled\": true, \"maxCommits\": 12 } },",
+    "  \"sync\": { \"autoSyncOnServerStart\": false }",
+    "}",
+    ""
+  ].join("\n");
+  writeFileSync(join(a, ".code-butler", "config.json"), sharedConfig);
   writeFileSync(join(a, ".code-butler", ".env"), "SECRET=private");
   writeFileSync(join(a, ".code-butler", "config.local.json"), JSON.stringify({ sources: { git: { repoPath: a } } }));
   mkdirSync(join(a, ".code-butler", "logs")); writeFileSync(join(a, ".code-butler", "logs", "secret.log"), "private");
@@ -183,10 +191,22 @@ it("snapshots retain memories and origins while excluding local settings, secret
   expect(snapshotPaths(first.snapshot).some(path => path === ".env" || path === "config.local.json" || path.startsWith("logs/"))).toBe(false);
   expect(readdirSync(stateDirectory(a)).filter(name => name.startsWith("capture-"))).toEqual([]);
   expect(portableConfig({ extractor: { baseUrl: "http://secret" }, sources: { git: { repoPath: a, enabled: true } } })).toEqual({ sources: { git: { enabled: true } } });
+  expect(materializeSnapshot(first.snapshot, bundleResolver(first.blocks)).files.find(file => file.path === "config.json")!.data.toString()).toBe(sharedConfig);
   expect(decodeSnapshot(first.bytes).fingerprint).toBe(first.snapshot.fingerprint);
   const second = await captureSnapshot(a, first.snapshot.projectId, 0); expect(second.snapshot.fingerprint).toBe(first.snapshot.fingerprint);
   const b = temp(); initialize(b); applyCapture(b, first);
+  expect(readFileSync(join(b, ".code-butler", "config.json"), "utf8")).toBe(sharedConfig);
   const s = openConfiguredMemoryStore(b); try { s.init(); expect(s.readMemory(saved.id)!.origin).toEqual(saved.origin); } finally { s.close(); }
+});
+
+it("rejects nonportable shared config instead of rewriting it", async () => {
+  vi.stubEnv("CODE_BUTLER_HOME", temp()); const root = temp(); initialize(root);
+  writeFileSync(
+    join(root, ".code-butler", "config.json"),
+    JSON.stringify({ sources: { git: { enabled: true, repoPath: root } } })
+  );
+
+  await expect(captureSnapshot(root, randomUUID(), 0)).rejects.toThrow("Snapshot contains nonportable configuration");
 });
 it("round-trips two devices, does not echo pulls, and preserves conflicting edits", async () => {
   const { a, b } = await fixture(); const saved = remember(a, "Keep storage local for offline usage.");
@@ -335,15 +355,16 @@ it("keeps remote snapshots through grace, then removes them, and enforces the pr
   expect(() => remember(a, "Local memory remains writable after cloud access expires.")).not.toThrow();
 });
 
-it("preserves receiving-device cursors, endpoints, roots, and its own working context", async () => {
+it("preserves receiving-device cursors, local config, and its own working context", async () => {
   vi.stubEnv("CODE_BUTLER_HOME", temp()); const a = temp(), b = temp(); initialize(a); initialize(b);
   const source = openConfiguredMemoryStore(a);
   const expiresAt = new Date(Date.now() + 3600000).toISOString();
   try { source.init(); source.upsertTemporaryMemory({ title: "Sender task", summary: "Finish portability tests", kind: "task_state", expiresAt }); } finally { source.close(); }
-  const path = join(b, ".code-butler", "config.json"); const localConfig = JSON.parse(readFileSync(path, "utf8"));
+  const localPath = join(b, ".code-butler", "config.local.json");
+  const localConfig = JSON.parse(readFileSync(localPath, "utf8"));
   localConfig.extractor = { provider: "openai-compatible", baseUrl: "http://localhost:8080", model: "local", apiKeyEnv: "LOCAL_KEY" };
   localConfig.sources.git.repoPath = b; localConfig.sources.codex.roots = ["C:/local/sessions"];
-  writeFileSync(path, JSON.stringify(localConfig));
+  writeFileSync(localPath, JSON.stringify(localConfig));
   const localExpiresAt = new Date(Date.now() + 7200000).toISOString();
   const target = openConfiguredMemoryStore(b);
   try {
@@ -352,7 +373,7 @@ it("preserves receiving-device cursors, endpoints, roots, and its own working co
     target.upsertTemporaryMemory({ title: "Receiver task", summary: "Keep local working context", kind: "task_state", expiresAt: localExpiresAt });
   } finally { target.close(); }
   const snapshot = await captureSnapshot(a, randomUUID(), 0); applyCapture(b, snapshot);
-  const restoredConfig = JSON.parse(readFileSync(path, "utf8")); expect(restoredConfig.extractor).toEqual(localConfig.extractor); expect(restoredConfig.sources.codex.roots).toEqual(["C:/local/sessions"]);
+  const restoredLocalConfig = JSON.parse(readFileSync(localPath, "utf8")); expect(restoredLocalConfig.extractor).toEqual(localConfig.extractor); expect(restoredLocalConfig.sources.codex.roots).toEqual(["C:/local/sessions"]);
   const restored = openConfiguredMemoryStore(b);
   try {
     restored.init();

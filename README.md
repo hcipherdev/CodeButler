@@ -126,8 +126,9 @@ code-butler init
 ```
 
 `init` is the explicit opt-in setup step and the best default for real
-projects. It creates project-local memory, writes
-`.code-butler/project-summary.md`, and backs up existing
+projects. It creates project-local memory and config files, including the
+ignored `.code-butler/config.local.json` prefilled with this machine's source
+paths. It also writes `.code-butler/project-summary.md` and backs up existing
 `AGENTS.md` / `CLAUDE.md` beside the originals as
 `*.code-butler-backup-<timestamp>` before replacing them with short Butler
 bootstrap instructions. It also installs and starts the per-project background

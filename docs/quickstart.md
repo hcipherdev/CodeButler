@@ -21,7 +21,7 @@ Run `init` in each repository where you want the full Code Butler workflow:
 code-butler init
 ```
 
-`init` creates project-local memory, writes `.code-butler/project-summary.md`, installs short agent bootstrap instructions, and tries to start the per-project background watcher.
+`init` creates project-local memory and config files, including an ignored `.code-butler/config.local.json` prefilled with this machine's source paths. It also writes `.code-butler/project-summary.md`, installs short agent bootstrap instructions, and tries to start the per-project background watcher.
 
 ## Sync Memory
 
@@ -56,7 +56,7 @@ Merge the shared policy into `.code-butler/config.json`:
 }
 ```
 
-Keep the machine-specific endpoint in the ignored `.code-butler/config.local.json`:
+Put the machine-specific endpoint in the ignored `.code-butler/config.local.json`:
 
 ```json
 {

@@ -91,6 +91,7 @@ export function ensureProjectConfig(rootDir: string): string {
   mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
   ensureProjectGitignore(rootDir);
   ensureProjectEnvExample(rootDir);
+  ensureProjectLocalConfig(rootDir);
   ensureProjectConfigExamples(rootDir);
   if (existsSync(configPath)) return configPath;
   writeFileSync(configPath, JSON.stringify(defaultConfigFile(), null, 2));
@@ -180,14 +181,19 @@ export function migrateSharedConfigToLocal(rootDir: string, options: { apply: bo
 
   const nextShared = cloneConfig(shared);
   const nextLocal = cloneConfig(local);
+  const generatedLocalDefaults = defaultLocalConfigFile();
   for (const path of paths) {
     const value = getNested(shared, path);
     const existing = getNested(local, path);
+    const generatedDefault = getNested(generatedLocalDefaults, path);
     if (existing === undefined) {
       result.moved.push(path);
       setNested(nextLocal, path, value);
     } else if (sameJson(existing, value)) {
       result.unchanged.push(path);
+    } else if (generatedDefault !== undefined && sameJson(existing, generatedDefault)) {
+      result.moved.push(path);
+      setNested(nextLocal, path, value);
     } else {
       result.conflicts.push(path);
     }
@@ -1009,6 +1015,31 @@ function ensureProjectEnvExample(rootDir: string): void {
       ""
     ].join("\n")
   );
+}
+
+function ensureProjectLocalConfig(rootDir: string): void {
+  const localConfigPath = projectLocalConfigPath(rootDir);
+  if (existsSync(localConfigPath)) return;
+  writeFileSync(localConfigPath, JSON.stringify(defaultLocalConfigFile(), null, 2) + "\n");
+}
+
+function defaultLocalConfigFile(): ProjectConfigFile {
+  const home = homedir();
+  return {
+    sources: {
+      git: {
+        repoPath: ".",
+        hookInstall: false
+      },
+      codex: {
+        roots: defaultCodexRoots(home),
+        includeDefaultRoots: true
+      },
+      claude: {
+        roots: [join(home, ".claude", "projects")]
+      }
+    }
+  };
 }
 
 function ensureGlobalEnvExample(globalDir: string): void {

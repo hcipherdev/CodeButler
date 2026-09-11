@@ -175,11 +175,23 @@ type Config = Record<string, any>;
 export function portableConfig(config: Config): Config {
   return portableProjectConfig(config);
 }
-function mergedConfig(remote: Config, local: Config): Config {
-  const value = { ...local, ...portableConfig(remote) };
-  value.sources = {};
-  for (const key of ["git", "codex", "claude"]) value.sources[key] = { ...local.sources?.[key], ...remote.sources?.[key] };
-  return value;
+
+function assertPortableConfigBytes(bytes: Buffer): void {
+  const config = JSON.parse(bytes.toString()) as Config;
+  if (!sameJson(config, portableConfig(config))) throw new Error("Snapshot contains nonportable configuration");
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right));
+}
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (!value || typeof value !== "object") return value;
+  const object = value as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(object).sort()) result[key] = canonicalJson(object[key]);
+  return result;
 }
 function quote(name: string): string { return `"${name.replaceAll('"', '""')}"`; }
 
@@ -406,8 +418,8 @@ export async function captureSnapshot(
     const hashes: Array<[string, string]> = [];
     let total = 0;
     for (const path of filesIn(dir)) {
-      let bytes = path === "memory.sqlite" ? readFileSync(temporary) : readFileSync(join(dir, path));
-      if (path === "config.json") bytes = Buffer.from(JSON.stringify(portableConfig(JSON.parse(bytes.toString()))));
+      const bytes = path === "memory.sqlite" ? readFileSync(temporary) : readFileSync(join(dir, path));
+      if (path === "config.json") assertPortableConfigBytes(bytes);
       total += bytes.length;
       if (total > MAX_EXPANDED) throw new Error("Snapshot exceeds expanded limit");
       const core = path === "memory.sqlite";
@@ -516,9 +528,7 @@ export function materializeSnapshot(
     data: joinBlocks(segment, resolve)
   }));
   const config = files.find(file => file.path === "config.json");
-  if (config && JSON.stringify(portableConfig(JSON.parse(config.data.toString()))) !== config.data.toString()) {
-    throw new Error("Snapshot contains nonportable configuration");
-  }
+  if (config) assertPortableConfigBytes(config.data);
   const own = deviceId ?? installationDeviceId();
   const partitions = partitionSegments(manifest)
     // This device's live rows are authoritative for its own layers, so a published
@@ -593,7 +603,7 @@ export function applySnapshot(root: string, materialized: MaterializedSnapshot):
       for (const path of existing) rmSync(join(dir, path), { force: true });
       for (const file of materialized.files) {
         mkdirSync(join(dir, file.path, ".."), { recursive: true });
-        const data = file.path === "memory.sqlite" ? readFileSync(staged) : file.path === "config.json" ? Buffer.from(JSON.stringify(mergedConfig(JSON.parse(file.data.toString()), local))) : file.data;
+        const data = file.path === "memory.sqlite" ? readFileSync(staged) : file.data;
         atomicWrite(join(dir, file.path), data);
       }
       // A snapshot without config still preserves local configuration.

@@ -106,9 +106,10 @@ Shared `.code-butler/config.json` carries project policy only: retention, privac
 redaction rules, deterministic settings, promotion, retrieval mode, sync sharing
 policy, and per-source `enabled`, `projectOnly`, and max limits. Machine-specific
 settings belong in the ignored `.code-butler/config.local.json`, which uses the same
-schema and is layered last: defaults and global provider profiles, then `config.json`,
-then `config.local.json`. Relative paths in either file resolve against the project
-root.
+schema and is created by `code-butler init` / `code-butler config init` with the
+current machine's project and agent-log paths. It is layered last: defaults and
+global provider profiles, then `config.json`, then
+`config.local.json`. Relative paths in either file resolve against the project root.
 
 Local-only keys are `sources.git.repoPath`, `sources.git.hookInstall`,
 `sources.*.roots`, `sources.codex.includeDefaultRoots`, and the `embeddings`,

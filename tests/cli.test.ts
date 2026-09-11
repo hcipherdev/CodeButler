@@ -160,6 +160,20 @@ describe("CLI", () => {
         2
       )
     );
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.local.json"),
+      JSON.stringify(
+        {
+          sources: {
+            git: { repoPath: ".", hookInstall: false },
+            codex: { roots: [], includeDefaultRoots: false },
+            claude: { roots: ["./claude/projects"] }
+          }
+        },
+        null,
+        2
+      )
+    );
     return { rootDir, claudeDir };
   }
 
@@ -526,8 +540,8 @@ describe("CLI", () => {
     );
 
     await expect(runCli(["config", "migrate-local", "--dry-run", "--json"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
-    expect(JSON.parse(output.join("\n")).moved).toContain("sources.git.repoPath");
-    expect(existsSync(join(rootDir, ".code-butler", "config.local.json"))).toBe(false);
+    expect(JSON.parse(output.join("\n")).moved).toContain("sources.git.hookInstall");
+    expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.local.json"), "utf8")).sources.git.hookInstall).toBe(false);
 
     output.length = 0;
     await expect(runCli(["config", "migrate-local", "--apply", "--json"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
