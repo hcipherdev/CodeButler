@@ -15,6 +15,7 @@ import {
   bundleResolver,
   captureSnapshot,
   coreSegment,
+  databaseFingerprint,
   decodeSnapshot,
   materializeSnapshot,
   portableConfig,
@@ -204,6 +205,32 @@ it("round-trips two devices, does not echo pulls, and preserves conflicting edit
   expect(binding(b)!.revision).toBe(cloudRevision + 1);
   expect(existsSync(join(stateDirectory(b), "conflict-local.gz"))).toBe(true);
 });
+
+it("fingerprints full SQLite text bytes when evidence contains embedded NULs", () => {
+  vi.stubEnv("CODE_BUTLER_HOME", temp()); const a = temp(); initialize(a);
+  const store = openConfiguredMemoryStore(a);
+  try {
+    store.init();
+    store.db.prepare(
+      `insert into sources(id,type,title,origin,raw_content,metadata_json,created_at)
+       values('nul-source','conversation','NUL source','test',?,'{}','2026-09-11T00:00:00.000Z')`
+    ).run("before\0after-a");
+    store.db.prepare(
+      `insert into chunks(id,source_id,chunk_index,text,metadata_json)
+       values('nul-source:chunk:0','nul-source',0,?,'{}')`
+    ).run("chunk\0after-a");
+  } finally { store.close(); }
+  const first = databaseFingerprint(join(a, ".code-butler", "memory.sqlite"));
+  const db = new DatabaseSync(join(a, ".code-butler", "memory.sqlite"));
+  try {
+    db.prepare("update sources set raw_content=? where id='nul-source'").run("before\0after-b");
+    db.prepare("update chunks set text=? where id='nul-source:chunk:0'").run("chunk\0after-b");
+    expect(db.prepare("select length(raw_content) as chars, length(cast(raw_content as blob)) as bytes, instr(raw_content, char(0)) as nul from sources where id='nul-source'").get())
+      .toEqual({ chars: 6, bytes: 14, nul: 7 });
+  } finally { db.close(); }
+  expect(databaseFingerprint(join(a, ".code-butler", "memory.sqlite"))).not.toBe(first);
+});
+
 it("fast-forwards same-checkout cloud revisions instead of creating a conflict", async () => {
   const { service, access, a } = await fixture();
   remember(a, "Keep local MCP and watcher processes attached to one checkout identity.");
