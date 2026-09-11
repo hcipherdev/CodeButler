@@ -18,14 +18,26 @@ export interface ProjectMemoryServer {
   store: MemoryStore;
   cloudManaged?: boolean;
   stopCloud?: () => void;
+  /** Present only when the caller asked to defer startup sync; see startServer. */
+  startupSync?: () => Promise<void>;
 }
 
 export interface ProjectMemoryServerOptions {
   rootDir?: string;
   startupMetadata?: ProjectStartupMetadata;
+  /**
+   * Return before the startup sync runs, handing it back as `startupSync`.
+   * A stdio client closes the pipe if `initialize` goes unanswered past its
+   * timeout, and startup sync is long synchronous SQLite work, so the transport
+   * has to be connected and the handshake answered before it begins.
+   */
+  deferStartupSync?: boolean;
 }
 
 class RecoverableProjectMemoryShutdownError extends Error {}
+
+/** Fallback delay for clients that connect but never send `initialized`. */
+const STARTUP_SYNC_FALLBACK_MS = 5_000;
 
 export async function closeProjectMemoryServer(projectServer: ProjectMemoryServer): Promise<void> {
   try {
@@ -60,13 +72,24 @@ export async function createProjectMemoryServer(
     databaseCreated: !existsSync(join(rootDir, ".code-butler", "memory.sqlite"))
   };
   if (binding(rootDir)?.enabled) {
-    await syncQuietly(rootDir);
+    const runCloudStartupSync = async (): Promise<void> => {
+      await syncQuietly(rootDir);
+      await projectOperation(rootDir, async () => {
+        const bootstrap = openConfiguredMemoryStore(rootDir);
+        try {
+          bootstrap.init();
+          const config = loadProjectConfig(rootDir);
+          if (config.sync.autoSyncOnServerStart) await syncProjectMemory(bootstrap, config);
+        } finally { bootstrap.close(); }
+      });
+    };
+    if (!options.deferStartupSync) await runCloudStartupSync();
+    // Handlers open their own store per call, so this handle only has to exist
+    // and carry a current schema; opening and closing it takes no network.
     const store = await projectOperation(rootDir, async () => {
       const bootstrap = openConfiguredMemoryStore(rootDir);
       try {
         bootstrap.init();
-        const config = loadProjectConfig(rootDir);
-        if (config.sync.autoSyncOnServerStart) await syncProjectMemory(bootstrap, config);
         return bootstrap;
       } finally { bootstrap.close(); }
     });
@@ -85,25 +108,61 @@ export async function createProjectMemoryServer(
       }
     });
     registerProjectMemoryHandlers(server, handlers);
-    return { server, store, cloudManaged: true, stopCloud: startCloudScheduler(rootDir) };
+    return {
+      server,
+      store,
+      cloudManaged: true,
+      stopCloud: startCloudScheduler(rootDir),
+      ...(options.deferStartupSync ? { startupSync: runCloudStartupSync } : {})
+    };
   }
   const store = openConfiguredMemoryStore(rootDir);
   store.init();
   const config = loadProjectConfig(rootDir);
-  if (config.sync.autoSyncOnServerStart) {
-    await syncProjectMemory(store, config);
-  }
+  const runStartupSync = async (): Promise<void> => {
+    if (config.sync.autoSyncOnServerStart) await syncProjectMemory(store, config);
+  };
+  if (!options.deferStartupSync) await runStartupSync();
   const server = new McpServer({
     name: "project-memory",
     version: "0.1.0"
   });
   registerProjectMemoryTools(server, store, { rootDir, startupMetadata });
-  return { server, store };
+  return {
+    server,
+    store,
+    ...(options.deferStartupSync ? { startupSync: runStartupSync } : {})
+  };
 }
 
 export async function startServer(options: ProjectMemoryServerOptions = {}): Promise<ProjectMemoryServer> {
-  const projectServer = await createProjectMemoryServer(options);
+  const projectServer = await createProjectMemoryServer({ ...options, deferStartupSync: true });
   const transport = new StdioServerTransport();
+  const startupSync = projectServer.startupSync;
+  // Startup sync is long synchronous SQLite work that blocks the event loop, so
+  // it waits for the client handshake. Answering `initialize` first is what stops
+  // the client from timing out, closing the pipe, and leaving this process orphaned.
+  if (startupSync) {
+    let started = false;
+    const runStartupSyncOnce = (): void => {
+      if (started) return;
+      started = true;
+      clearTimeout(fallback);
+      void startupSync().catch((error) => {
+        console.error(
+          "Code Butler startup sync failed; the server keeps serving stored memory: " +
+          (error instanceof Error ? error.message : String(error))
+        );
+      });
+    };
+    // A client that never sends `initialized` must still get its startup sync.
+    const fallback = setTimeout(runStartupSyncOnce, STARTUP_SYNC_FALLBACK_MS);
+    fallback.unref();
+    projectServer.server.server.oninitialized = () => {
+      // Yield so the SDK finishes the handshake before sync blocks the loop.
+      setTimeout(runStartupSyncOnce, 0);
+    };
+  }
   await projectServer.server.connect(transport);
   console.error("Project Memory MCP Server running on stdio");
 

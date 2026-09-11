@@ -31,6 +31,39 @@ Source retention is disabled by default:
 
 Exact source overrides take precedence. `null` retains indefinitely. Preview first with `privacy prune --dry-run`; mutation requires `privacy prune --apply`.
 
+## Layer retention
+
+Durable device- and branch-layer memories have no TTL of their own, so a separate
+retention pass ages them out. It is conservative by default: only a branch layer
+whose branch no longer exists locally is archived, and only after the grace period.
+
+```json
+{
+  "retention": {
+    "layers": {
+      "enabled": true,
+      "graceDays": 30,
+      "branch": { "onDeleted": "archive", "onMerged": "keep", "maxIdleDays": null },
+      "device": { "maxIdleDays": null }
+    }
+  }
+}
+```
+
+Archiving is reversible and destroys nothing: a promoted memory is retracted and can
+be restored with `memory status --status current`, and a candidate is quarantined with
+a `layer_retention_archived` quality reason. `core` memories are never touched, merged
+branches are left to promotion and triage, and an explicit `retain_branch` triage
+review always outranks the policy. Without a readable Git repository every branch
+classifies as unknown and nothing is archived.
+
+The pass runs after automatic promotion on every sync, so knowledge that has earned
+`core` is shared before its branch-local copy expires. Preview it with
+`code-butler memory retention` or `explain_layer_retention`, apply it out of band with
+`code-butler memory retention --apply`, and read what it did with
+`code-butler memory retention --history`. Set `retention.layers.enabled: false` to turn
+it off.
+
 ## Git sharing
 
 Code Butler project state lives under `.code-butler/`. Treat that directory as

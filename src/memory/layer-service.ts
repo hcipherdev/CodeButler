@@ -1,21 +1,22 @@
 import { createHash } from "node:crypto";
 import type { MemoryStore } from "../storage/store.js";
-import type { MemoryScope, OperationActor } from "../types.js";
+import type { OperationActor } from "../types.js";
 import { withTransaction } from "../storage/transactions.js";
-import { sanitizeScope, scopeKey, assessApplicability } from "./scope.js";
+import { sanitizeLayerInput } from "./layer.js";
 import { assertWritableLayer } from "./peer-layer.js";
 
-export interface UpdateMemoryScopeInput {
+export interface UpdateMemoryLayerInput {
   memoryId: string;
   category: "candidate" | "promoted" | "temporary";
-  scope: MemoryScope;
+  layer: string;
   reason: string;
 }
-export function updateMemoryScope(store: MemoryStore, input: UpdateMemoryScopeInput, actor: OperationActor = "mcp") {
-  if (!input.reason.trim()) throw new Error("Scope correction reason is required");
+
+export function updateMemoryLayer(store: MemoryStore, input: UpdateMemoryLayerInput, actor: OperationActor = "mcp") {
+  if (!input.reason.trim()) throw new Error("Layer correction reason is required");
   const table = { candidate: "memory_candidates", promoted: "memories", temporary: "temporary_memories" }[input.category];
   if (!table) throw new Error("Invalid memory category");
-  const scope = sanitizeScope(store.contentPolicy, input.scope);
+  const layer = sanitizeLayerInput(store.contentPolicy, input.layer);
   const id = store.contentPolicy.identifier(input.memoryId);
   const hash = (text: string) => createHash("sha256").update(text).digest("hex");
   return withTransaction(store.db, () => {
@@ -31,13 +32,13 @@ export function updateMemoryScope(store: MemoryStore, input: UpdateMemoryScopeIn
       }
     }
     try {
-      for (const update of updates) store.db.prepare(`update ${update.table} set scope_json = ?, scope_key = ? where id = ?`).run(JSON.stringify(scope), scopeKey(scope), update.id);
+      for (const update of updates) store.db.prepare(`update ${update.table} set layer = ? where id = ?`).run(layer, update.id);
     } catch (error) {
-      if (String(error).includes("UNIQUE constraint")) throw new Error("Scope correction collides with an existing memory; no records changed");
+      if (String(error).includes("UNIQUE constraint")) throw new Error("Layer correction collides with an existing memory; no records changed");
       throw error;
     }
-    const op = store.beginOperation({ operationType: "scope_change", actor, metadata: { memoryIdHash: hash(id), reasonHash: hash(input.reason.trim()), category: input.category === "candidate" ? "candidates" : input.category === "temporary" ? "temporary_memories" : "memories" } });
+    const op = store.beginOperation({ operationType: "layer_change", actor, metadata: { memoryIdHash: hash(id), reasonHash: hash(input.reason.trim()), category: input.category === "candidate" ? "candidates" : input.category === "temporary" ? "temporary_memories" : "memories" } });
     store.completeOperation(op.id);
-    return { memoryId: id, category: input.category, scope, applicability: assessApplicability(scope), updatedMemoryIds: updates.map(x => x.id) };
+    return { memoryId: id, category: input.category, layer, updatedMemoryIds: updates.map(x => x.id) };
   });
 }

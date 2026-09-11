@@ -9,6 +9,7 @@ export interface AnthropicAwsMessageRequest {
   workspaceIdEnv: string;
   regionEnv: string;
   baseUrl?: string | undefined;
+  timeoutMs?: number | undefined;
 }
 
 export interface AnthropicAwsMessageResponse {
@@ -28,6 +29,7 @@ export type AnthropicAwsHttpClient = (
     method: "POST";
     headers: Record<string, string>;
     body: string;
+    timeoutMs?: number | undefined;
   }
 ) => Promise<AnthropicAwsHttpResponse>;
 
@@ -66,7 +68,8 @@ export async function runAnthropicAwsMessage(
       "user-agent": "AnthropicAWS/CodeButler",
       "X-Api-Key": apiKey
     },
-    body
+    body,
+    timeoutMs: request.timeoutMs
   });
 
   if (!response.ok) {
@@ -82,6 +85,7 @@ async function nodeHttpsRequest(
     method: "POST";
     headers: Record<string, string>;
     body: string;
+    timeoutMs?: number | undefined;
   }
 ): Promise<AnthropicAwsHttpResponse> {
   const parsedUrl = new URL(url);
@@ -112,6 +116,9 @@ async function nodeHttpsRequest(
         });
       }
     );
+    req.setTimeout(init.timeoutMs ?? 300000, () => {
+      req.destroy(new Error("AnthropicAWS request timed out"));
+    });
     req.on("error", reject);
     req.end(init.body);
   });

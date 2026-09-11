@@ -1,5 +1,17 @@
 import { withApplicability } from "../memory/scope.js";
-import type { TargetEnvironment } from "../types.js";
+import { matchesLayerFilter } from "../memory/layer.js";
+import { isPeerLayer } from "../memory/peer-layer.js";
+
+function matchesLayerOwner(
+  store: MemoryStore,
+  layer: string | undefined,
+  owner: MemoryLayerOwner | undefined
+): boolean {
+  if (owner === "any") return true;
+  const peer = isPeerLayer(store, layer);
+  return owner === "peer" ? peer : !peer;
+}
+import type { MemoryLayerFilter, MemoryLayerOwner, TargetEnvironment } from "../types.js";
 import { createProviderFingerprint, createProviderKey, createEmbeddingEndpointHash } from "../embeddings/fingerprint.js";
 import { createOpenAICompatibleEmbeddingProvider, isLoopbackEmbeddingEndpoint } from "../embeddings/provider.js";
 import { redactSensitiveText } from "../privacy/redaction.js";
@@ -26,6 +38,8 @@ export interface MemorySearchInput {
   status?: "promoted" | "candidate";
   qualityStatus?: MemoryQualityStatusFilter;
   lifecycleStatus?: MemoryLifecycleStatusFilter;
+  layer?: MemoryLayerFilter;
+  owner?: MemoryLayerOwner;
   limit?: number;
 }
 
@@ -167,7 +181,11 @@ function fuseMemoryResults(
   if (resolvedSemanticResults.length !== vectors.length) throw new Error("Embedding coverage is incomplete");
   const semanticResults = resolvedSemanticResults
     .filter((memory) => input.type === undefined || memory.type === input.type)
-    .filter((memory) => input.qualityStatus === "all" || memory.qualityStatus === (input.qualityStatus ?? "active"));
+    .filter((memory) => input.qualityStatus === "all" || memory.qualityStatus === (input.qualityStatus ?? "active"))
+    // Semantic hits bypass the store's layer clause, so apply it here too — including
+    // the owner dimension, or a peer's row could arrive through the semantic path only.
+    .filter((memory) => matchesLayerFilter(memory.layer, input.layer))
+    .filter((memory) => matchesLayerOwner(store, memory.layer, input.owner));
   const lexicalPromoted = lexical.filter((memory) => memory.kind === "promoted");
   const candidates = lexical.filter((memory) => memory.kind === "candidate");
   const limit = normalizeLimit(input.limit);

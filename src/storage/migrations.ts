@@ -409,6 +409,161 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
       db.exec("create unique index idx_temporary_scope_identity on temporary_memories(base_id, scope_key)");
       rebuildScopedTable(db, "operation_log", sql => sql.replace("'retention_prune', 'recovery'", "'retention_prune', 'recovery', 'scope_change'"));
     }
+  },
+  {
+    version: 13,
+    name: "add memory sync layer",
+    up(db) {
+      // Backfill to 'core' so durable memories keep syncing exactly as before. Never read
+      // the installation identity here: a migration must stay pure and deterministic.
+      for (const table of ["memory_candidates", "memories", "temporary_memories"]) {
+        ensureColumn(db, table, "layer", "text not null default 'core'");
+      }
+      // The layer joins every uniqueness key so the same fact can exist once per layer;
+      // without it a preserved device-layer row collides with an incoming core row on restore.
+      rebuildScopedTable(db, "memory_candidates", sql =>
+        sql.replace(/unique\s*\(\s*dedupe_key\s*,\s*scope_key\s*\)/i, "unique(dedupe_key, scope_key, layer)"));
+      rebuildScopedTable(db, "memories", sql =>
+        sql.replace(
+          /unique\s*\(\s*dedupe_key\s*,\s*evidence_signature\s*,\s*source\s*,\s*scope_key\s*\)/i,
+          "unique(dedupe_key, evidence_signature, source, scope_key, layer)"
+        ));
+      db.exec("drop index if exists idx_temporary_scope_identity");
+      db.exec("create unique index idx_temporary_scope_identity on temporary_memories(base_id, scope_key, layer)");
+      db.exec("create index if not exists idx_memories_layer on memories(layer)");
+      db.exec("create index if not exists idx_memory_candidates_layer on memory_candidates(layer)");
+      db.exec("create index if not exists idx_temporary_memories_layer on temporary_memories(layer)");
+      rebuildScopedTable(db, "operation_log", sql => sql.replace("'scope_change'", "'scope_change', 'layer_change'"));
+    }
+  },
+  {
+    version: 14,
+    name: "add branch memory triage reviews",
+    up(db) {
+      db.exec(`
+        create table if not exists branch_triage_reviews (
+          id text primary key,
+          memory_id text not null,
+          category text not null check (category in ('candidate', 'promoted')),
+          branch text not null,
+          layer text not null,
+          memory_version text not null,
+          action text not null check (action in ('promote_to_core', 'discard', 'retain_branch')),
+          reason text not null,
+          reviewed_at text not null,
+          actor text not null check (actor in ('cli', 'mcp', 'system')),
+          promoted_memory_id text,
+          supersedes_memory_id text,
+          unique (memory_id, category, memory_version)
+        );
+        create index if not exists idx_branch_triage_reviews_memory
+          on branch_triage_reviews(memory_id, category, memory_version);
+        create index if not exists idx_branch_triage_reviews_branch
+          on branch_triage_reviews(branch, reviewed_at desc);
+      `);
+      const operationLog = db.prepare("select sql from sqlite_master where type = 'table' and name = 'operation_log'").get() as { sql: string } | undefined;
+      if (operationLog && !operationLog.sql.includes("'branch_triage'")) {
+        rebuildScopedTable(db, "operation_log", sql => sql.replace("'layer_change'", "'layer_change', 'branch_triage'"));
+      }
+    }
+  },
+  {
+    version: 15,
+    name: "add automatic promotion decisions",
+    up(db) {
+      // Keyed by memory version and policy version so an unchanged deferral is a
+      // no-op, while new evidence or a policy change re-opens the decision.
+      db.exec(`
+        create table if not exists promotion_decisions (
+          id text primary key,
+          memory_id text not null,
+          category text not null check (category in ('candidate', 'promoted')),
+          memory_version text not null,
+          policy_version integer not null,
+          decision text not null check (decision in ('promote', 'converge', 'defer', 'skip')),
+          reason_codes_json text not null,
+          target_layer text,
+          core_memory_id text,
+          decided_at text not null,
+          actor text not null check (actor in ('cli', 'mcp', 'system')),
+          unique (memory_id, category, memory_version, policy_version)
+        );
+        create index if not exists idx_promotion_decisions_memory
+          on promotion_decisions(memory_id, category, memory_version, policy_version);
+        create index if not exists idx_promotion_decisions_decided
+          on promotion_decisions(decided_at desc);
+      `);
+      const operationLog = db.prepare("select sql from sqlite_master where type = 'table' and name = 'operation_log'").get() as { sql: string } | undefined;
+      if (operationLog && !operationLog.sql.includes("'automatic_promotion'")) {
+        rebuildScopedTable(db, "operation_log", sql => sql.replace("'branch_triage'", "'branch_triage', 'automatic_promotion'"));
+      }
+    }
+  },
+  {
+    version: 16,
+    name: "add layer retention decisions",
+    up(db) {
+      // Keyed like promotion_decisions so a repeated pass is a no-op and a policy
+      // change re-opens the decision. Device-local: retention is per-machine.
+      db.exec(`
+        create table if not exists layer_retention_decisions (
+          id text primary key,
+          memory_id text not null,
+          category text not null check (category in ('candidate', 'promoted')),
+          memory_version text not null,
+          policy_version integer not null,
+          decision text not null check (decision in ('archive', 'skip')),
+          reason_codes_json text not null,
+          layer text not null,
+          decided_at text not null,
+          actor text not null check (actor in ('cli', 'mcp', 'system')),
+          unique (memory_id, category, memory_version, policy_version)
+        );
+        create index if not exists idx_layer_retention_decisions_memory
+          on layer_retention_decisions(memory_id, category, memory_version, policy_version);
+        create index if not exists idx_layer_retention_decisions_decided
+          on layer_retention_decisions(decided_at desc);
+      `);
+      const operationLog = db.prepare("select sql from sqlite_master where type = 'table' and name = 'operation_log'").get() as { sql: string } | undefined;
+      if (operationLog && !operationLog.sql.includes("'layer_retention'")) {
+        rebuildScopedTable(db, "operation_log", sql => sql.replace("'automatic_promotion'", "'automatic_promotion', 'layer_retention'"));
+      }
+    }
+  },
+  {
+    version: 17,
+    name: "track imported peer layer partitions",
+    up(db) {
+      // Records which non-core layers arrived from another device. Without it a restore
+      // cannot tell a peer's imported rows from this device's own local rows, so it
+      // would either resurrect a partition the peer stopped publishing or delete a
+      // local layer whose name happens to carry someone else's device id.
+      // Keyed by segment, not by layer: a layer name identifies a writer's installation,
+      // but two checkouts of one installation publish separate partitions that can both
+      // carry the same layer name. Keying on the layer would make the imported set and
+      // the published set permanently disagree, and every sync would pull again.
+      db.exec(`
+        create table if not exists peer_partitions (
+          segment_id text primary key,
+          layer text not null,
+          writer_installation_id text not null,
+          fingerprint text not null,
+          imported_at text not null
+        );
+        create index if not exists idx_peer_partitions_layer
+          on peer_partitions(layer);
+      `);
+    }
+  },
+  {
+    version: 18,
+    name: "register cloud merge operations",
+    up(db) {
+      const operationLog = db.prepare("select sql from sqlite_master where type = 'table' and name = 'operation_log'").get() as { sql: string } | undefined;
+      if (operationLog && !operationLog.sql.includes("'cloud_merge'")) {
+        rebuildScopedTable(db, "operation_log", sql => sql.replace("'layer_retention'", "'layer_retention', 'cloud_merge'"));
+      }
+    }
   }
 ] as const;
 

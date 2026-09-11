@@ -488,6 +488,7 @@ async function runWatch(
     if (running) return;
     running = true;
     try {
+      let projectBriefExists = false;
       await projectOperation(cwd, async () => {
         const store = openConfiguredMemoryStore(cwd);
         try {
@@ -497,24 +498,32 @@ async function runWatch(
           stdout(
             `Synced project memory at ${result.completedAt} (git=${result.sources.git.imported}, codex=${result.sources.codex.imported}, claude=${result.sources.claude.imported}, promoted=${result.memories.promoted})`
           );
-          if (readProjectBrief(config.sources.git.repoPath).exists) {
-            try {
-              const summaryResult = await refreshProjectSummaryIfDue(store, config, {
-                ...projectSummaryOperationOptions(options)
-              });
-              if (summaryResult.checked) {
-                stdout(
-                  summaryResult.generated
-                    ? `Refreshed project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
-                    : `Checked project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
-                );
-              }
-            } catch (error) {
-              stdout(`Project summary refresh skipped: ${error instanceof Error ? error.message : String(error)}`);
-            }
-          }
+          projectBriefExists = readProjectBrief(config.sources.git.repoPath).exists;
         } finally { store.close(); }
       });
+      if (projectBriefExists) {
+        try {
+          // Summary generation can call a remote provider; the database handle
+          // guard still blocks unsafe restores without holding the project gate.
+          const store = openConfiguredMemoryStore(cwd);
+          try {
+            store.init();
+            const config = loadProjectConfig(cwd);
+            const summaryResult = await refreshProjectSummaryIfDue(store, config, {
+              ...projectSummaryOperationOptions(options)
+            });
+            if (summaryResult.checked) {
+              stdout(
+                summaryResult.generated
+                  ? `Refreshed project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
+                  : `Checked project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
+              );
+            }
+          } finally { store.close(); }
+        } catch (error) {
+          stdout(`Project summary refresh skipped: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     } finally {
       running = false;
     }
@@ -781,14 +790,19 @@ function usage(): string {
     "  code-butler cloud status",
     "  code-butler cloud sync",
     "  code-butler cloud disable",
-    "  code-butler cloud resolve --keep <local|cloud>",
+    "  code-butler cloud resolve --keep <local|cloud|merge>",
     "  code-butler ingest conversation <file>",
     "  code-butler ingest git <repo> [--max-commits <n>]",
     "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",
     "  code-butler decision import <markdown-file>",
     "  code-butler memory audit [--fix] [--json]",
-    "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>] [--scope-json <json>] [--json]",
+    "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>] [--scope-json <json>] [--layer <layer>] [--json]",
     "  code-butler memory scope --id <id> --category <candidate|promoted|temporary> --scope-json <json> --reason <text> [--json]",
+    "  code-butler memory layer --id <id> --category <candidate|promoted|temporary> --layer <layer> --reason <text> [--json]",
+    "  code-butler memory promotions [--layer <core|device|branch|all>] [--min-score <0..1>] [--min-confidence <0..1>] [--limit <n>] [--promoted-only] [--json]",
+    "  code-butler memory retention [--apply] [--history] [--id <id>] [--limit <n>] [--json]",
+    "  code-butler memory branch-triage [--branch <name>] [--include-active] [--stale-days <n>] [--include-reviewed] [--limit <n>] [--json]",
+    "  code-butler memory branch-resolve --id <id> --category <candidate|promoted> --action <promote_to_core|discard|retain_branch> --reason <text> [--supersedes <memory-id>] [--json]",
     "  code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]",
     "  code-butler memory conflicts [--fix] [--json]",
     "  code-butler doctor [--json] [--strict]",

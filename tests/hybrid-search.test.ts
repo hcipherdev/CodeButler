@@ -309,7 +309,7 @@ function config(mode: "fts" | "hybrid", enabled: boolean): ProjectConfig {
   return {
     configPath: "test", sources: {} as ProjectConfig["sources"], extractor: {} as ProjectConfig["extractor"],
     investigator: {} as ProjectConfig["investigator"], promotion: {} as ProjectConfig["promotion"],
-    sync: { autoSyncOnServerStart: false }, retrieval: { mode, rrfK: 60 },
+    sync: { autoSyncOnServerStart: false, shareLocalLayers: "durable" }, retrieval: { mode, rrfK: 60 },
     embeddings: { enabled, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "model", batchSize: 16 },
     privacy: { allowRemoteEmbeddings: false }, deterministic: {} as ProjectConfig["deterministic"]
   };

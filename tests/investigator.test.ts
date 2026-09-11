@@ -43,10 +43,18 @@ describe("native RLM investigation", () => {
       promotion: {
         confidenceThreshold: 0.85,
         requireCommitAndConversation: true,
-        minSourceCategories: 2
+        minSourceCategories: 2,
+        automatic: {
+          enabled: true,
+          mode: "conservative",
+          minScore: 0.85,
+          mergedBranches: true,
+          deviceMemories: true
+        }
       },
       sync: {
-        autoSyncOnServerStart: true
+        autoSyncOnServerStart: true,
+        shareLocalLayers: "durable"
       },
       retrieval: { mode: "fts", rrfK: 60 },
       embeddings: {

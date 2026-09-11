@@ -1,4 +1,5 @@
 import { createMemoryOrigin, type OriginFactory } from "../memory/origin.js";
+import { defaultBranchMemoryLayer } from "../memory/branch.js";
 import { createAnthropicAwsExtractor } from "../extract/anthropic-aws.js";
 import { createOpenAICompatibleExtractor } from "../extract/openai.js";
 import { extractDeterministicMemories } from "../deterministic/triggers.js";
@@ -10,6 +11,8 @@ import type {
 } from "../embeddings/service.js";
 import { createEmbeddingEndpointHash, createProviderKey } from "../embeddings/fingerprint.js";
 import { assessMemoryQuality } from "../memory/quality.js";
+import { runAutomaticPromotions, type AutomaticPromotionSummary } from "../memory/automatic-promotion.js";
+import { runLayerRetention, type LayerRetentionSummary } from "../memory/layer-retention.js";
 import type { MemoryStore } from "../storage/store.js";
 import { syncClaudeSource, syncCodexSource } from "../sources/codex.js";
 import { syncGitSource } from "../sources/git.js";
@@ -19,6 +22,7 @@ import type {
   EmbeddingProvider,
   ExtractorConversationInput,
   ExtractorProvider,
+  OperationActor,
   ProjectConfig,
   SyncSourceName
 } from "../types.js";
@@ -49,6 +53,8 @@ export interface SyncRunResult {
   sources: Record<SyncSourceName, SyncSourceResult>;
   memories: SyncMemoryResult;
   temporary: SyncTemporaryMemoryResult;
+  promotions?: AutomaticPromotionSummary | undefined;
+  retention?: LayerRetentionSummary | undefined;
   embeddings?: EmbeddingBuildResult | undefined;
 }
 
@@ -61,6 +67,8 @@ export interface SyncProjectMemoryOptions {
   embeddingProvider?: EmbeddingProvider | undefined;
   embeddingProviderFactory?: EmbeddingServiceOptions["providerFactory"];
   embeddingBuilder?: SyncEmbeddingBuilder | undefined;
+  /** Attributed to the automatic promotion pass; defaults to `system`. */
+  actor?: OperationActor | undefined;
 }
 
 export async function syncProjectMemory(
@@ -92,6 +100,7 @@ export async function syncProjectMemory(
 
   const importedConversations: ExtractorConversationInput[] = [];
   const importedCommits: CommitRecord[] = [];
+  const defaultCandidateLayer = defaultBranchMemoryLayer(config.sources.git.repoPath);
 
   for (const sourceName of SOURCE_NAMES) {
     if (!selectedSources.includes(sourceName)) continue;
@@ -180,7 +189,8 @@ export async function syncProjectMemory(
       },
       { deterministic: config.deterministic, repoPath: config.sources.git.repoPath }
     ),
-    options.originFactory
+    options.originFactory,
+    defaultCandidateLayer
   );
 
   const extractor = options.extractorProvider ?? buildConfiguredExtractor(config);
@@ -219,7 +229,7 @@ export async function syncProjectMemory(
       conversations: importedConversations,
       commits: importedCommits
     });
-    const processed = processExtractedMemories(store, config, extracted.memories, options.originFactory);
+    const processed = processExtractedMemories(store, config, extracted.memories, options.originFactory, defaultCandidateLayer);
     result.memories = {
       candidates: deterministicProcessed.candidates + processed.candidates,
       promoted: deterministicProcessed.promoted + processed.promoted,
@@ -254,6 +264,31 @@ async function finishSync(
   result: SyncRunResult,
   options: SyncProjectMemoryOptions
 ): Promise<SyncRunResult> {
+  // Runs after source ingestion has committed. A failure here must not roll that
+  // back, so it becomes a warning and the next sync retries the same decisions.
+  try {
+    result.promotions = runAutomaticPromotions(store, config, {
+      repoPath: config.sources.git.repoPath
+    }, options.actor ?? "system");
+  } catch {
+    result.promotions = {
+      scanned: 0,
+      promoted: 0,
+      converged: 0,
+      deferred: 0,
+      skipped: 0,
+      warnings: ["Automatic promotion pass failed"]
+    };
+  }
+  // After promotion, so knowledge that has earned core is shared before its
+  // branch-local copy can age out.
+  try {
+    result.retention = runLayerRetention(store, config, {
+      repoPath: config.sources.git.repoPath
+    }, options.actor ?? "system");
+  } catch {
+    result.retention = { scanned: 0, archived: 0, skipped: 0, warnings: ["Layer retention pass failed"] };
+  }
   const builder = options.embeddingBuilder ?? buildEmbeddings;
   const embeddingOptions: EmbeddingServiceOptions = {};
   if (options.embeddingProvider !== undefined) embeddingOptions.provider = options.embeddingProvider;
@@ -333,7 +368,8 @@ const SOURCE_NAMES: SyncSourceName[] = ["git", "codex", "claude"];
 function processDeterministicMemories(
   store: MemoryStore,
   extraction: { memories: ExtractedMemory[]; promoteDedupeKeys: string[] },
-  originFactory: OriginFactory = createMemoryOrigin
+  originFactory: OriginFactory = createMemoryOrigin,
+  defaultCandidateLayer?: string | undefined
 ): { candidates: number; promoted: number; rejected: number } {
   const promoteDedupeKeys = new Set(extraction.promoteDedupeKeys);
   let promoted = 0;
@@ -345,13 +381,15 @@ function processDeterministicMemories(
       rejected += 1;
       continue;
     }
-    const candidate = store.upsertMemoryCandidate({ ...memory, origin: originFactory({ method: "deterministic", channel: "sync" }) }, {
+    const shouldPromoteMemory = assessment.status === "active" && promoteDedupeKeys.has(memory.dedupeKey);
+    const candidateInput = applyDefaultCandidateLayer(memory, defaultCandidateLayer, shouldPromoteMemory);
+    const candidate = store.upsertMemoryCandidate({ ...candidateInput, origin: originFactory({ method: "deterministic", channel: "sync" }) }, {
       qualityStatus: assessment.status,
       qualityReasons: assessment.reasons,
       lastVerifiedAt: assessment.lastVerifiedAt
     });
     candidates += 1;
-    if (assessment.status === "active" && promoteDedupeKeys.has(memory.dedupeKey)) {
+    if (shouldPromoteMemory) {
       store.promoteMemoryCandidate(candidate.id);
       promoted += 1;
     }
@@ -374,7 +412,8 @@ function processExtractedMemories(
   store: MemoryStore,
   config: ProjectConfig,
   memories: ExtractedMemory[],
-  originFactory: OriginFactory = createMemoryOrigin
+  originFactory: OriginFactory = createMemoryOrigin,
+  defaultCandidateLayer?: string | undefined
 ): { candidates: number; promoted: number; rejected: number } {
   let promoted = 0;
   let candidates = 0;
@@ -393,13 +432,15 @@ function processExtractedMemories(
         ...(config.extractor.model ? { model: config.extractor.model } : {})
       }
     });
-    const candidate = store.upsertMemoryCandidate({ ...memory, origin }, {
+    const shouldPromoteMemory = assessment.status === "active" && shouldPromote(memory, config);
+    const candidateInput = applyDefaultCandidateLayer(memory, defaultCandidateLayer, shouldPromoteMemory);
+    const candidate = store.upsertMemoryCandidate({ ...candidateInput, origin }, {
       qualityStatus: assessment.status,
       qualityReasons: assessment.reasons,
       lastVerifiedAt: assessment.lastVerifiedAt
     });
     candidates += 1;
-    if (assessment.status === "active" && shouldPromote(memory, config)) {
+    if (shouldPromoteMemory) {
       store.promoteMemoryCandidate(candidate.id);
       promoted += 1;
     }
@@ -409,6 +450,15 @@ function processExtractedMemories(
     promoted,
     rejected
   };
+}
+
+function applyDefaultCandidateLayer(
+  memory: ExtractedMemory,
+  defaultCandidateLayer: string | undefined,
+  shouldPromoteMemory: boolean
+): ExtractedMemory {
+  if (memory.layer !== undefined || defaultCandidateLayer === undefined || shouldPromoteMemory) return memory;
+  return { ...memory, layer: defaultCandidateLayer };
 }
 
 function shouldPromote(memory: ExtractedMemory, config: ProjectConfig): boolean {

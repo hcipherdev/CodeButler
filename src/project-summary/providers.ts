@@ -21,6 +21,7 @@ const PROJECT_SUMMARY_SYSTEM_PROMPT = [
   "Respond with strict JSON shaped as {\"summaryMarkdown\":\"...\"}."
 ].join(" ");
 const DEFAULT_PROJECT_SUMMARY_MAX_TOKENS = 8192;
+const PROJECT_SUMMARY_REQUEST_TIMEOUT_MS = 300000;
 
 export function createConfiguredProjectSummaryGenerator(config: ProjectConfig): ProjectSummaryGenerator {
   const providerConfig =
@@ -42,28 +43,37 @@ export function createOpenAICompatibleProjectSummaryGenerator(
     async generate(input): Promise<string> {
       const apiKey = readRequiredProjectSummaryEnv(config.apiKeyEnv);
       const baseUrl = config.baseUrl ?? "https://api.openai.com/v1";
-      const response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: config.model,
-          temperature: 0,
-          max_tokens: config.maxTokens ?? DEFAULT_PROJECT_SUMMARY_MAX_TOKENS,
-          messages: [
-            {
-              role: "system",
-              content: PROJECT_SUMMARY_SYSTEM_PROMPT
-            },
-            {
-              role: "user",
-              content: JSON.stringify(projectSummaryPayload(input))
-            }
-          ]
-        })
-      });
+      let response: Awaited<ReturnType<typeof fetchImpl>>;
+      try {
+        response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+          method: "POST",
+          signal: AbortSignal.timeout(PROJECT_SUMMARY_REQUEST_TIMEOUT_MS),
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model: config.model,
+            temperature: 0,
+            max_tokens: config.maxTokens ?? DEFAULT_PROJECT_SUMMARY_MAX_TOKENS,
+            messages: [
+              {
+                role: "system",
+                content: PROJECT_SUMMARY_SYSTEM_PROMPT
+              },
+              {
+                role: "user",
+                content: JSON.stringify(projectSummaryPayload(input))
+              }
+            ]
+          })
+        });
+      } catch (error) {
+        if (error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name)) {
+          throw new Error("Project summary request timed out");
+        }
+        throw error;
+      }
       if (!response.ok) {
         throw new Error(`Project summary request failed with status ${response.status}`);
       }
@@ -84,6 +94,7 @@ export function createAnthropicAwsProjectSummaryGenerator(
       const payload = await runAnthropicAwsMessage(
         {
           ...requestConfig,
+          timeoutMs: PROJECT_SUMMARY_REQUEST_TIMEOUT_MS,
           maxTokens: config.maxTokens ?? DEFAULT_PROJECT_SUMMARY_MAX_TOKENS,
           system: PROJECT_SUMMARY_SYSTEM_PROMPT,
           messages: [{ role: "user", content: JSON.stringify(projectSummaryPayload(input)) }]

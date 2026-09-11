@@ -1,6 +1,27 @@
 import { withApplicability } from "../memory/scope.js";
+import { defaultBranchMemoryLayer } from "../memory/branch.js";
+import { updateMemoryLayer, type UpdateMemoryLayerInput } from "../memory/layer-service.js";
+import { suggestMemoryLayerPromotions, type SuggestMemoryLayerPromotionsInput } from "../memory/layer-promotion.js";
+import {
+  listLayerRetentionDecisions,
+  planLayerRetention,
+  type LayerRetentionDecisionRecord,
+  type LayerRetentionPlan
+} from "../memory/layer-retention.js";
+import {
+  listPromotionDecisions,
+  planAutomaticPromotions,
+  type AutomaticPromotionDecisionRecord,
+  type AutomaticPromotionPlan
+} from "../memory/automatic-promotion.js";
+import {
+  resolveBranchMemoryTriage,
+  suggestBranchMemoryTriage,
+  type ResolveBranchMemoryTriageInput,
+  type SuggestBranchMemoryTriageInput
+} from "../memory/branch-triage.js";
 import { updateMemoryScope, type UpdateMemoryScopeInput } from "../memory/scope-service.js";
-import type { TargetEnvironment, MemoryScope } from "../types.js";
+import type { TargetEnvironment, MemoryScope, MemoryLayerFilter, MemoryLayerOwner } from "../types.js";
 import { execFileSync } from "node:child_process";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -140,6 +161,8 @@ export interface ProjectMemoryToolHandlers {
   read_memory_source(input: { sourceId: string }): ReturnType<MemoryStore["readSource"]>;
   find_memories(input: {
     targetEnvironment?: TargetEnvironment;
+    layer?: MemoryLayerFilter;
+    owner?: MemoryLayerOwner;
     query?: string;
     type?: MemoryType;
     status?: "promoted" | "candidate";
@@ -150,8 +173,21 @@ export interface ProjectMemoryToolHandlers {
     results: ReturnType<MemoryStore["searchMemoryLayer"]>;
   }>;
   update_memory_scope(input: UpdateMemoryScopeInput): ReturnType<typeof updateMemoryScope>;
+  update_memory_layer(input: UpdateMemoryLayerInput): ReturnType<typeof updateMemoryLayer>;
+  suggest_memory_layer_promotions(input?: SuggestMemoryLayerPromotionsInput): ReturnType<typeof suggestMemoryLayerPromotions>;
+  suggest_branch_memory_triage(input?: Omit<SuggestBranchMemoryTriageInput, "repoPath" | "now">): ReturnType<typeof suggestBranchMemoryTriage>;
+  resolve_branch_memory_triage(input: Omit<ResolveBranchMemoryTriageInput, "now">): ReturnType<typeof resolveBranchMemoryTriage>;
+  explain_memory_promotions(input?: { memoryId?: string; limit?: number }): {
+    plan: AutomaticPromotionPlan;
+    history: AutomaticPromotionDecisionRecord[];
+  };
+  explain_layer_retention(input?: { memoryId?: string; limit?: number }): {
+    plan: LayerRetentionPlan;
+    history: LayerRetentionDecisionRecord[];
+  };
   remember_project_memory(input: {
     scope?: MemoryScope;
+    layer?: string;
     type: MemoryType;
     text: string;
     title?: string;
@@ -275,16 +311,60 @@ export function createProjectMemoryToolHandlers(
       return store.readSource(input.sourceId);
     },
     async find_memories(input) {
-      return {
-        results: withApplicability(await findProjectMemories(store, config, normalizeMemorySearchInput(input), options.searchService), input.targetEnvironment)
-      };
+      // The layer filter now travels into storage retrieval, so the result limit
+      // applies to matching rows instead of hiding them behind newer core memories.
+      const found = await findProjectMemories(store, config, normalizeMemorySearchInput(input), options.searchService);
+      return { results: withApplicability(found, input.targetEnvironment) };
     },
     update_memory_scope(input) { return updateMemoryScope(store, input, "mcp"); },
+    update_memory_layer(input) { return updateMemoryLayer(store, input, "mcp"); },
+    suggest_memory_layer_promotions(input = {}) { return suggestMemoryLayerPromotions(store, input); },
+    suggest_branch_memory_triage(input = {}) {
+      return suggestBranchMemoryTriage(store, {
+        ...input,
+        repoPath: config.sources.git.repoPath,
+        now: nowIso(options.now)
+      });
+    },
+    resolve_branch_memory_triage(input) {
+      return resolveBranchMemoryTriage(store, {
+        ...input,
+        now: nowIso(options.now)
+      }, "mcp");
+    },
+    explain_memory_promotions(input = {}) {
+      return {
+        plan: planAutomaticPromotions(store, config, {
+          repoPath: config.sources.git.repoPath,
+          now: nowIso(options.now)
+        }),
+        history: listPromotionDecisions(store, input)
+      };
+    },
+    explain_layer_retention(input = {}) {
+      return {
+        plan: planLayerRetention(store, config, {
+          repoPath: config.sources.git.repoPath,
+          now: nowIso(options.now)
+        }),
+        history: listLayerRetentionDecisions(store, input)
+      };
+    },
     remember_project_memory(input) {
+      const defaultLayer = defaultBranchMemoryLayer(config.sources.git.repoPath);
       const remembered = rememberProjectMemory(
         store,
-        { ...normalizeRememberMemoryInput(input), ...(input.scope === undefined ? {} : { scope: input.scope }) },
-        { ...(options.now === undefined ? {} : { now: options.now }), actor: "mcp", client: options.clientInfo?.() }
+        {
+          ...normalizeRememberMemoryInput(input),
+          ...(input.scope === undefined ? {} : { scope: input.scope }),
+          ...(input.layer === undefined ? {} : { layer: input.layer })
+        },
+        {
+          ...(options.now === undefined ? {} : { now: options.now }),
+          actor: "mcp",
+          client: options.clientInfo?.(),
+          ...(defaultLayer === undefined ? {} : { defaultLayer })
+        }
       );
       const memoryId = remembered.memory?.id ?? remembered.candidate.id;
       const status = remembered.memory ? "promoted" : "candidate";
@@ -445,6 +525,8 @@ function normalizeMemorySearchInput(input: {
   status?: "promoted" | "candidate" | undefined;
   qualityStatus?: MemoryQualityStatus | "all" | undefined;
   lifecycleStatus?: MemoryLifecycleStatus | "all" | undefined;
+  layer?: MemoryLayerFilter | undefined;
+  owner?: MemoryLayerOwner | undefined;
   limit?: number | undefined;
 }): {
   query?: string;
@@ -452,6 +534,8 @@ function normalizeMemorySearchInput(input: {
   status?: "promoted" | "candidate";
   qualityStatus?: MemoryQualityStatus | "all";
   lifecycleStatus?: MemoryLifecycleStatus | "all";
+  layer?: MemoryLayerFilter;
+  owner?: MemoryLayerOwner;
   limit?: number;
 } {
   const normalized: {
@@ -460,6 +544,8 @@ function normalizeMemorySearchInput(input: {
     status?: "promoted" | "candidate";
     qualityStatus?: MemoryQualityStatus | "all";
     lifecycleStatus?: MemoryLifecycleStatus | "all";
+    layer?: MemoryLayerFilter;
+    owner?: MemoryLayerOwner;
     limit?: number;
   } = {};
   if (input.query !== undefined) normalized.query = input.query;
@@ -467,6 +553,8 @@ function normalizeMemorySearchInput(input: {
   if (input.status !== undefined) normalized.status = input.status;
   if (input.qualityStatus !== undefined) normalized.qualityStatus = input.qualityStatus;
   if (input.lifecycleStatus !== undefined) normalized.lifecycleStatus = input.lifecycleStatus;
+  if (input.layer !== undefined) normalized.layer = input.layer;
+  if (input.owner !== undefined) normalized.owner = input.owner;
   if (input.limit !== undefined) normalized.limit = input.limit;
   return normalized;
 }

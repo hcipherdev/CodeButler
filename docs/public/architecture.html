@@ -636,7 +636,7 @@
   </div>
   <div class="badge">
     <span>SQLite/FTS5 · MCP · Node 24</span>
-    <span><b>10 layers</b> · <b>21 tools</b></span>
+    <span><b>10 layers</b> · <b>28 tools</b></span>
   </div>
 </header>
 
@@ -773,7 +773,7 @@
           <div class="stage-title">MCP / CLI</div>
         </div>
         <div class="stage-body" style="border-radius:0 0 8px 0">
-          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>21 MCP tools exposed</div>
+          <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>28 MCP tools exposed</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Memory health + doctor</div>
           <div class="stage-item"><div class="dot" style="background:var(--orange)"></div>Project narrative summaries</div>
@@ -1035,7 +1035,7 @@
               <div class="layer-toggle">▼</div>
             </summary>
             <div class="layer-body">
-              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>22 exposed tools</div>
+              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>28 exposed tools</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Global launcher via code-butler mcp</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate, summarize</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Memory health, doctor, project briefs</div>
@@ -1062,7 +1062,7 @@
 
       <!-- RIGHT: MCP Tools -->
       <div>
-        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (22)</div>
+        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (28)</div>
         <div class="mcp-col">
           <div class="mcp-group-label">Search & Read</div>
           <div class="mcp-card">
@@ -1088,6 +1088,30 @@
           <div class="mcp-card">
             <div class="mcp-tool-name">update_memory_scope</div>
             <div class="mcp-tool-desc">Correct applicability scope while preserving origin</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">update_memory_layer</div>
+            <div class="mcp-tool-desc">Move memories between sync layers</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">suggest_memory_layer_promotions</div>
+            <div class="mcp-tool-desc">Review non-core memories for core promotion</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">suggest_branch_memory_triage</div>
+            <div class="mcp-tool-desc">Review branch-layer memories by Git state</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">resolve_branch_memory_triage</div>
+            <div class="mcp-tool-desc">Promote, discard, or retain branch memories</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">explain_memory_promotions</div>
+            <div class="mcp-tool-desc">Explain automatic layer promotion decisions</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">explain_layer_retention</div>
+            <div class="mcp-tool-desc">Explain which local layers age out and why</div>
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">update_memory_status</div>
@@ -1653,7 +1677,7 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/mcp/tools.ts</div>
-        <div class="file-desc">MCP registration facade for 21 backward-compatible tools</div>
+        <div class="file-desc">MCP registration facade for 28 exposed tools</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/mcp/tool-groups/*</div>
