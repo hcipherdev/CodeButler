@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync, backup } from "node:sqlite";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { z } from "zod";
+import { portableProjectConfig } from "../config.js";
 import { CURRENT_SCHEMA_VERSION } from "../storage/migrations.js";
 import { verifyDatabaseFile } from "../privacy/backup.js";
 import { installationDeviceId } from "../memory/origin.js";
@@ -151,7 +152,7 @@ export function bundleResolver(blocks: Map<string, Buffer>): (checksum: string) 
 }
 export function excluded(path: string): boolean {
   const parts = path.split("/");
-  return parts.some(p => p === "logs" || p === "backups" || p === "staging" || p.startsWith(".cloud") || p === "cloud" || p === "device.json" || (p.startsWith(".env") && p !== ".env.example") || p.endsWith(".lock") || p.endsWith(".tmp") || p === ".DS_Store") || /^memory\.sqlite(?:-|\.)/.test(path);
+  return parts.some(p => p === "config.local.json" || p === "logs" || p === "backups" || p === "staging" || p.startsWith(".cloud") || p === "cloud" || p === "device.json" || (p.startsWith(".env") && p !== ".env.example") || p.endsWith(".lock") || p.endsWith(".tmp") || p === ".DS_Store") || /^memory\.sqlite(?:-|\.)/.test(path);
 }
 export function validArchivePath(path: string, platform: string = process.platform): void {
   if (!path || path.includes("\\") || path.startsWith("/") || path.includes("\0") || path.split("/").some(p => !p || p === "." || p === "..") || /^[a-z]:/i.test(path)) throw new Error("Invalid snapshot path");
@@ -172,18 +173,7 @@ function filesIn(dir: string, prefix = ""): string[] {
 }
 type Config = Record<string, any>;
 export function portableConfig(config: Config): Config {
-  const result: Config = {};
-  for (const key of ["promotion", "deterministic", "privacy", "retention", "sync"]) if (config[key] !== undefined) result[key] = config[key];
-  if (config.retrieval) result.retrieval = config.retrieval;
-  if (config.sources) {
-    result.sources = {};
-    for (const key of ["git", "codex", "claude"]) {
-      if (!config.sources[key]) continue;
-      result.sources[key] = { ...config.sources[key] };
-      for (const local of ["repoPath", "roots", "hookInstall", "includeDefaultRoots"]) delete result.sources[key][local];
-    }
-  }
-  return result;
+  return portableProjectConfig(config);
 }
 function mergedConfig(remote: Config, local: Config): Config {
   const value = { ...local, ...portableConfig(remote) };

@@ -29,7 +29,7 @@ export type MemoryLifecycleStatus = "current" | "superseded" | "retracted";
 export type MemoryRelationType = "supersedes" | "potentially_contradicts";
 export type SyncSourceName = "git" | "codex" | "claude";
 export type DoctorStatus = "ok" | "warning" | "error";
-export type DoctorCheckCategory = "project" | "storage" | "sources" | "sync" | "summary" | "extractor" | "retrieval" | "memory";
+export type DoctorCheckCategory = "project" | "storage" | "sources" | "sync" | "summary" | "extractor" | "retrieval" | "memory" | "maintenance";
 export type InvestigationMode = "native-rlm" | "heuristic-fallback";
 export type InvestigationStatus = "complete" | "partial" | "failed";
 export type InvestigationStepStatus = "completed" | "failed" | "skipped";
@@ -509,6 +509,23 @@ export interface LayerRetentionConfig {
   };
 }
 
+export interface ArtifactRetentionConfig {
+  logs: {
+    maxBytes: number;
+    maxFiles: number;
+  };
+  projectSummaryBackups: {
+    maxFiles: number;
+  };
+  recoveryBackups: {
+    maxFiles: number;
+    minAgeDays: number;
+  };
+  cloudHandles: {
+    reapStale: boolean;
+  };
+}
+
 export interface RetentionConfig {
   migrationBackups: number;
   sources: {
@@ -519,6 +536,7 @@ export interface RetentionConfig {
   };
   overrides: SourceRetentionOverride[];
   layers: LayerRetentionConfig;
+  artifacts: ArtifactRetentionConfig;
 }
 
 export type EmbeddingOwnerKind = "chunk" | "memory";

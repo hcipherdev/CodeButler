@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type { ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, LayerRetentionConfig, ProjectConfig, RedactionPatternConfig } from "./types.js";
+import type { ArtifactRetentionConfig, ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, LayerRetentionConfig, ProjectConfig, RedactionPatternConfig } from "./types.js";
 import { validateRedactionPattern } from "./privacy/policy.js";
 
 interface ProjectConfigFile {
@@ -27,6 +27,12 @@ interface ProjectConfigFile {
     layers?: Partial<Omit<LayerRetentionConfig, "branch" | "device">> & {
       branch?: Partial<LayerRetentionConfig["branch"]>;
       device?: Partial<LayerRetentionConfig["device"]>;
+    };
+    artifacts?: Partial<ArtifactRetentionConfig> & {
+      logs?: Partial<ArtifactRetentionConfig["logs"]>;
+      projectSummaryBackups?: Partial<ArtifactRetentionConfig["projectSummaryBackups"]>;
+      recoveryBackups?: Partial<ArtifactRetentionConfig["recoveryBackups"]>;
+      cloudHandles?: Partial<ArtifactRetentionConfig["cloudHandles"]>;
     };
   };
   deterministic?: Partial<ProjectConfig["deterministic"]> & {
@@ -63,6 +69,22 @@ const PROJECT_CODE_BUTLER_IGNORE = [
   ""
 ].join("\n");
 const LEGACY_ENV_ONLY_IGNORE = [".env", ".env.*", "!*.example", ""].join("\n");
+
+type ConfigObject = Record<string, any>;
+
+export interface ConfigPortabilityIssue {
+  path: string;
+  reason: "device_local_path" | "device_local_source_setting" | "provider_runtime_setting";
+}
+
+export interface ConfigLocalMigrationResult {
+  sharedConfigPath: string;
+  localConfigPath: string;
+  dryRun: boolean;
+  moved: string[];
+  unchanged: string[];
+  conflicts: string[];
+}
 
 export function ensureProjectConfig(rootDir: string): string {
   const configPath = join(rootDir, ".code-butler", "config.json");
@@ -103,13 +125,94 @@ export function loadExistingProjectConfig(rootDir: string): ProjectConfig {
   return readProjectConfig(rootDir, configPath);
 }
 
+export function projectLocalConfigPath(rootDir: string): string {
+  return join(rootDir, ".code-butler", "config.local.json");
+}
+
+export function portableProjectConfig(config: ConfigObject): ConfigObject {
+  const result: ConfigObject = {};
+  for (const key of ["promotion", "deterministic", "privacy", "retention", "sync"]) {
+    if (config[key] !== undefined) result[key] = config[key];
+  }
+  if (config.retrieval) result.retrieval = config.retrieval;
+  if (config.sources) {
+    result.sources = {};
+    for (const key of ["git", "codex", "claude"]) {
+      if (!config.sources[key]) continue;
+      result.sources[key] = { ...config.sources[key] };
+      for (const local of ["repoPath", "roots", "hookInstall", "includeDefaultRoots"]) {
+        delete result.sources[key][local];
+      }
+    }
+  }
+  return result;
+}
+
+export function analyzeSharedConfigPortability(rootDir: string): ConfigPortabilityIssue[] {
+  const configPath = join(rootDir, ".code-butler", "config.json");
+  if (!existsSync(configPath)) return [];
+  const parsed = readConfigObject(configPath);
+  validateProjectConfigFile(parsed);
+  return localOnlyConfigPaths(parsed).map((path) => ({
+    path,
+    reason: localOnlyReason(path)
+  }));
+}
+
+export function migrateSharedConfigToLocal(rootDir: string, options: { apply: boolean }): ConfigLocalMigrationResult {
+  const sharedConfigPath = ensureProjectConfig(rootDir);
+  const localConfigPath = projectLocalConfigPath(rootDir);
+  const shared = readConfigObject(sharedConfigPath);
+  const local = existsSync(localConfigPath) ? readConfigObject(localConfigPath) : {};
+  validateProjectConfigFile(shared);
+  validateProjectConfigFile(local);
+
+  const paths = localOnlyConfigPaths(shared);
+  const result: ConfigLocalMigrationResult = {
+    sharedConfigPath,
+    localConfigPath,
+    dryRun: !options.apply,
+    moved: [],
+    unchanged: [],
+    conflicts: []
+  };
+  if (paths.length === 0) return result;
+
+  const nextShared = cloneConfig(shared);
+  const nextLocal = cloneConfig(local);
+  for (const path of paths) {
+    const value = getNested(shared, path);
+    const existing = getNested(local, path);
+    if (existing === undefined) {
+      result.moved.push(path);
+      setNested(nextLocal, path, value);
+    } else if (sameJson(existing, value)) {
+      result.unchanged.push(path);
+    } else {
+      result.conflicts.push(path);
+    }
+    deleteNested(nextShared, path);
+  }
+
+  if (options.apply) {
+    writeConfigObject(sharedConfigPath, nextShared);
+    writeConfigObject(localConfigPath, nextLocal);
+  }
+  return result;
+}
+
 function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
   loadProjectEnv(rootDir);
   loadGlobalEnv();
   const raw = readFileSync(configPath, "utf8");
   const parsedValue: unknown = raw.trim().length > 0 ? JSON.parse(raw) : {};
   validateProjectConfigFile(parsedValue);
-  const parsed = parsedValue as ProjectConfigFile;
+  const localConfigPath = projectLocalConfigPath(rootDir);
+  const localValue: unknown = existsSync(localConfigPath)
+    ? JSON.parse(readFileSync(localConfigPath, "utf8").trim() || "{}")
+    : {};
+  validateProjectConfigFile(localValue);
+  const parsed = mergeConfigFiles(parsedValue as ProjectConfigFile, localValue as ProjectConfigFile);
   const globalConfig = loadGlobalConfig();
   const defaults = defaultConfig(rootDir, configPath);
 
@@ -188,6 +291,26 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
         device: {
           ...defaults.retention!.layers.device,
           ...(parsed.retention?.layers?.device ?? {})
+        }
+      },
+      artifacts: {
+        ...defaults.retention!.artifacts,
+        ...(parsed.retention?.artifacts ?? {}),
+        logs: {
+          ...defaults.retention!.artifacts.logs,
+          ...(parsed.retention?.artifacts?.logs ?? {})
+        },
+        projectSummaryBackups: {
+          ...defaults.retention!.artifacts.projectSummaryBackups,
+          ...(parsed.retention?.artifacts?.projectSummaryBackups ?? {})
+        },
+        recoveryBackups: {
+          ...defaults.retention!.artifacts.recoveryBackups,
+          ...(parsed.retention?.artifacts?.recoveryBackups ?? {})
+        },
+        cloudHandles: {
+          ...defaults.retention!.artifacts.cloudHandles,
+          ...(parsed.retention?.artifacts?.cloudHandles ?? {})
         }
       }
     },
@@ -294,6 +417,12 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
         graceDays: 30,
         branch: { onDeleted: "archive", onMerged: "keep", maxIdleDays: null },
         device: { maxIdleDays: null }
+      },
+      artifacts: {
+        logs: { maxBytes: 5 * 1024 * 1024, maxFiles: 3 },
+        projectSummaryBackups: { maxFiles: 5 },
+        recoveryBackups: { maxFiles: 5, minAgeDays: 7 },
+        cloudHandles: { reapStale: true }
       }
     },
     deterministic: {
@@ -438,11 +567,12 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 function validateRetentionConfig(retention: Record<string, unknown>): void {
-  assertKnownKeys(retention, new Set(["migrationBackups", "sources", "overrides", "layers"]), "retention");
+  assertKnownKeys(retention, new Set(["migrationBackups", "sources", "overrides", "layers", "artifacts"]), "retention");
   if (retention.migrationBackups !== undefined && !isNonNegativeInteger(retention.migrationBackups)) {
     throw new Error("retention.migrationBackups must be a non-negative integer");
   }
   if (retention.layers !== undefined) validateLayerRetentionConfig(retention.layers);
+  if (retention.artifacts !== undefined) validateArtifactRetentionConfig(retention.artifacts);
   if (retention.sources === undefined) return;
   if (!isConfigRecord(retention.sources)) throw new Error("retention.sources must be an object");
   assertKnownKeys(retention.sources, new Set(["git", "codex", "claude", "manual"]), "retention.sources");
@@ -466,6 +596,45 @@ function validateRetentionConfig(retention: Record<string, unknown>): void {
       if (override.maxAgeDays !== null && !isPositiveInteger(override.maxAgeDays)) {
         throw new Error(`retention.overrides[${index}].maxAgeDays must be null or a positive integer`);
       }
+    }
+  }
+}
+
+function validateArtifactRetentionConfig(value: unknown): void {
+  if (!isConfigRecord(value)) throw new Error("retention.artifacts must be an object");
+  assertKnownKeys(value, new Set(["logs", "projectSummaryBackups", "recoveryBackups", "cloudHandles"]), "retention.artifacts");
+  if (value.logs !== undefined) {
+    if (!isConfigRecord(value.logs)) throw new Error("retention.artifacts.logs must be an object");
+    assertKnownKeys(value.logs, new Set(["maxBytes", "maxFiles"]), "retention.artifacts.logs");
+    if (value.logs.maxBytes !== undefined && !isPositiveInteger(value.logs.maxBytes)) {
+      throw new Error("retention.artifacts.logs.maxBytes must be a positive integer");
+    }
+    if (value.logs.maxFiles !== undefined && !isNonNegativeInteger(value.logs.maxFiles)) {
+      throw new Error("retention.artifacts.logs.maxFiles must be a non-negative integer");
+    }
+  }
+  if (value.projectSummaryBackups !== undefined) {
+    if (!isConfigRecord(value.projectSummaryBackups)) throw new Error("retention.artifacts.projectSummaryBackups must be an object");
+    assertKnownKeys(value.projectSummaryBackups, new Set(["maxFiles"]), "retention.artifacts.projectSummaryBackups");
+    if (value.projectSummaryBackups.maxFiles !== undefined && !isNonNegativeInteger(value.projectSummaryBackups.maxFiles)) {
+      throw new Error("retention.artifacts.projectSummaryBackups.maxFiles must be a non-negative integer");
+    }
+  }
+  if (value.recoveryBackups !== undefined) {
+    if (!isConfigRecord(value.recoveryBackups)) throw new Error("retention.artifacts.recoveryBackups must be an object");
+    assertKnownKeys(value.recoveryBackups, new Set(["maxFiles", "minAgeDays"]), "retention.artifacts.recoveryBackups");
+    if (value.recoveryBackups.maxFiles !== undefined && !isNonNegativeInteger(value.recoveryBackups.maxFiles)) {
+      throw new Error("retention.artifacts.recoveryBackups.maxFiles must be a non-negative integer");
+    }
+    if (value.recoveryBackups.minAgeDays !== undefined && !isNonNegativeInteger(value.recoveryBackups.minAgeDays)) {
+      throw new Error("retention.artifacts.recoveryBackups.minAgeDays must be a non-negative integer");
+    }
+  }
+  if (value.cloudHandles !== undefined) {
+    if (!isConfigRecord(value.cloudHandles)) throw new Error("retention.artifacts.cloudHandles must be an object");
+    assertKnownKeys(value.cloudHandles, new Set(["reapStale"]), "retention.artifacts.cloudHandles");
+    if (value.cloudHandles.reapStale !== undefined && typeof value.cloudHandles.reapStale !== "boolean") {
+      throw new Error("retention.artifacts.cloudHandles.reapStale must be a boolean");
     }
   }
 }
@@ -589,26 +758,19 @@ function readProviderProfile(
 }
 
 function defaultConfigFile(): ProjectConfigFile {
-  const home = homedir();
-  const codexRoots = defaultCodexRoots(home);
   return {
     sources: {
       git: {
         enabled: true,
-        repoPath: ".",
-        hookInstall: false,
         maxCommits: 200,
         maxDiffChars: 12_000
       },
       codex: {
         enabled: true,
-        roots: codexRoots,
-        includeDefaultRoots: true,
         projectOnly: true
       },
       claude: {
         enabled: true,
-        roots: [join(home, ".claude", "projects")],
         projectOnly: true
       }
     },
@@ -632,13 +794,6 @@ function defaultConfigFile(): ProjectConfigFile {
       mode: "fts",
       rrfK: 60
     },
-    embeddings: {
-      enabled: false,
-      provider: "openai-compatible",
-      baseUrl: "http://127.0.0.1:11434/v1",
-      model: "nomic-embed-text",
-      batchSize: 16
-    },
     privacy: {
       allowRemoteEmbeddings: false,
       redactionPatterns: []
@@ -659,6 +814,12 @@ function defaultConfigFile(): ProjectConfigFile {
         graceDays: 30,
         branch: { onDeleted: "archive", onMerged: "keep", maxIdleDays: null },
         device: { maxIdleDays: null }
+      },
+      artifacts: {
+        logs: { maxBytes: 5 * 1024 * 1024, maxFiles: 3 },
+        projectSummaryBackups: { maxFiles: 5 },
+        recoveryBackups: { maxFiles: 5, minAgeDays: 7 },
+        cloudHandles: { reapStale: true }
       }
     },
     deterministic: {
@@ -674,6 +835,96 @@ function defaultConfigFile(): ProjectConfigFile {
       }
     }
   };
+}
+
+function mergeConfigFiles(shared: ProjectConfigFile, local: ProjectConfigFile): ProjectConfigFile {
+  return deepMerge(shared, local) as ProjectConfigFile;
+}
+
+function readConfigObject(path: string): ConfigObject {
+  const raw = readFileSync(path, "utf8").trim();
+  const parsed = raw.length > 0 ? JSON.parse(raw) : {};
+  if (!isConfigRecord(parsed)) throw new Error(`Config file must be an object: ${path}`);
+  return parsed;
+}
+
+function writeConfigObject(path: string, value: ConfigObject): void {
+  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function cloneConfig<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function deepMerge(left: unknown, right: unknown): unknown {
+  if (!isConfigRecord(left) || !isConfigRecord(right)) return right ?? left;
+  const result: ConfigObject = { ...left };
+  for (const [key, value] of Object.entries(right)) {
+    if (value === undefined) continue;
+    result[key] = key in result && isConfigRecord(result[key]) && isConfigRecord(value)
+      ? deepMerge(result[key], value)
+      : value;
+  }
+  return result;
+}
+
+function localOnlyConfigPaths(config: ConfigObject): string[] {
+  const paths = [
+    "sources.git.repoPath",
+    "sources.git.hookInstall",
+    "sources.codex.roots",
+    "sources.codex.includeDefaultRoots",
+    "sources.claude.roots",
+    "extractor",
+    "investigator",
+    "embeddings"
+  ];
+  return paths.filter((path) => getNested(config, path) !== undefined);
+}
+
+function localOnlyReason(path: string): ConfigPortabilityIssue["reason"] {
+  if (path.endsWith(".repoPath") || path.endsWith(".roots")) return "device_local_path";
+  if (path === "extractor" || path === "investigator" || path === "embeddings") return "provider_runtime_setting";
+  return "device_local_source_setting";
+}
+
+function getNested(root: ConfigObject, path: string): unknown {
+  let current: unknown = root;
+  for (const segment of path.split(".")) {
+    if (!isConfigRecord(current) || !Object.prototype.hasOwnProperty.call(current, segment)) return undefined;
+    current = current[segment];
+  }
+  return current;
+}
+
+function setNested(root: ConfigObject, path: string, value: unknown): void {
+  const segments = path.split(".");
+  let current = root;
+  for (const segment of segments.slice(0, -1)) {
+    if (!isConfigRecord(current[segment])) current[segment] = {};
+    current = current[segment] as ConfigObject;
+  }
+  current[segments.at(-1)!] = cloneConfig(value);
+}
+
+function deleteNested(root: ConfigObject, path: string): void {
+  const segments = path.split(".");
+  const parents: Array<{ target: ConfigObject; key: string }> = [];
+  let current = root;
+  for (const segment of segments.slice(0, -1)) {
+    if (!isConfigRecord(current[segment])) return;
+    parents.push({ target: current, key: segment });
+    current = current[segment] as ConfigObject;
+  }
+  delete current[segments.at(-1)!];
+  for (const parent of parents.reverse()) {
+    const child = parent.target[parent.key];
+    if (isConfigRecord(child) && Object.keys(child).length === 0) delete parent.target[parent.key];
+  }
+}
+
+function sameJson(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function resolveRootedPath(rootDir: string, pathValue: string): string {

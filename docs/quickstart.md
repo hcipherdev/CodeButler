@@ -47,19 +47,26 @@ For semantic ranking with a local OpenAI-compatible Ollama service, first instal
 ollama pull nomic-embed-text
 ```
 
-Merge this configuration into `.code-butler/config.json`:
+Merge the shared policy into `.code-butler/config.json`:
 
 ```json
 {
   "retrieval": { "mode": "hybrid", "rrfK": 60 },
+  "privacy": { "allowRemoteEmbeddings": false }
+}
+```
+
+Keep the machine-specific endpoint in the ignored `.code-butler/config.local.json`:
+
+```json
+{
   "embeddings": {
     "enabled": true,
     "provider": "openai-compatible",
     "baseUrl": "http://127.0.0.1:11434/v1",
     "model": "nomic-embed-text",
     "batchSize": 16
-  },
-  "privacy": { "allowRemoteEmbeddings": false }
+  }
 }
 ```
 

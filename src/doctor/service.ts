@@ -3,11 +3,12 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { globalConfigDir, loadExistingProjectConfig } from "../config.js";
+import { analyzeSharedConfigPortability, globalConfigDir, loadExistingProjectConfig } from "../config.js";
 import { getProjectSummaryStatus } from "../project-summary/service.js";
 import { getClaudeSourceStatus, getCodexSourceStatus, type ConversationSourceStatus } from "../sources/codex.js";
 import { getMigrationStatus } from "../storage/migrations.js";
 import { isLoopbackEmbeddingEndpoint } from "../embeddings/provider.js";
+import { inspectArtifactMaintenance } from "../maintenance/artifacts.js";
 import { createEmbeddingContentHash, createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey } from "../embeddings/fingerprint.js";
 import type { MemoryStore } from "../storage/store.js";
 import type {
@@ -131,6 +132,7 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
         title: "Project config parses",
         detail: "Configuration loaded without writing defaults."
       });
+      addConfigPortabilityCheck(projectRoot, addCheck, addAction);
     } catch (error) {
       addCheck({
         id: "config:load",
@@ -169,6 +171,7 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
     }
     addSummaryCheck(projectRoot, now, config, addCheck, addAction);
     addMemoryCheck(storage, addCheck, addAction);
+    if (config !== undefined) addArtifactMaintenanceCheck(projectRoot, config, now, addCheck, addAction);
   } finally {
     storage.db?.close();
   }
@@ -454,6 +457,57 @@ function addProjectChecks(
     title: gitConfigured ? "Git source is coherent" : "Git source points at a non-Git directory",
     detail: gitConfigured ? gitDir : `Expected a Git directory at ${gitDir}.`
   });
+}
+
+function addConfigPortabilityCheck(
+  rootDir: string,
+  addCheck: (check: DoctorCheck) => void,
+  addAction: (action: DoctorNextAction) => void
+): void {
+  const issues = analyzeSharedConfigPortability(rootDir);
+  addCheck({
+    id: "config:portable",
+    category: "project",
+    status: issues.length > 0 ? "warning" : "ok",
+    title: issues.length > 0 ? "Shared config contains local-only settings" : "Shared config is portable",
+    detail: issues.length > 0
+      ? `${issues.length} local-only config setting(s) should move to .code-butler/config.local.json.`
+      : ".code-butler/config.json contains only portable settings.",
+    metadata: { issues }
+  });
+  if (issues.length > 0) {
+    addAction({
+      priority: "medium",
+      command: "code-butler config migrate-local --dry-run",
+      reason: "Preview moving device-specific config into the ignored local config file."
+    });
+  }
+}
+
+function addArtifactMaintenanceCheck(
+  rootDir: string,
+  config: ProjectConfig,
+  now: Date,
+  addCheck: (check: DoctorCheck) => void,
+  addAction: (action: DoctorNextAction) => void
+): void {
+  const result = inspectArtifactMaintenance(rootDir, config.retention!.artifacts, { now });
+  const status: DoctorStatus = result.items.length > 0 || result.warnings.length > 0 ? "warning" : "ok";
+  addCheck({
+    id: "maintenance:artifacts",
+    category: "maintenance",
+    status,
+    title: status === "ok" ? "Runtime artifacts are within retention limits" : "Runtime artifacts need cleanup",
+    detail: `planned=${result.items.length} warnings=${result.warnings.length}`,
+    metadata: { ...result }
+  });
+  if (result.items.length > 0) {
+    addAction({
+      priority: "low",
+      command: "code-butler maintenance prune --dry-run",
+      reason: "Preview bounded cleanup for logs, backups, and stale cloud handles."
+    });
+  }
 }
 
 function inspectStorage(

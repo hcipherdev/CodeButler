@@ -3,7 +3,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
+import {
+  analyzeSharedConfigPortability,
+  ensureProjectConfig,
+  loadProjectConfig,
+  migrateSharedConfigToLocal
+} from "../src/config.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("project config", () => {
@@ -46,13 +51,7 @@ describe("project config", () => {
     expect(generatedProjectConfig.extractor).toBeUndefined();
     expect(generatedProjectConfig.investigator).toBeUndefined();
     expect(generatedProjectConfig.retrieval).toEqual({ mode: "fts", rrfK: 60 });
-    expect(generatedProjectConfig.embeddings).toEqual({
-      enabled: false,
-      provider: "openai-compatible",
-      baseUrl: "http://127.0.0.1:11434/v1",
-      model: "nomic-embed-text",
-      batchSize: 16
-    });
+    expect(generatedProjectConfig.embeddings).toBeUndefined();
     expect(generatedProjectConfig.privacy).toEqual({ allowRemoteEmbeddings: false, redactionPatterns: [] });
     expect(generatedProjectConfig.retention).toEqual({
       migrationBackups: 2,
@@ -68,6 +67,12 @@ describe("project config", () => {
         graceDays: 30,
         branch: { onDeleted: "archive", onMerged: "keep", maxIdleDays: null },
         device: { maxIdleDays: null }
+      },
+      artifacts: {
+        logs: { maxBytes: 5 * 1024 * 1024, maxFiles: 3 },
+        projectSummaryBackups: { maxFiles: 5 },
+        recoveryBackups: { maxFiles: 5, minAgeDays: 7 },
+        cloudHandles: { reapStale: true }
       }
     });
     expect(existsSync(join(rootDir, ".code-butler", ".gitignore"))).toBe(true);
@@ -102,6 +107,7 @@ describe("project config", () => {
     expect(defaults.privacy).toEqual({ allowRemoteEmbeddings: false, redactionPatterns: [] });
     expect(defaults.retention!.migrationBackups).toBe(2);
     expect(defaults.retention!.sources.manual.maxAgeDays).toBeNull();
+    expect(defaults.retention!.artifacts.logs.maxBytes).toBe(5 * 1024 * 1024);
 
     mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
     writeFileSync(
@@ -150,6 +156,87 @@ describe("project config", () => {
     expect(overridden.deterministic.promoteStrongSignals).toBe(true);
     expect(overridden.deterministic.triggers.conversationDirectives).toBe(true);
     expect(overridden.deterministic.triggers.docsFacts).toBe(false);
+  });
+
+  it("layers ignored config.local.json over portable shared config", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        sources: {
+          git: { enabled: true, maxCommits: 20 },
+          codex: { enabled: true, projectOnly: true }
+        },
+        retrieval: { mode: "fts" }
+      })
+    );
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.local.json"),
+      JSON.stringify({
+        sources: {
+          git: { repoPath: "./repo", hookInstall: true },
+          codex: { includeDefaultRoots: false, roots: ["./logs"] }
+        },
+        embeddings: { enabled: true, model: "local-model" }
+      })
+    );
+
+    const config = loadProjectConfig(rootDir);
+
+    expect(config.sources.git.repoPath).toBe(join(rootDir, "repo"));
+    expect(config.sources.git.hookInstall).toBe(true);
+    expect(config.sources.git.maxCommits).toBe(20);
+    expect(config.sources.codex.roots).toEqual([join(rootDir, "logs")]);
+    expect(config.embeddings.enabled).toBe(true);
+    expect(config.embeddings.model).toBe("local-model");
+    expect(readFileSync(configPath, "utf8")).toContain('"maxCommits"');
+  });
+
+  it("migrates local-only shared config into config.local.json without overwriting local choices", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        sources: {
+          git: { enabled: true, repoPath: ".", hookInstall: true, maxCommits: 50 },
+          codex: { roots: ["./codex"], includeDefaultRoots: false, projectOnly: true },
+          claude: { roots: ["./claude"], projectOnly: false }
+        },
+        extractor: { provider: "openai-compatible", model: "project-extractor", apiKeyEnv: "PROJECT_KEY" },
+        retrieval: { mode: "hybrid" }
+      }, null, 2)
+    );
+    writeFileSync(
+      join(rootDir, ".code-butler", "config.local.json"),
+      JSON.stringify({ sources: { git: { repoPath: "./existing" } } }, null, 2)
+    );
+
+    const dryRun = migrateSharedConfigToLocal(rootDir, { apply: false });
+    expect(dryRun.moved).toContain("sources.git.hookInstall");
+    expect(dryRun.conflicts).toEqual(["sources.git.repoPath"]);
+    expect(analyzeSharedConfigPortability(rootDir).map((issue) => issue.path)).toContain("extractor");
+
+    const applied = migrateSharedConfigToLocal(rootDir, { apply: true });
+    const shared = JSON.parse(readFileSync(configPath, "utf8"));
+    const local = JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.local.json"), "utf8"));
+
+    expect(applied.conflicts).toEqual(["sources.git.repoPath"]);
+    expect(shared.sources.git).toEqual({ enabled: true, maxCommits: 50 });
+    expect(shared.sources.codex).toEqual({ projectOnly: true });
+    expect(shared.sources.claude).toEqual({ projectOnly: false });
+    expect(shared.extractor).toBeUndefined();
+    expect(shared.retrieval).toEqual({ mode: "hybrid" });
+    expect(local.sources.git.repoPath).toBe("./existing");
+    expect(local.sources.git.hookInstall).toBe(true);
+    expect(local.sources.codex.roots).toEqual(["./codex"]);
+    expect(local.sources.codex.includeDefaultRoots).toBe(false);
+    expect(local.sources.claude.roots).toEqual(["./claude"]);
+    expect(local.extractor.model).toBe("project-extractor");
+    expect(migrateSharedConfigToLocal(rootDir, { apply: true }).moved).toEqual([]);
   });
 
   it("creates project-local env and config examples without secrets", () => {

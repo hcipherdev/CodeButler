@@ -1,4 +1,5 @@
 import { scopeLabel } from "../memory/scope.js";
+import { runArtifactMaintenance } from "../maintenance/artifacts.js";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -444,6 +445,11 @@ async function refreshProjectSummaryInternal(
       manualEditsDetected: true,
       ...(backupPath ? { backupPath } : {})
     };
+  }
+  try {
+    runArtifactMaintenance(rootDir, config.retention!.artifacts, { apply: true, now });
+  } catch {
+    // Summary refresh is already committed; artifact cleanup is best effort.
   }
   return {
     checked: true,
