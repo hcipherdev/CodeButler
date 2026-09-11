@@ -80,6 +80,19 @@ describe("project config", () => {
       ["/*", "!/.gitignore", "!/config.json", "!/project-summary.md", ""].join("\n")
     );
     expect(existsSync(join(rootDir, ".code-butler", ".env.example"))).toBe(true);
+    expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.local.json"), "utf8"))).toEqual({
+      sources: {
+        git: { repoPath: ".", hookInstall: false },
+        codex: {
+          roots: [
+            join(homedir(), ".codex", "sessions"),
+            join(homedir(), ".codex", "archived_sessions")
+          ],
+          includeDefaultRoots: true
+        },
+        claude: { roots: [join(homedir(), ".claude", "projects")] }
+      }
+    });
     expect(existsSync(join(rootDir, ".code-butler", "config.examples.json"))).toBe(true);
     expect(defaults.sources.git.enabled).toBe(true);
     expect(defaults.promotion.confidenceThreshold).toBe(0.85);
@@ -110,6 +123,7 @@ describe("project config", () => {
     expect(defaults.retention!.artifacts.logs.maxBytes).toBe(5 * 1024 * 1024);
 
     mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, ".code-butler", "config.local.json"), "{}\n");
     writeFileSync(
       configPath,
       JSON.stringify(
@@ -162,6 +176,7 @@ describe("project config", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(join(rootDir, ".code-butler", "config.local.json"), "{}\n");
     writeFileSync(
       configPath,
       JSON.stringify({
@@ -198,6 +213,7 @@ describe("project config", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(join(rootDir, ".code-butler", "config.local.json"), "{}\n");
     writeFileSync(
       configPath,
       JSON.stringify({
@@ -466,6 +482,7 @@ describe("project config", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(join(rootDir, ".code-butler", "config.local.json"), "{}\n");
     writeFileSync(
       configPath,
       JSON.stringify(
@@ -495,6 +512,7 @@ describe("project config", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(join(rootDir, ".code-butler", "config.local.json"), "{}\n");
     writeFileSync(
       configPath,
       JSON.stringify(
