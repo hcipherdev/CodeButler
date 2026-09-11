@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createMemoryOrigin } from "../src/memory/origin.js";
+import { CORE_LAYER } from "../src/memory/layer.js";
 import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
 import {
   createEmbeddingEndpointHash,
@@ -21,12 +22,13 @@ describe("automatic sync", () => {
   let tempDirs: string[] = [];
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     for (const dir of tempDirs) cleanupTempDir(dir);
     tempDirs = [];
   });
 
   function git(repo: string, args: string[]): string {
-    return execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+    return execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
   }
 
   function createFixtureWorkspace(): {
@@ -226,6 +228,71 @@ describe("automatic sync", () => {
     expect(store.listMemoryCandidates()).toHaveLength(1);
     expect(store.getSyncStatus("git")?.lastSyncAt).toBeTruthy();
 
+    store.close();
+  });
+
+  it("defaults unpromoted extracted memories to the feature branch layer during sync", async () => {
+    const { rootDir, repoDir } = createFixtureWorkspace();
+    const codeButlerHome = makeTempDir();
+    tempDirs.push(codeButlerHome);
+    vi.stubEnv("CODE_BUTLER_HOME", codeButlerHome);
+    git(repoDir, ["checkout", "-b", "feature/sync-memory"]);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const provider: ExtractorProvider = {
+      async extract(context) {
+        return {
+          memories: [
+            {
+              type: "constraint",
+              title: "Branch-only sync probe",
+              summary: "Keep the sync branch probe local until merge review.",
+              reason: "The evidence only comes from a branch conversation.",
+              confidence: 0.91,
+              dedupeKey: "branch-sync-probe",
+              relatedFiles: ["src/cache.ts"],
+              evidence: [
+                {
+                  sourceType: "conversation",
+                  sourceId: context.conversations[0]!.sourceId,
+                  locator: `${context.conversations[0]!.sourceId}:chunk:0`
+                }
+              ]
+            },
+            {
+              type: "bug_fix",
+              title: "Shared sync probe",
+              summary: "Promote sync facts when commit and conversation evidence agree.",
+              reason: "The promotion policy has both configured evidence categories.",
+              confidence: 0.91,
+              dedupeKey: "shared-sync-probe",
+              relatedFiles: ["src/cache.ts"],
+              evidence: [
+                { sourceType: "commit", sourceId: context.commits[0]!.hash },
+                {
+                  sourceType: "conversation",
+                  sourceId: context.conversations[0]!.sourceId,
+                  locator: `${context.conversations[0]!.sourceId}:chunk:0`
+                }
+              ]
+            }
+          ],
+          rejected: []
+        };
+      }
+    };
+
+    const result = await syncProjectMemory(store, config, { extractorProvider: provider });
+    const branchCandidate = store.listMemoryCandidates({ qualityStatus: "all" })
+      .find((candidate) => candidate.dedupeKey === "branch-sync-probe")!;
+    const sharedMemory = store.listMemories({ qualityStatus: "all" })
+      .find((memory) => memory.dedupeKey === "shared-sync-probe")!;
+
+    expect(result.memories).toMatchObject({ candidates: 2, promoted: 1 });
+    expect(branchCandidate.layer).toMatch(/^branch:feature\/sync-memory:device:[0-9a-f-]{36}$/);
+    expect(branchCandidate.promotionState).toBe("candidate");
+    expect(sharedMemory.layer).toBe(CORE_LAYER);
     store.close();
   });
 
@@ -821,6 +888,45 @@ describe("automatic sync", () => {
     expect(result.embeddings).toMatchObject({ enabled: false, built: 0 });
     expect(providerCalls).toBe(0);
     expect(store.listEmbeddingJobs()).toEqual([]);
+    store.close();
+  });
+
+  it("reports an automatic promotion summary and promotes merged-branch memory during sync", async () => {
+    const { rootDir, repoDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+
+    // Merge a feature branch so its layer classifies as `merged`.
+    git(repoDir, ["branch", "-M", "main"]);
+    git(repoDir, ["checkout", "-b", "feature/sync-promotion"]);
+    writeFileSync(join(repoDir, "src", "auth.ts"), "export const auth = true;\n");
+    git(repoDir, ["add", "src/auth.ts"]);
+    git(repoDir, ["commit", "-m", "Add auth module"]);
+    git(repoDir, ["checkout", "main"]);
+    git(repoDir, ["merge", "--no-ff", "-m", "Merge feature", "feature/sync-promotion"]);
+
+    store.upsertMemoryCandidate({
+      layer: "branch:feature/sync-promotion",
+      type: "decision",
+      title: "Auth caching",
+      summary: "The auth middleware caches tokens in Redis.",
+      reason: "Found while building the feature.",
+      confidence: 0.95,
+      scope: { kind: "project" },
+      evidence: [],
+      relatedFiles: [],
+      dedupeKey: "sync-auto-promotion"
+    }, { qualityStatus: "active", qualityReasons: [] });
+
+    const result = await syncProjectMemory(store, config, { source: "git" });
+    expect(result.promotions).toMatchObject({ promoted: 1, converged: 0, deferred: 0, warnings: [] });
+    expect(store.listMemories({ layer: "core", lifecycleStatus: "current", qualityStatus: "all", limit: null }))
+      .toHaveLength(1);
+
+    // A second sync must not promote again or report new work.
+    const second = await syncProjectMemory(store, config, { source: "git" });
+    expect(second.promotions).toMatchObject({ promoted: 0, converged: 0, deferred: 0, skipped: 0 });
     store.close();
   });
 

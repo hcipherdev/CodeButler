@@ -22,3 +22,20 @@ Memories carry project-wide, conditional, or unspecified applicability separatel
 from generation origin. Retrieval labels OS, architecture, and shell mismatches
 without filtering history. The `update_memory_scope` tool corrects scope atomically
 with linked candidate/durable records. See [memory scope and applicability](./privacy.md#memory-scope-and-applicability).
+
+## Memory layers
+
+A memory's *layer* is a separate axis from its scope: scope says where a memory's
+advice applies, layer says where the memory lives. Promoted durable memories default
+to the shared `core` layer; unpromoted durable candidates default to the current
+branch/device layer when the configured Git repo is off the default branch. Temporary
+working context defaults to `device:<id>` and stays on the machine that recorded it.
+`find_memories` reports each memory's layer and
+accepts an optional `layer` filter (`core`, `device`, `branch`, or `all`, defaulting
+to all). `update_memory_layer` moves existing memories between layers atomically
+with linked candidate/durable records. `suggest_memory_layer_promotions` is a
+read-only review pass for non-core durable memories that may be ready for `core`.
+Branch merge triage adds a reviewed path for branch layers:
+`suggest_branch_memory_triage` classifies branch memories as current, merged, stale,
+active, or unknown, and `resolve_branch_memory_triage` explicitly promotes,
+discards, or retains them. Sync does not auto-promote branch memories.

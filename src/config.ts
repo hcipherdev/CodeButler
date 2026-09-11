@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type { ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, ProjectConfig, RedactionPatternConfig } from "./types.js";
+import type { ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, LayerRetentionConfig, ProjectConfig, RedactionPatternConfig } from "./types.js";
 import { validateRedactionPattern } from "./privacy/policy.js";
 
 interface ProjectConfigFile {
@@ -13,7 +13,9 @@ interface ProjectConfigFile {
   };
   extractor?: ExtractorConfigInput;
   investigator?: InvestigatorConfigInput;
-  promotion?: Partial<ProjectConfig["promotion"]>;
+  promotion?: Partial<Omit<ProjectConfig["promotion"], "automatic">> & {
+    automatic?: Partial<ProjectConfig["promotion"]["automatic"]>;
+  };
   sync?: Partial<ProjectConfig["sync"]>;
   retrieval?: Partial<ProjectConfig["retrieval"]>;
   embeddings?: Partial<ProjectConfig["embeddings"]>;
@@ -22,6 +24,10 @@ interface ProjectConfigFile {
     migrationBackups?: number;
     sources?: Partial<Record<"git" | "codex" | "claude" | "manual", { maxAgeDays?: number | null }>>;
     overrides?: Array<{ sourceId: string; maxAgeDays: number | null }>;
+    layers?: Partial<Omit<LayerRetentionConfig, "branch" | "device">> & {
+      branch?: Partial<LayerRetentionConfig["branch"]>;
+      device?: Partial<LayerRetentionConfig["device"]>;
+    };
   };
   deterministic?: Partial<ProjectConfig["deterministic"]> & {
     triggers?: Partial<ProjectConfig["deterministic"]["triggers"]>;
@@ -138,7 +144,13 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
     investigator: resolveProviderConfig("investigator", defaults.investigator, globalConfig, parsed.investigator),
     promotion: {
       ...defaults.promotion,
-      ...(parsed.promotion ?? {})
+      ...(parsed.promotion ?? {}),
+      // Nested so `promotion.automatic.enabled: false` alone cannot drop the
+      // other automatic defaults and leave minScore undefined.
+      automatic: {
+        ...defaults.promotion.automatic,
+        ...(parsed.promotion?.automatic ?? {})
+      }
     },
     sync: {
       ...defaults.sync,
@@ -164,7 +176,20 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
         claude: { ...defaults.retention!.sources.claude, ...(parsed.retention?.sources?.claude ?? {}) },
         manual: { ...defaults.retention!.sources.manual, ...(parsed.retention?.sources?.manual ?? {}) }
       },
-      overrides: parsed.retention?.overrides ?? defaults.retention!.overrides
+      overrides: parsed.retention?.overrides ?? defaults.retention!.overrides,
+      // Nested, so a file setting only retention.layers.enabled keeps every other default.
+      layers: {
+        ...defaults.retention!.layers,
+        ...(parsed.retention?.layers ?? {}),
+        branch: {
+          ...defaults.retention!.layers.branch,
+          ...(parsed.retention?.layers?.branch ?? {})
+        },
+        device: {
+          ...defaults.retention!.layers.device,
+          ...(parsed.retention?.layers?.device ?? {})
+        }
+      }
     },
     deterministic: {
       ...defaults.deterministic,
@@ -225,10 +250,18 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
     promotion: {
       confidenceThreshold: 0.85,
       requireCommitAndConversation: true,
-      minSourceCategories: 2
+      minSourceCategories: 2,
+      automatic: {
+        enabled: true,
+        mode: "conservative",
+        minScore: 0.85,
+        mergedBranches: true,
+        deviceMemories: true
+      }
     },
     sync: {
-      autoSyncOnServerStart: true
+      autoSyncOnServerStart: true,
+      shareLocalLayers: "durable"
     },
     retrieval: {
       mode: "fts",
@@ -253,7 +286,15 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
         claude: { maxAgeDays: null },
         manual: { maxAgeDays: null }
       },
-      overrides: []
+      overrides: [],
+      // Conservative by default: only a branch that no longer exists locally ages out,
+      // and only after the grace period. Idle age-out is available but off.
+      layers: {
+        enabled: true,
+        graceDays: 30,
+        branch: { onDeleted: "archive", onMerged: "keep", maxIdleDays: null },
+        device: { maxIdleDays: null }
+      }
     },
     deterministic: {
       enabled: true,
@@ -320,13 +361,67 @@ function validateProjectConfigFile(value: unknown): void {
     }
   }
 
+  const promotion = optionalConfigSection(value, "promotion");
+  if (promotion) validatePromotionConfig(promotion);
+
+  const sync = value.sync;
+  if (sync !== undefined) {
+    if (!isConfigRecord(sync)) throw new Error("sync must be an object");
+    assertKnownKeys(sync, new Set(["autoSyncOnServerStart", "shareLocalLayers"]), "sync");
+    if (sync.autoSyncOnServerStart !== undefined && typeof sync.autoSyncOnServerStart !== "boolean") {
+      throw new Error("sync.autoSyncOnServerStart must be a boolean");
+    }
+    if (sync.shareLocalLayers !== undefined && !["durable", "all", "none"].includes(String(sync.shareLocalLayers))) {
+      throw new Error("sync.shareLocalLayers must be durable, all, or none");
+    }
+  }
   const retention = optionalConfigSection(value, "retention");
   if (retention) validateRetentionConfig(retention);
 }
 
+function validatePromotionConfig(promotion: Record<string, unknown>): void {
+  assertKnownKeys(
+    promotion,
+    new Set(["confidenceThreshold", "requireCommitAndConversation", "minSourceCategories", "automatic"]),
+    "promotion"
+  );
+  if (promotion.confidenceThreshold !== undefined && !isUnitInterval(promotion.confidenceThreshold)) {
+    throw new Error("promotion.confidenceThreshold must be a number between 0 and 1");
+  }
+  if (promotion.requireCommitAndConversation !== undefined && typeof promotion.requireCommitAndConversation !== "boolean") {
+    throw new Error("promotion.requireCommitAndConversation must be a boolean");
+  }
+  if (promotion.minSourceCategories !== undefined && !isPositiveInteger(promotion.minSourceCategories)) {
+    throw new Error("promotion.minSourceCategories must be a positive integer");
+  }
+  if (promotion.automatic === undefined) return;
+  if (!isConfigRecord(promotion.automatic)) throw new Error("promotion.automatic must be an object");
+  const automatic = promotion.automatic;
+  assertKnownKeys(
+    automatic,
+    new Set(["enabled", "mode", "minScore", "mergedBranches", "deviceMemories"]),
+    "promotion.automatic"
+  );
+  for (const flag of ["enabled", "mergedBranches", "deviceMemories"] as const) {
+    if (automatic[flag] !== undefined && typeof automatic[flag] !== "boolean") {
+      throw new Error(`promotion.automatic.${flag} must be a boolean`);
+    }
+  }
+  if (automatic.mode !== undefined && automatic.mode !== "conservative") {
+    throw new Error("promotion.automatic.mode must be conservative");
+  }
+  if (automatic.minScore !== undefined && !isUnitInterval(automatic.minScore)) {
+    throw new Error("promotion.automatic.minScore must be a number between 0 and 1");
+  }
+}
+
+function isUnitInterval(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
 function optionalConfigSection(
   config: Record<string, unknown>,
-  name: "retrieval" | "embeddings" | "privacy" | "retention"
+  name: "retrieval" | "embeddings" | "privacy" | "retention" | "promotion"
 ): Record<string, unknown> | undefined {
   const value = config[name];
   if (value === undefined) return undefined;
@@ -343,10 +438,11 @@ function isPositiveInteger(value: unknown): value is number {
 }
 
 function validateRetentionConfig(retention: Record<string, unknown>): void {
-  assertKnownKeys(retention, new Set(["migrationBackups", "sources", "overrides"]), "retention");
+  assertKnownKeys(retention, new Set(["migrationBackups", "sources", "overrides", "layers"]), "retention");
   if (retention.migrationBackups !== undefined && !isNonNegativeInteger(retention.migrationBackups)) {
     throw new Error("retention.migrationBackups must be a non-negative integer");
   }
+  if (retention.layers !== undefined) validateLayerRetentionConfig(retention.layers);
   if (retention.sources === undefined) return;
   if (!isConfigRecord(retention.sources)) throw new Error("retention.sources must be an object");
   assertKnownKeys(retention.sources, new Set(["git", "codex", "claude", "manual"]), "retention.sources");
@@ -371,6 +467,39 @@ function validateRetentionConfig(retention: Record<string, unknown>): void {
         throw new Error(`retention.overrides[${index}].maxAgeDays must be null or a positive integer`);
       }
     }
+  }
+}
+
+function validateLayerRetentionConfig(value: unknown): void {
+  if (!isConfigRecord(value)) throw new Error("retention.layers must be an object");
+  assertKnownKeys(value, new Set(["enabled", "graceDays", "branch", "device"]), "retention.layers");
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") {
+    throw new Error("retention.layers.enabled must be a boolean");
+  }
+  if (value.graceDays !== undefined && !isNonNegativeInteger(value.graceDays)) {
+    throw new Error("retention.layers.graceDays must be a non-negative integer");
+  }
+  if (value.branch !== undefined) {
+    if (!isConfigRecord(value.branch)) throw new Error("retention.layers.branch must be an object");
+    assertKnownKeys(value.branch, new Set(["onDeleted", "onMerged", "maxIdleDays"]), "retention.layers.branch");
+    for (const key of ["onDeleted", "onMerged"] as const) {
+      const action = value.branch[key];
+      if (action !== undefined && action !== "archive" && action !== "keep") {
+        throw new Error(`retention.layers.branch.${key} must be archive or keep`);
+      }
+    }
+    assertOptionalIdleDays(value.branch.maxIdleDays, "retention.layers.branch.maxIdleDays");
+  }
+  if (value.device !== undefined) {
+    if (!isConfigRecord(value.device)) throw new Error("retention.layers.device must be an object");
+    assertKnownKeys(value.device, new Set(["maxIdleDays"]), "retention.layers.device");
+    assertOptionalIdleDays(value.device.maxIdleDays, "retention.layers.device.maxIdleDays");
+  }
+}
+
+function assertOptionalIdleDays(value: unknown, path: string): void {
+  if (value !== undefined && value !== null && !isPositiveInteger(value)) {
+    throw new Error(`${path} must be null or a positive integer`);
   }
 }
 
@@ -486,10 +615,18 @@ function defaultConfigFile(): ProjectConfigFile {
     promotion: {
       confidenceThreshold: 0.85,
       requireCommitAndConversation: true,
-      minSourceCategories: 2
+      minSourceCategories: 2,
+      automatic: {
+        enabled: true,
+        mode: "conservative",
+        minScore: 0.85,
+        mergedBranches: true,
+        deviceMemories: true
+      }
     },
     sync: {
-      autoSyncOnServerStart: true
+      autoSyncOnServerStart: true,
+      shareLocalLayers: "durable"
     },
     retrieval: {
       mode: "fts",
@@ -514,7 +651,15 @@ function defaultConfigFile(): ProjectConfigFile {
         claude: { maxAgeDays: null },
         manual: { maxAgeDays: null }
       },
-      overrides: []
+      overrides: [],
+      // Conservative by default: only a branch that no longer exists locally ages out,
+      // and only after the grace period. Idle age-out is available but off.
+      layers: {
+        enabled: true,
+        graceDays: 30,
+        branch: { onDeleted: "archive", onMerged: "keep", maxIdleDays: null },
+        device: { maxIdleDays: null }
+      }
     },
     deterministic: {
       enabled: true,

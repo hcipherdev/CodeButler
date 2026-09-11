@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isCliEntrypoint, runCli } from "../src/cli.js";
+import { withProjectGate } from "../src/cloud/gate.js";
 import { loadProjectConfig } from "../src/config.js";
 import { createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey } from "../src/embeddings/fingerprint.js";
 import type { ProjectSummaryGenerator } from "../src/project-summary/service.js";
@@ -43,14 +44,19 @@ describe("CLI", () => {
       "  code-butler cloud status",
       "  code-butler cloud sync",
       "  code-butler cloud disable",
-      "  code-butler cloud resolve --keep <local|cloud>",
+      "  code-butler cloud resolve --keep <local|cloud|merge>",
       "  code-butler ingest conversation <file>",
       "  code-butler ingest git <repo> [--max-commits <n>]",
       "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",
       "  code-butler decision import <markdown-file>",
       "  code-butler memory audit [--fix] [--json]",
-      "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>] [--scope-json <json>] [--json]",
+      "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>] [--scope-json <json>] [--layer <layer>] [--json]",
       "  code-butler memory scope --id <id> --category <candidate|promoted|temporary> --scope-json <json> --reason <text> [--json]",
+      "  code-butler memory layer --id <id> --category <candidate|promoted|temporary> --layer <layer> --reason <text> [--json]",
+      "  code-butler memory promotions [--layer <core|device|branch|all>] [--min-score <0..1>] [--min-confidence <0..1>] [--limit <n>] [--promoted-only] [--json]",
+      "  code-butler memory retention [--apply] [--history] [--id <id>] [--limit <n>] [--json]",
+      "  code-butler memory branch-triage [--branch <name>] [--include-active] [--stale-days <n>] [--include-reviewed] [--limit <n>] [--json]",
+      "  code-butler memory branch-resolve --id <id> --category <candidate|promoted> --action <promote_to_core|discard|retain_branch> --reason <text> [--supersedes <memory-id>] [--json]",
     "  code-butler memory status --id <id> --status <current|superseded|retracted> --reason <text> [--replacement <id>]",
       "  code-butler memory conflicts [--fix] [--json]",
       "  code-butler doctor [--json] [--strict]",
@@ -1352,6 +1358,59 @@ describe("CLI", () => {
     controller.abort();
 
     await expect(watch).resolves.toBe(0);
+  });
+
+  it("does not hold the project gate while watch generates a summary", async () => {
+    const { rootDir } = createConversationProject();
+    const output: string[] = [];
+    const controller = new AbortController();
+    writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Existing Brief\n");
+    writeFileSync(
+      join(rootDir, ".code-butler", "project-summary.meta.json"),
+      JSON.stringify({
+        version: 1,
+        summaryPath: join(rootDir, ".code-butler", "project-summary.md"),
+        fingerprint: "old",
+        outputContentHash: createHash("sha256").update("# Existing Brief\n").digest("hex"),
+        lastGeneratedAt: "2026-06-14T10:00:00.000Z",
+        lastCheckedAt: "2026-06-14T10:00:00.000Z"
+      })
+    );
+    let summaryStarted!: () => void;
+    let releaseSummary!: (value: string) => void;
+    const summaryStartedPromise = new Promise<void>((resolve) => { summaryStarted = resolve; });
+    const summaryReady = new Promise<string>((resolve) => { releaseSummary = resolve; });
+    const watch = runCli(["watch", "--interval", "60", "--source", "claude"], {
+      cwd: rootDir,
+      stdout: (line) => output.push(line),
+      signal: controller.signal,
+      projectSummaryGenerator: {
+        async generate() {
+          summaryStarted();
+          return summaryReady;
+        }
+      },
+      now: () => new Date("2026-06-16T10:00:00Z")
+    });
+
+    let gate: Promise<"entered"> | undefined;
+    let gateResult: "entered" | "blocked" = "blocked";
+    try {
+      await summaryStartedPromise;
+      gate = withProjectGate(rootDir, () => "entered" as const);
+      gateResult = await Promise.race([
+        gate,
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 100))
+      ]);
+    } finally {
+      releaseSummary("# Watch Generated Brief\n");
+      controller.abort();
+      await gate?.catch(() => "blocked");
+      await watch;
+    }
+
+    expect(output.join("\n")).toContain("Synced project memory");
+    expect(gateResult).toBe("entered");
   });
 
   it("watch does not bootstrap an uninitialized project", async () => {

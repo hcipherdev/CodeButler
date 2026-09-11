@@ -1,4 +1,5 @@
 import { inferScope, normalizeScope, scopeKey } from "./scope.js";
+import { CORE_LAYER, normalizeLayer } from "./layer.js";
 import { createHash } from "node:crypto";
 
 import { createMemoryOrigin, type OriginFactory } from "./origin.js";
@@ -14,10 +15,12 @@ interface RememberOptions {
   actor?: OperationActor;
   originFactory?: OriginFactory;
   client?: MemoryOrigin["client"];
+  defaultLayer?: string | undefined;
 }
 
 export interface RememberProjectMemoryInput {
   scope?: import("../types.js").MemoryScope;
+  layer?: string | undefined;
   type: MemoryType;
   text: string;
   title?: string | undefined;
@@ -61,8 +64,9 @@ function rememberProjectMemoryAtomically(
   const reason = cleanMemoryText(input.reason ?? "Captured from explicit user memory request.");
   const now = (options.now ?? (() => new Date()))().toISOString();
   const scope = normalizeScope(input.scope ?? inferScope(summary));
+  const layer = normalizeLayer(input.layer ?? (!shouldPromote ? options.defaultLayer : undefined) ?? CORE_LAYER);
   const stableId = stableMemoryId(type, summary);
-  const sourceId = `manual-memory:${type}:${stableId}${scopeKey(scope) === "unspecified" ? "" : `:scope:${scopeKey(scope)}`}`;
+  const sourceId = `manual-memory:${type}:${stableId}${scopeKey(scope) === "unspecified" ? "" : `:scope:${scopeKey(scope)}`}${layer === CORE_LAYER ? "" : `:layer:${layer}`}`;
   const locator = `${sourceId}:chunk:0`;
 
   store.addSourceWithChunks({
@@ -92,6 +96,7 @@ function rememberProjectMemoryAtomically(
 
   const extracted = {
     scope,
+    layer,
     type,
     title,
     summary,

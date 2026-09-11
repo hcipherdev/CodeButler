@@ -31,7 +31,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(12);
+    expect(CURRENT_SCHEMA_VERSION).toBe(18);
     expect(store.db.prepare("pragma table_info(source_failures)").all()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "adapter" }),
@@ -60,9 +60,81 @@ describe("ordered storage migrations", () => {
         expect.objectContaining({ name: "operation_id" })
       ])
     );
+    expect(store.db.prepare("pragma table_info(branch_triage_reviews)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "memory_id" }),
+        expect.objectContaining({ name: "category" }),
+        expect.objectContaining({ name: "memory_version" }),
+        expect.objectContaining({ name: "action" }),
+        expect.objectContaining({ name: "reviewed_at" })
+      ])
+    );
+    expect(store.db.prepare("pragma table_info(promotion_decisions)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "memory_id" }),
+        expect.objectContaining({ name: "category" }),
+        expect.objectContaining({ name: "memory_version" }),
+        expect.objectContaining({ name: "policy_version" }),
+        expect.objectContaining({ name: "decision" }),
+        expect.objectContaining({ name: "reason_codes_json" }),
+        expect.objectContaining({ name: "core_memory_id" }),
+        expect.objectContaining({ name: "decided_at" })
+      ])
+    );
+    expect(store.db.prepare("pragma table_info(layer_retention_decisions)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "memory_id" }),
+        expect.objectContaining({ name: "category" }),
+        expect.objectContaining({ name: "memory_version" }),
+        expect.objectContaining({ name: "policy_version" }),
+        expect.objectContaining({ name: "decision" }),
+        expect.objectContaining({ name: "reason_codes_json" }),
+        expect.objectContaining({ name: "layer" }),
+        expect.objectContaining({ name: "decided_at" })
+      ])
+    );
+    expect(store.db.prepare("pragma table_info(peer_partitions)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "segment_id", pk: 1 }),
+        expect.objectContaining({ name: "layer" }),
+        expect.objectContaining({ name: "writer_installation_id" }),
+        expect.objectContaining({ name: "fingerprint" }),
+        expect.objectContaining({ name: "imported_at" })
+      ])
+    );
     const migrationOperations = store.listOperations({ operationType: "migration" });
-    expect(migrationOperations).toHaveLength(4);
+    expect(migrationOperations).toHaveLength(10);
     expect(migrationOperations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 18 }
+      }),
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 17 }
+      }),
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 16 }
+      }),
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 15 }
+      }),
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 14 }
+      }),
       expect.objectContaining({
         operationType: "migration",
         status: "completed",
@@ -316,7 +388,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(12);
+    expect(CURRENT_SCHEMA_VERSION).toBe(18);
     expect(store.db.prepare("select count(*) as count from sources").get()).toEqual(before.sources);
     expect(store.db.prepare("select count(*) as count from chunks").get()).toEqual(before.chunks);
     expect(store.db.prepare("select count(*) as count from memories").get()).toEqual(before.memories);

@@ -78,7 +78,7 @@ export async function runCloudCommand(args: string[], root: string, output: (lin
     }
     return 0;
   }
-  const keep = command === "resolve" ? z.enum(["local", "cloud"]).parse(flags.get("--keep")) : undefined;
+  const keep = command === "resolve" ? z.enum(["local", "cloud", "merge"]).parse(flags.get("--keep")) : undefined;
   if (!binding(root)?.enabled) throw new Error("Cloud sync is not enabled for this checkout");
   const result = await cloudSync(root, keep); output(JSON.stringify(result, null, 2)); return 0;
 }

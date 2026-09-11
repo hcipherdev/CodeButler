@@ -41,11 +41,16 @@ const OPAQUE_IDENTIFIER_PATTERNS = [
   /^(?:operation|memory|source|decision)-[a-f0-9]{8}-[a-f0-9-]{27}$/i,
   /^memory-manual-decision-[a-f0-9]{8}-[a-f0-9-]{27}$/i,
   /^commit-[a-f0-9]{7,64}$/i,
-  /^(?:export|import|redaction|retention|recovery|batch)-[0-9]+$/
+  /^(?:export|import|redaction|retention|recovery|batch|merge)-[0-9]+$/
 ];
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const SOURCE_TYPES = new Set<SourceType>(["conversation", "commit", "decision"]);
 const LIFECYCLE_STATUSES = new Set<MemoryLifecycleStatus>(["current", "superseded", "retracted"]);
+const BRANCH_TRIAGE_ACTIONS = new Set(["promote_to_core", "discard", "retain_branch"]);
+const AUTOMATIC_PROMOTION_DECISIONS = new Set(["promote", "converge", "defer", "skip"]);
+const LAYER_RETENTION_DECISIONS = new Set(["archive", "skip"]);
+/** Both decision-bearing operation types share the `decision` metadata key. */
+const DECISION_VALUES = new Set([...AUTOMATIC_PROMOTION_DECISIONS, ...LAYER_RETENTION_DECISIONS]);
 const METADATA_CATEGORIES = new Set([
   "all", "candidates", "chunks", "commits", "database", "decisions", "embeddings",
   "memories", "operations", "project", "schema", "sources", "temporary_memories", "tombstones"
@@ -53,6 +58,32 @@ const METADATA_CATEGORIES = new Set([
 
 const METADATA_KEYS: Record<OperationType, ReadonlySet<string>> = {
   scope_change: new Set(["memoryIdHash", "reasonHash", "category"]),
+  layer_change: new Set(["memoryIdHash", "reasonHash", "category"]),
+  branch_triage: new Set([
+    "memoryIdHash",
+    "branchHash",
+    "reasonHash",
+    "category",
+    "action",
+    "promotedMemoryIdHash",
+    "supersedesMemoryIdHash"
+  ]),
+  automatic_promotion: new Set([
+    "memoryIdHash",
+    "coreMemoryIdHash",
+    "category",
+    "decision",
+    "reasonCodesHash",
+    "policyVersion"
+  ]),
+  layer_retention: new Set([
+    "memoryIdHash",
+    "category",
+    "decision",
+    "reasonCodesHash",
+    "policyVersion"
+  ]),
+  cloud_merge: new Set(["identifier", "count", "category"]),
   migration: new Set(["migrationVersion"]),
   lifecycle_change: new Set(["memoryIdHash", "previousStatus", "newStatus", "replacementMemoryIdHash"]),
   redaction: new Set(["identifier", "count", "category"]),
@@ -286,16 +317,34 @@ function validateMetadataValue(key: string, value: unknown): void {
     if (typeof value !== "string" || !METADATA_CATEGORIES.has(value)) {
       throw new Error("category operation metadata must be an allowlisted category");
     }
-  } else if (key === "count" || key === "migrationVersion") {
+  } else if (key === "count" || key === "migrationVersion" || key === "policyVersion") {
     if (typeof value !== "number" || !Number.isSafeInteger(value) ||
-        value < (key === "migrationVersion" ? 1 : 0)) {
+        value < (key === "count" ? 0 : 1)) {
       throw new Error(`${key} operation metadata must be a safe non-negative integer`);
     }
   } else if (key === "sourceType") {
     assertSourceType(value);
-  } else if (key === "reasonHash" || key === "sourceIdHash" || key === "memoryIdHash" || key === "replacementMemoryIdHash") {
+  } else if (
+    key === "reasonHash" ||
+    key === "sourceIdHash" ||
+    key === "memoryIdHash" ||
+    key === "replacementMemoryIdHash" ||
+    key === "branchHash" ||
+    key === "promotedMemoryIdHash" ||
+    key === "supersedesMemoryIdHash" ||
+    key === "coreMemoryIdHash" ||
+    key === "reasonCodesHash"
+  ) {
     if (typeof value !== "string" || !HASH_PATTERN.test(value)) {
       throw new Error(`${key} operation metadata must be a SHA-256 hex digest`);
+    }
+  } else if (key === "action") {
+    if (typeof value !== "string" || !BRANCH_TRIAGE_ACTIONS.has(value)) {
+      throw new Error("action operation metadata must be a branch triage action");
+    }
+  } else if (key === "decision") {
+    if (typeof value !== "string" || !DECISION_VALUES.has(value)) {
+      throw new Error("decision operation metadata must be an automatic promotion or layer retention decision");
     }
   } else if (key === "previousStatus" || key === "newStatus") {
     if (typeof value !== "string" || !LIFECYCLE_STATUSES.has(value as MemoryLifecycleStatus)) {

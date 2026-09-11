@@ -4,6 +4,11 @@ export const OPERATION_TYPES = [
   "migration",
   "lifecycle_change",
   "scope_change",
+  "layer_change",
+  "branch_triage",
+  "automatic_promotion",
+  "layer_retention",
+  "cloud_merge",
   "redaction",
   "deletion",
   "export",
@@ -18,6 +23,9 @@ export const OPERATION_ACTORS = ["cli", "mcp", "system"] as const;
 export type OperationType = typeof OPERATION_TYPES[number];
 export type OperationStatus = typeof OPERATION_STATUSES[number];
 export type OperationActor = typeof OPERATION_ACTORS[number];
+export type BranchTriageAction = "promote_to_core" | "discard" | "retain_branch";
+export type AutomaticPromotionDecisionKind = "promote" | "converge" | "defer" | "skip";
+export type LayerRetentionDecisionKind = "archive" | "skip";
 
 export interface IdentifierCountCategoryMetadata {
   identifier?: string | undefined;
@@ -27,6 +35,32 @@ export interface IdentifierCountCategoryMetadata {
 
 export interface OperationMetadataByType {
   scope_change: { memoryIdHash?: string; reasonHash?: string; category?: string };
+  layer_change: { memoryIdHash?: string; reasonHash?: string; category?: string };
+  branch_triage: {
+    memoryIdHash?: string;
+    branchHash?: string;
+    reasonHash?: string;
+    category?: string;
+    action?: BranchTriageAction;
+    promotedMemoryIdHash?: string;
+    supersedesMemoryIdHash?: string;
+  };
+  automatic_promotion: {
+    memoryIdHash?: string;
+    coreMemoryIdHash?: string;
+    category?: string;
+    decision?: AutomaticPromotionDecisionKind;
+    reasonCodesHash?: string;
+    policyVersion?: number;
+  };
+  layer_retention: {
+    memoryIdHash?: string;
+    category?: string;
+    decision?: LayerRetentionDecisionKind;
+    reasonCodesHash?: string;
+    policyVersion?: number;
+  };
+  cloud_merge: IdentifierCountCategoryMetadata;
   migration: { migrationVersion?: number | undefined };
   lifecycle_change: {
     memoryIdHash?: string | undefined;

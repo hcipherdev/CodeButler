@@ -377,7 +377,8 @@ export function deletePrivacySource(
 
 export function prunePrivacySources(
   store: MemoryStore,
-  retention: RetentionConfig,
+  // Source pruning reads only the source policy; layer retention is a separate pass.
+  retention: Pick<RetentionConfig, "sources" | "overrides">,
   options: {
     apply: boolean;
     purgeBackups?: boolean;
@@ -490,6 +491,13 @@ function parseExportDocument(raw: string): PrivacyExportDocument {
   }
   for (const table of PRIVACY_EXPORT_TABLES) {
     const rows = document.tables[table];
+    // A table added after the export was written is absent, not malformed. Treating it
+    // as empty keeps older exports importable without a version bump; a table that is
+    // present but not an array of rows is still a real error.
+    if (rows === undefined) {
+      document.tables[table] = [];
+      continue;
+    }
     if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== "object" || Array.isArray(row))) {
       throw new Error(`Invalid privacy export table: ${table}`);
     }
@@ -548,6 +556,10 @@ function importOrder(): readonly string[] {
     "temporary_memories",
     "temporary_memory_links",
     "memory_relations",
+    "branch_triage_reviews",
+    "promotion_decisions",
+    "layer_retention_decisions",
+    "peer_partitions",
     "source_failures",
     "source_tombstones"
   ];
@@ -562,13 +574,13 @@ const PRIVACY_EXPORT_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   sync_sources: ["source", "enabled", "last_sync_at", "last_success_at", "last_error", "metadata_json"],
   sync_cursors: ["source", "cursor_key", "cursor_value", "updated_at"],
   memory_candidates: [
-    "scope_json", "scope_key", "origin_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
+    "scope_json", "scope_key", "layer", "origin_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
     "related_files_json", "dedupe_key", "promotion_state", "promoted_memory_id",
     "evidence_signature", "quality_status", "quality_reasons_json", "last_verified_at",
     "created_at", "updated_at"
   ],
   memories: [
-    "scope_json", "scope_key", "origin_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
+    "scope_json", "scope_key", "layer", "origin_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
     "related_files_json", "dedupe_key", "evidence_signature", "source", "quality_status",
     "quality_reasons_json", "last_verified_at", "subject_key", "lifecycle_status",
     "valid_from", "valid_until", "status_reason", "status_changed_at",
@@ -577,12 +589,25 @@ const PRIVACY_EXPORT_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   memory_links: ["id", "owner_kind", "owner_id", "target_type", "target_id", "locator", "metadata_json"],
   temporary_memories: [
     "base_id",
-    "scope_json", "scope_key", "origin_json", "id", "project_id", "thread_id", "session_id", "source_adapter", "kind", "title",
+    "scope_json", "scope_key", "layer", "origin_json", "id", "project_id", "thread_id", "session_id", "source_adapter", "kind", "title",
     "summary", "details", "related_files_json", "evidence_json", "confidence", "created_at",
     "updated_at", "expires_at"
   ],
   temporary_memory_links: ["id", "memory_id", "target_type", "target_id", "locator", "metadata_json"],
   memory_relations: ["id", "from_memory_id", "to_memory_id", "relation_type", "created_at", "reason"],
+  branch_triage_reviews: [
+    "id", "memory_id", "category", "branch", "layer", "memory_version", "action", "reason",
+    "reviewed_at", "actor", "promoted_memory_id", "supersedes_memory_id"
+  ],
+  promotion_decisions: [
+    "id", "memory_id", "category", "memory_version", "policy_version", "decision",
+    "reason_codes_json", "target_layer", "core_memory_id", "decided_at", "actor"
+  ],
+  layer_retention_decisions: [
+    "id", "memory_id", "category", "memory_version", "policy_version", "decision",
+    "reason_codes_json", "layer", "decided_at", "actor"
+  ],
+  peer_partitions: ["segment_id", "layer", "writer_installation_id", "fingerprint", "imported_at"],
   source_failures: [
     "id", "adapter", "path", "error_code", "message", "first_occurred_at",
     "last_occurred_at", "attempts", "resolved_at"
@@ -623,6 +648,10 @@ const RESTORE_TABLE_ORDER = [
   "temporary_memories",
   "temporary_memory_links",
   "memory_relations",
+  "branch_triage_reviews",
+  "promotion_decisions",
+  "layer_retention_decisions",
+  "peer_partitions",
   "source_failures",
   "source_tombstones",
   "embedding_jobs",
@@ -759,6 +788,10 @@ function scrubStoredContent(store: MemoryStore): number {
   });
   update("temporary_memory_links", "id", { locator: "text", metadata_json: "json" });
   update("memory_relations", "id", { reason: "text" });
+  update("branch_triage_reviews", "id", { branch: "text", layer: "text", reason: "text" });
+  update("promotion_decisions", "id", { target_layer: "text", reason_codes_json: "json" });
+  update("layer_retention_decisions", "id", { layer: "text", reason_codes_json: "json" });
+  update("peer_partitions", "segment_id", { layer: "text" });
   update("source_failures", "id", { path: "text", message: "text" });
   update("sync_sources", "source", { last_error: "text", metadata_json: "json" });
   update("sync_cursors", ["source", "cursor_key"], { cursor_value: "text" });

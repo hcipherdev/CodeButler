@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { runCli } from "../src/cli.js";
 import { auditPrivacy, exportPrivacy, importPrivacy } from "../src/privacy/service.js";
+import { PRIVACY_EXPORT_TABLES } from "../src/privacy/export-format.js";
 import { openConfiguredMemoryStore } from "../src/storage/open-configured-store.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
@@ -148,14 +149,9 @@ describe("privacy audit and export", () => {
       version: 1,
       redacted: true,
       exportedAt: new Date().toISOString(),
-      tables: Object.fromEntries(
-        [
-          "sources", "chunks", "commits", "decisions", "relations", "sync_sources", "sync_cursors",
-          "memory_candidates", "memories", "memory_links", "temporary_memories",
-          "temporary_memory_links", "memory_relations", "source_failures", "source_tombstones",
-          "private_identity_mappings", "operation_log"
-        ].map((table) => [table, []])
-      )
+      // Derived from the constant so a newly exported table cannot silently turn
+      // this into an "incomplete document" test instead of an unknown-column one.
+      tables: Object.fromEntries(PRIVACY_EXPORT_TABLES.map((table) => [table, []]))
     };
     document.tables.sources = [{ unknown_column: "bad" }];
     writeFileSync(inputPath, JSON.stringify(document));

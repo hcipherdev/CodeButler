@@ -8,6 +8,9 @@ import { prunePrivacySources } from "../src/privacy/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
 import type { RetentionConfig } from "../src/types.js";
 
+/** Source pruning reads only these two fields. */
+type SourceRetention = Pick<RetentionConfig, "sources" | "overrides">;
+
 describe("privacy retention", () => {
   it("selects expired sources by adapter and exact overrides without mutating in dry-run mode", () => {
     const rootDir = mkdtempSync(join(tmpdir(), "code-butler-retention-"));
@@ -17,8 +20,7 @@ describe("privacy retention", () => {
     addSource(store, "old-manual", "manual", "2026-01-01T00:00:00.000Z");
     addSource(store, "override-keep", "codex", "2026-01-01T00:00:00.000Z");
     addSource(store, "override-delete", "manual", "2026-07-01T00:00:00.000Z");
-    const retention: RetentionConfig = {
-      migrationBackups: 5,
+    const retention: SourceRetention = {
       sources: {
         git: { maxAgeDays: null },
         codex: { maxAgeDays: 30 },
@@ -50,8 +52,7 @@ describe("privacy retention", () => {
     store.init();
     addSource(store, "old-codex", "codex", "2026-01-01T00:00:00.000Z");
     addSource(store, "old-manual", "manual", "2026-01-01T00:00:00.000Z");
-    const retention: RetentionConfig = {
-      migrationBackups: 5,
+    const retention: SourceRetention = {
       sources: {
         git: { maxAgeDays: null },
         codex: { maxAgeDays: 30 },

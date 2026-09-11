@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createAnthropicAwsProjectSummaryGenerator,
@@ -44,8 +44,13 @@ function openAiConfig(overrides: Partial<ExtractorConfig> = {}): ExtractorConfig
 }
 
 describe("project summary providers", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("maps OpenAI-compatible responses to summary markdown", async () => {
     process.env.TEST_PROJECT_SUMMARY_OPENAI_KEY = "test-key";
+    const timeout = vi.spyOn(AbortSignal, "timeout");
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       status: 200,
@@ -59,11 +64,20 @@ describe("project summary providers", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, { headers: Record<string, string>; body: string }];
     expect(url).toBe("https://example.test/v1/chat/completions");
     expect(init.headers.authorization).toBe("Bearer test-key");
+    expect(timeout).toHaveBeenLastCalledWith(300000);
     expect(JSON.parse(init.body)).toMatchObject({
       model: "gpt-test",
       temperature: 0
     });
     expect(JSON.parse(init.body).messages[0].content).toContain("project narrative summary");
+  });
+
+  it("fails clearly when OpenAI-compatible project summary requests time out", async () => {
+    process.env.TEST_PROJECT_SUMMARY_OPENAI_KEY = "test-key";
+    const fetchMock = vi.fn().mockRejectedValue(Object.assign(new Error("aborted"), { name: "TimeoutError" }));
+    const generator = createOpenAICompatibleProjectSummaryGenerator(openAiConfig(), fetchMock);
+
+    await expect(generator.generate(makeInput())).rejects.toThrow("Project summary request timed out");
   });
 
   it("accepts fenced JSON project summary responses", async () => {
@@ -140,8 +154,9 @@ describe("project summary providers", () => {
     );
 
     await expect(generator.generate(makeInput())).resolves.toBe("# AWS Brief\n");
-    const [, init] = httpMock.mock.calls[0] as [string, { body: string }];
+    const [, init] = httpMock.mock.calls[0] as [string, { body: string; timeoutMs?: number }];
     const body = JSON.parse(init.body);
+    expect(init.timeoutMs).toBe(300000);
     expect(body.max_tokens).toBe(8192);
     expect(body.system).toContain("project narrative summary");
     expect(body.messages[0].content).toContain("AGENTS.md");

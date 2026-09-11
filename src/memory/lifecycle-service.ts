@@ -1,6 +1,7 @@
 import type { MemoryStore } from "../storage/store.js";
 import { hashOperationIdentifier, recordCompletedOperation } from "../operations/log.js";
 import { afterCommit, withTransaction } from "../storage/transactions.js";
+import { assertWritableLayer } from "./peer-layer.js";
 import type { DurableMemory, MemoryLifecycleStatus, OperationActor } from "../types.js";
 
 export interface UpdateMemoryStatusInput {
@@ -26,6 +27,7 @@ export function updateMemoryStatus(
   return withTransaction(store.db, () => {
     const memory = store.readMemory(input.memoryId);
     if (!memory) throw new Error(`Unknown durable memory: ${input.memoryId}`);
+    assertWritableLayer(store, "promoted", input.memoryId);
 
     if (input.status === "superseded") {
       const replacementId = input.replacementMemoryId;

@@ -1,5 +1,19 @@
 import { registerDatabaseHandle } from "../cloud/gate.js";
 import { normalizeScope, parseScope, sanitizeScope, scopeKey, assessApplicability } from "../memory/scope.js";
+import { CORE_LAYER, deviceLayer, matchesLayerFilter, normalizeLayer, sanitizeLayer } from "../memory/layer.js";
+
+/**
+ * Peer layers are read from storage rather than derived, so a retrieval filter and the
+ * write guards agree on exactly the same set.
+ */
+function importedPeerLayers(db: DatabaseSync): string[] {
+  try {
+    return (db.prepare("select layer from peer_partitions order by layer").all() as Array<{ layer: string }>)
+      .map((row) => row.layer);
+  } catch {
+    return [];
+  }
+}
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -63,6 +77,8 @@ import type {
   MemoryCandidate,
   MemoryOrigin,
   MemoryChunk,
+  MemoryLayerFilter,
+  MemoryLayerOwner,
   MemoryLifecycleStatus,
   MemoryPromotionState,
   MemoryQualityStatus,
@@ -120,6 +136,7 @@ function sanitizeDecision(policy: StorageContentPolicy, decision: DecisionRecord
 function sanitizeExtractedMemory(policy: StorageContentPolicy, memory: ExtractedMemory): ExtractedMemory {
   return {
     scope: sanitizeScope(policy, memory.scope),
+    layer: sanitizeLayer(policy, memory.layer),
     origin: sanitizeMemoryOrigin(policy, memory.origin),
     type: memory.type,
     title: policy.text(memory.title),
@@ -138,6 +155,7 @@ function sanitizeTemporaryMemory(
 ): TemporaryMemoryUpsertInput {
   return {
     scope: sanitizeScope(policy, input.scope),
+    ...(input.layer === undefined ? {} : { layer: sanitizeLayer(policy, input.layer) }),
     origin: sanitizeMemoryOrigin(policy, input.origin),
     ...(input.id === undefined ? {} : { id: policy.identifier(input.id) }),
     ...(input.projectId === undefined ? {} : { projectId: policy.path(input.projectId) }),
@@ -387,7 +405,11 @@ export interface MemoryStore {
       lastVerifiedAt?: string | undefined;
     }
   ): MemoryCandidate;
-  promoteMemoryCandidate(candidateId: string, source?: DurableMemory["source"]): DurableMemory;
+  promoteMemoryCandidate(
+    candidateId: string,
+    source?: DurableMemory["source"],
+    options?: { layer?: string | undefined }
+  ): DurableMemory;
   upsertManualDecisionMemory(decision: DecisionRecord, origin?: MemoryOrigin): DurableMemory;
   readMemory(id: string): DurableMemory | undefined;
   updateMemoryLifecycle(
@@ -417,6 +439,8 @@ export interface MemoryStore {
     type?: MemoryType;
     promotionState?: MemoryPromotionState;
     qualityStatus?: MemoryQualityStatusFilter;
+    layer?: MemoryLayerFilter;
+    owner?: MemoryLayerOwner;
     query?: string;
     limit?: number | null;
   }): MemoryCandidate[];
@@ -425,6 +449,8 @@ export interface MemoryStore {
     status?: "promoted" | "candidate";
     lifecycleStatus?: MemoryLifecycleStatusFilter;
     qualityStatus?: MemoryQualityStatusFilter;
+    layer?: MemoryLayerFilter;
+    owner?: MemoryLayerOwner;
     query?: string;
     limit?: number | null;
   }): DurableMemory[];
@@ -459,6 +485,8 @@ export interface MemoryStore {
     status?: "promoted" | "candidate";
     lifecycleStatus?: MemoryLifecycleStatusFilter;
     qualityStatus?: MemoryQualityStatusFilter;
+    layer?: MemoryLayerFilter;
+    owner?: MemoryLayerOwner;
     limit?: number;
   }): MemorySearchResult[];
   readMemorySearchResultsByIds(memoryIds: string[]): MemorySearchResult[];
@@ -525,6 +553,7 @@ interface SourceFailureRow {
 interface MemoryCandidateRow {
   scope_json: string;
   scope_key: string;
+  layer: string;
   origin_json: string | null;
   id: string;
   type: MemoryType;
@@ -547,6 +576,7 @@ interface MemoryCandidateRow {
 interface MemoryRow {
   scope_json: string;
   scope_key: string;
+  layer: string;
   origin_json: string | null;
   id: string;
   type: MemoryType;
@@ -576,6 +606,7 @@ interface TemporaryMemoryRow {
   base_id: string;
   scope_json: string;
   scope_key: string;
+  layer: string;
   origin_json: string | null;
   id: string;
   project_id: string;
@@ -655,6 +686,8 @@ const SQLITE_READ_BATCH_SIZE = 500;
 export interface OpenMemoryStoreOptions {
   readonly privacyPolicy?: RedactionPolicy;
   readonly backupRetention?: number;
+  /** Resolves the layer for working context; injectable so tests need no global device identity. */
+  readonly deviceLayer?: () => string;
 }
 
 export class MemoryStoreCheckpointBusyError extends Error {
@@ -678,6 +711,10 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA journal_mode = WAL");
+  // Resolved once, and lazily, so opening a store never reaches for the global device identity.
+  let resolvedDeviceLayer: string | undefined;
+  const workingContextLayer = (): string =>
+    resolvedDeviceLayer ??= (options.deviceLayer ?? deviceLayer)();
   const baseContentPolicy = createStorageContentPolicy(options.privacyPolicy);
   const contentPolicy = createDurableContentPolicy(db, baseContentPolicy);
   const backupRetention = options.backupRetention;
@@ -1487,15 +1524,16 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
             : { qualityReasons: options.qualityReasons.map(contentPolicy.text) })
         };
         const now = new Date().toISOString();
+        const layer = sanitizeLayer(contentPolicy, memory.layer);
         const existing = db
           .prepare(
-            `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+            `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                     dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                     created_at, updated_at
              from memory_candidates
-             where dedupe_key = ? and scope_key = ?`
+             where dedupe_key = ? and scope_key = ? and layer = ?`
           )
-          .get(memory.dedupeKey, scopeKey(memory.scope)) as MemoryCandidateRow | undefined;
+          .get(memory.dedupeKey, scopeKey(memory.scope), layer) as MemoryCandidateRow | undefined;
         const candidateId = existing?.id ?? `candidate-${randomUUID()}`;
         const promotionState = options?.promotionState ?? existing?.promotion_state ?? "candidate";
         const qualityStatus = options?.qualityStatus ?? existing?.quality_status ?? "active";
@@ -1503,11 +1541,11 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         const lastVerifiedAt = options?.lastVerifiedAt ?? existing?.last_verified_at ?? null;
         db.prepare(
           `insert into memory_candidates
-             (scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+             (scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
               dedupe_key, promotion_state, evidence_signature, quality_status, quality_reasons_json,
               last_verified_at, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           on conflict(dedupe_key, scope_key) do update set
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(dedupe_key, scope_key, layer) do update set
              type = excluded.type,
              title = excluded.title,
              summary = excluded.summary,
@@ -1522,7 +1560,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
              last_verified_at = excluded.last_verified_at,
              updated_at = excluded.updated_at`
         ).run(
-          JSON.stringify(normalizeScope(memory.scope)), scopeKey(memory.scope),
+          JSON.stringify(normalizeScope(memory.scope)), scopeKey(memory.scope), layer,
           memory.origin ? JSON.stringify(memory.origin) : null,
           candidateId,
           memory.type,
@@ -1544,7 +1582,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         rebuildMemoryLinks(db, "candidate", candidateId, memory.evidence, memory.relatedFiles);
         const row = db
           .prepare(
-            `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+            `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                     dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                     created_at, updated_at
              from memory_candidates
@@ -1554,11 +1592,12 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         return memoryCandidateFromRow(row);
       });
     },
-    promoteMemoryCandidate(candidateId, source = "auto") {
+    promoteMemoryCandidate(candidateId, source = "auto", options = {}) {
       return withTransaction(db, () => {
+        candidateId = contentPolicy.identifier(candidateId);
         const candidate = db
           .prepare(
-            `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+            `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                     dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                     created_at, updated_at
              from memory_candidates
@@ -1568,8 +1607,10 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         if (!candidate) {
           throw new Error(`Unknown memory candidate: ${candidateId}`);
         }
+        const layer = options.layer === undefined ? candidate.layer : sanitizeLayer(contentPolicy, options.layer);
         const memory = upsertMemoryRow(db, {
           scope: parseScope(candidate.scope_json),
+          layer,
           origin: parseMemoryOrigin(candidate.origin_json),
           id: candidate.promoted_memory_id ?? undefined,
           type: candidate.type,
@@ -1588,9 +1629,9 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         });
         db.prepare(
           `update memory_candidates
-           set promotion_state = 'promoted', promoted_memory_id = ?, updated_at = ?
+           set promotion_state = 'promoted', promoted_memory_id = ?, layer = ?, updated_at = ?
            where id = ?`
-        ).run(memory.id, new Date().toISOString(), candidateId);
+        ).run(memory.id, layer, new Date().toISOString(), candidateId);
         return memory;
       });
     },
@@ -1599,6 +1640,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         decision = sanitizeDecision(contentPolicy, decision);
         return upsertMemoryRow(db, {
           scope: decision.scope,
+          layer: CORE_LAYER,
           origin: sanitizeMemoryOrigin(contentPolicy, origin),
           id: `memory-manual-${decision.id}${scopeKey(decision.scope) === "unspecified" ? "" : `-scope-${scopeKey(decision.scope)}`}`,
           type: "decision",
@@ -1643,44 +1685,50 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       return deleteStoredMemoryRelation(db, contentPolicy, id);
     },
     listMemoryCandidates(input = {}) {
+      const layer = layerSqlPredicate(input.layer, input.owner, importedPeerLayers(db));
       const rows = db
         .prepare(
-          `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                   dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
                   created_at, updated_at
            from memory_candidates
+           ${layer.clause}
            order by updated_at desc, created_at desc, rowid desc`
         )
-        .all() as unknown as MemoryCandidateRow[];
+        .all(...layer.parameters) as unknown as MemoryCandidateRow[];
       return rows
         .map(memoryCandidateFromRow)
         .filter((candidate) => {
           if (input.type && candidate.type !== input.type) return false;
           if (input.promotionState && candidate.promotionState !== input.promotionState) return false;
           if (!matchesQualityStatus(candidate.qualityStatus, input.qualityStatus)) return false;
+          if (!matchesLayerFilter(candidate.layer, input.layer)) return false;
           return matchesMemoryQuery(candidate, input.query);
         })
         .slice(0, input.limit === null ? undefined : normalizeLimit(input.limit));
     },
     listMemories(input = {}) {
       if (input.status === "candidate") return [];
+      const layer = layerSqlPredicate(input.layer, input.owner, importedPeerLayers(db));
       const rows = db
         .prepare(
-          `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                   dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
                   subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                   lifecycle_generation,
                   created_at, promoted_at
            from memories
+           ${layer.clause}
            order by promoted_at desc, created_at desc`
         )
-        .all() as unknown as MemoryRow[];
+        .all(...layer.parameters) as unknown as MemoryRow[];
       return rows
         .map(memoryFromRow)
         .filter((memory) => {
           if (input.type && memory.type !== input.type) return false;
           if (!matchesLifecycleStatus(memory.lifecycleStatus, input.lifecycleStatus)) return false;
           if (!matchesQualityStatus(memory.qualityStatus, input.qualityStatus)) return false;
+          if (!matchesLayerFilter(memory.layer, input.layer)) return false;
           return matchesMemoryQuery(memory, input.query);
         })
         .slice(0, input.limit === null ? undefined : normalizeLimit(input.limit));
@@ -1706,8 +1754,12 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         const existingById = input.id ? db.prepare("select base_id from temporary_memories where id = ?").get(input.id) as { base_id: string } | undefined : undefined;
         const baseId = existingById?.base_id ?? input.id ?? `temporary-${randomUUID()}`;
         const key = scopeKey(input.scope);
-        const existing = db.prepare("select * from temporary_memories where base_id = ? and scope_key = ?").get(baseId, key) as unknown as TemporaryMemoryRow | undefined;
-        const id = existing?.id ?? (key === "unspecified" ? baseId : `temporary-${randomUUID()}`);
+        const layer = sanitizeLayer(contentPolicy, input.layer ?? workingContextLayer());
+        const existing = db.prepare("select * from temporary_memories where base_id = ? and scope_key = ? and layer = ?").get(baseId, key, layer) as unknown as TemporaryMemoryRow | undefined;
+        // Keep the caller's stable id for the primary variant; only a real collision
+        // (same base id already stored under another scope or layer) needs a fresh one.
+        const idTaken = db.prepare("select 1 from temporary_memories where id = ?").get(baseId) !== undefined;
+        const id = existing?.id ?? (key === "unspecified" && !idTaken ? baseId : `temporary-${randomUUID()}`);
         const projectId = input.projectId ?? existing?.project_id ?? store.paths.rootDir;
         const createdAt = input.createdAt ?? existing?.created_at ?? now;
         const defaultExpiresAt = new Date(Date.parse(now) + TEMPORARY_MEMORY_DEFAULT_TTL_MS).toISOString();
@@ -1719,10 +1771,10 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
 
         db.prepare(
           `insert into temporary_memories
-             (base_id, scope_json, scope_key, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+             (base_id, scope_json, scope_key, layer, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
               related_files_json, evidence_json, confidence, created_at, updated_at, expires_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           on conflict(base_id, scope_key) do update set
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           on conflict(base_id, scope_key, layer) do update set
              project_id = excluded.project_id,
              thread_id = excluded.thread_id,
              session_id = excluded.session_id,
@@ -1737,7 +1789,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
              updated_at = excluded.updated_at,
              expires_at = excluded.expires_at`
         ).run(
-          baseId, JSON.stringify(normalizeScope(input.scope)), scopeKey(input.scope),
+          baseId, JSON.stringify(normalizeScope(input.scope)), scopeKey(input.scope), layer,
           input.origin ? JSON.stringify(input.origin) : null,
           id,
           projectId,
@@ -1771,7 +1823,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         rebuildTemporaryMemoryFts(db, ftsInput);
         const row = db
           .prepare(
-            `select base_id, scope_json, scope_key, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+            `select base_id, scope_json, scope_key, layer, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
                     related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
              from temporary_memories
              where id = ?`
@@ -1786,7 +1838,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       const rows = db
         .prepare(
           `select
-             m.base_id, m.scope_json, m.scope_key, m.origin_json,
+             m.base_id, m.scope_json, m.scope_key, m.layer, m.origin_json,
              m.id,
              m.project_id,
              m.thread_id,
@@ -1822,7 +1874,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       const now = input.now ?? new Date().toISOString();
       const rows = db
         .prepare(
-          `select base_id, scope_json, scope_key, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
+          `select base_id, scope_json, scope_key, layer, origin_json, id, project_id, thread_id, session_id, source_adapter, kind, title, summary, details,
                   related_files_json, evidence_json, confidence, created_at, updated_at, expires_at
            from temporary_memories
            where project_id = ? and expires_at > ?
@@ -1870,6 +1922,8 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       if (input.query !== undefined) promotedInput.query = input.query;
       if (input.qualityStatus !== undefined) promotedInput.qualityStatus = input.qualityStatus;
       if (input.lifecycleStatus !== undefined) promotedInput.lifecycleStatus = input.lifecycleStatus;
+      if (input.layer !== undefined) promotedInput.layer = input.layer;
+      if (input.owner !== undefined) promotedInput.owner = input.owner;
       const promoted =
         input.status === "candidate"
           ? []
@@ -1878,6 +1932,8 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       if (input.type !== undefined) candidateInput.type = input.type;
       if (input.query !== undefined) candidateInput.query = input.query;
       if (input.qualityStatus !== undefined) candidateInput.qualityStatus = input.qualityStatus;
+      if (input.layer !== undefined) candidateInput.layer = input.layer;
+      if (input.owner !== undefined) candidateInput.owner = input.owner;
       const candidates =
         input.status === "promoted"
           ? []
@@ -1893,7 +1949,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       if (memoryIds.length === 0) return [];
       const rows = chunked(memoryIds, SQLITE_READ_BATCH_SIZE).flatMap((batch) =>
         db.prepare(
-          `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                   dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
                   subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                   lifecycle_generation, created_at, promoted_at
@@ -1943,6 +1999,7 @@ function upsertMemoryRow(
   db: DatabaseSync,
   input: {
     scope?: import("../types.js").MemoryScope | undefined;
+    layer: string;
     origin?: MemoryOrigin | null;
     id?: string | undefined;
     type: MemoryType;
@@ -1964,14 +2021,14 @@ function upsertMemoryRow(
   const existing = input.id
     ? readMemoryRowRaw(db, input.id)
     : db.prepare(
-        `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+        `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
                 dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
                 subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                 lifecycle_generation,
                 created_at, promoted_at
          from memories
-         where dedupe_key = ? and evidence_signature = ? and source = ? and scope_key = ?`
-      ).get(input.dedupeKey, evidenceSignature, input.source, scopeKey(input.scope)) as MemoryRow | undefined;
+         where dedupe_key = ? and evidence_signature = ? and source = ? and scope_key = ? and layer = ?`
+      ).get(input.dedupeKey, evidenceSignature, input.source, scopeKey(input.scope), input.layer) as MemoryRow | undefined;
   const id = existing?.id ?? input.id ?? `memory-${randomUUID()}`;
   const subjectKey = createMemorySubjectKey(input.type, input.title);
   if (existing) {
@@ -1992,13 +2049,13 @@ function upsertMemoryRow(
     const lifecycleGeneration = randomUUID();
     db.prepare(
       `insert into memories
-         (scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+         (scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
           dedupe_key, evidence_signature, source, quality_status, quality_reasons_json,
           last_verified_at, subject_key, lifecycle_status, valid_from, valid_until,
           status_reason, status_changed_at, lifecycle_generation, created_at, promoted_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?, ?)`
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?, ?)`
     ).run(
-      JSON.stringify(normalizeScope(input.scope)), scopeKey(input.scope),
+      JSON.stringify(normalizeScope(input.scope)), scopeKey(input.scope), input.layer,
       input.origin ? JSON.stringify(input.origin) : null,
       id, input.type, input.title, input.summary, input.reason, input.confidence,
       JSON.stringify(input.evidence), JSON.stringify(input.relatedFiles), input.dedupeKey,
@@ -2013,7 +2070,7 @@ function upsertMemoryRow(
 
 function readMemoryRowRaw(db: DatabaseSync, id: string): MemoryRow | undefined {
   return db.prepare(
-    `select scope_json, scope_key, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+    `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
             dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
             subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
             lifecycle_generation,
@@ -2300,6 +2357,33 @@ function countMemoryHealth(db: DatabaseSync): { active: number; needsReview: num
   };
 }
 
+/**
+ * Narrows a layer query in SQL so the row limit applies to matching rows only.
+ * Filtering after the limit silently hides older non-core memories behind newer
+ * core ones. `parseLayer` stays authoritative: `matchesLayerFilter` still runs on
+ * the mapped rows, so a malformed stored layer cannot slip through the LIKE.
+ */
+function layerSqlPredicate(
+  filter: MemoryLayerFilter | undefined,
+  owner: MemoryLayerOwner | undefined = "self",
+  peers: readonly string[] = []
+): { clause: string; parameters: string[] } {
+  const conditions: string[] = [];
+  const parameters: string[] = [];
+  if (filter === "core") { conditions.push("layer = ?"); parameters.push(CORE_LAYER); }
+  else if (filter !== undefined && filter !== "all") { conditions.push("layer like ?"); parameters.push(`${filter}:%`); }
+  // Peer membership is a stored fact, so the predicate is an explicit list rather than
+  // a guess from the layer name. With no peers imported, `peer` matches nothing.
+  if (owner !== "any" && peers.length > 0) {
+    const placeholders = peers.map(() => "?").join(", ");
+    conditions.push(owner === "peer" ? `layer in (${placeholders})` : `layer not in (${placeholders})`);
+    parameters.push(...peers);
+  } else if (owner === "peer") {
+    conditions.push("1 = 0");
+  }
+  return { clause: conditions.length === 0 ? "" : `where ${conditions.join(" and ")}`, parameters };
+}
+
 function normalizeLimit(limit: number | undefined): number {
   if (!limit || !Number.isFinite(limit)) return 10;
   return Math.max(1, Math.min(Math.floor(limit), 100));
@@ -2371,6 +2455,7 @@ function formatCommitSearchText(commit: CommitRecord): string {
 function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
   return {
     scope: parseScope(row.scope_json),
+    layer: row.layer,
     applicability: assessApplicability(parseScope(row.scope_json)),
     origin: parseMemoryOrigin(row.origin_json),
     id: row.id,
@@ -2395,6 +2480,7 @@ function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
 function memoryFromRow(row: MemoryRow): DurableMemory {
   return {
     scope: parseScope(row.scope_json),
+    layer: row.layer,
     applicability: assessApplicability(parseScope(row.scope_json)),
     origin: parseMemoryOrigin(row.origin_json),
     id: row.id,
@@ -2434,6 +2520,7 @@ function memorySearchResult(
   const result: MemorySearchResult = {
     kind,
     scope: normalizeScope(memory.scope),
+    layer: normalizeLayer(memory.layer),
     applicability: assessApplicability(memory.scope),
     origin: memory.origin ?? null,
     id: memory.id,
@@ -2472,6 +2559,7 @@ function memorySearchResult(
 function temporaryMemoryFromRow(row: TemporaryMemoryRow): TemporaryMemory {
   const memory: TemporaryMemory = {
     scope: parseScope(row.scope_json),
+    layer: row.layer,
     applicability: assessApplicability(parseScope(row.scope_json)),
     origin: parseMemoryOrigin(row.origin_json),
     id: row.id,

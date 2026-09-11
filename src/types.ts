@@ -1,8 +1,11 @@
 export type SourceType = "conversation" | "commit" | "decision";
 export type {
+  AutomaticPromotionDecisionKind,
   BeginOperationInput,
+  BranchTriageAction,
   CreateSourceTombstoneInput,
   FinishOperationInput,
+  LayerRetentionDecisionKind,
   ListOperationsInput,
   OperationActor,
   OperationLogEntry,
@@ -144,6 +147,21 @@ export type MemoryScope = { kind: "project" } | { kind: "unspecified" } | {
   shells?: string[];
   condition?: string;
 };
+
+/** Where a memory syncs, not where its advice applies. Orthogonal to MemoryScope. */
+export type MemoryLayer = string;
+export interface ParsedMemoryLayer {
+  kind: "core" | "device" | "branch";
+  deviceId?: string;
+  branch?: string;
+}
+export type MemoryLayerFilter = "core" | "device" | "branch" | "all";
+/**
+ * Orthogonal to the layer filter, the way scope is orthogonal to layer: `layer` says
+ * which kind of layer, `owner` says whose. Peer rows are another device's read-only
+ * partition, so they are excluded unless asked for by name.
+ */
+export type MemoryLayerOwner = "self" | "peer" | "any";
 export interface TargetEnvironment { platform?: string; arch?: string; shell?: string; }
 export interface Applicability {
   status: "project_wide" | "matches" | "mismatch" | "needs_verification";
@@ -166,6 +184,7 @@ export interface MemoryOrigin {
 
 export interface ExtractedMemory {
   scope?: MemoryScope;
+  layer?: MemoryLayer;
   applicability?: Applicability;
   origin?: MemoryOrigin | null;
   type: MemoryType;
@@ -217,6 +236,7 @@ export interface MemoryRelation {
 
 export interface MemorySearchResult {
   scope?: MemoryScope;
+  layer?: MemoryLayer;
   applicability?: Applicability;
   origin?: MemoryOrigin | null;
   kind: "candidate" | "promoted";
@@ -245,6 +265,7 @@ export interface MemorySearchResult {
 
 export interface TemporaryMemory {
   scope?: MemoryScope;
+  layer?: MemoryLayer;
   applicability?: Applicability;
   origin?: MemoryOrigin | null;
   id: string;
@@ -273,6 +294,7 @@ export interface TemporaryMemorySearchResult extends TemporaryMemory {
 
 export interface TemporaryMemoryUpsertInput {
   scope?: MemoryScope;
+  layer?: MemoryLayer;
   applicability?: Applicability;
   origin?: MemoryOrigin | null;
   id?: string;
@@ -404,14 +426,30 @@ export interface ExtractorConfigInput extends Partial<ExtractorConfig> {
   profile?: string | undefined;
 }
 
+export interface AutomaticPromotionConfig {
+  enabled: boolean;
+  mode: "conservative";
+  minScore: number;
+  mergedBranches: boolean;
+  deviceMemories: boolean;
+}
+
 export interface PromotionConfig {
   confidenceThreshold: number;
   requireCommitAndConversation: boolean;
   minSourceCategories: number;
+  automatic: AutomaticPromotionConfig;
 }
 
 export interface SyncConfig {
   autoSyncOnServerStart: boolean;
+  /**
+   * Which of this device's own non-core layers are published for peers to read.
+   * `durable` shares device- and branch-layer memories; `all` adds temporary session
+   * state; `none` keeps every non-core row local, which was the behaviour before
+   * partitions existed.
+   */
+  shareLocalLayers: "durable" | "all" | "none";
 }
 
 export type RetrievalMode = "fts" | "hybrid";
@@ -450,6 +488,27 @@ export interface SourceRetentionOverride extends SourceRetentionPolicy {
   sourceId: string;
 }
 
+/**
+ * Retention for durable non-core memory. Temporary memories are already bounded by
+ * their TTL, and `core` is never touched: this only ages out this device's own
+ * device- and branch-layer durable memory.
+ */
+export interface LayerRetentionConfig {
+  enabled: boolean;
+  /** Quiet period a memory must sit untouched before any archival applies. */
+  graceDays: number;
+  branch: {
+    /** Applied once the branch no longer exists locally. */
+    onDeleted: "archive" | "keep";
+    /** Merged branches are left to promotion and triage. */
+    onMerged: "archive" | "keep";
+    maxIdleDays: number | null;
+  };
+  device: {
+    maxIdleDays: number | null;
+  };
+}
+
 export interface RetentionConfig {
   migrationBackups: number;
   sources: {
@@ -459,6 +518,7 @@ export interface RetentionConfig {
     manual: SourceRetentionPolicy;
   };
   overrides: SourceRetentionOverride[];
+  layers: LayerRetentionConfig;
 }
 
 export type EmbeddingOwnerKind = "chunk" | "memory";

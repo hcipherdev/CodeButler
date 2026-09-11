@@ -97,6 +97,56 @@ describe("server startup sync", () => {
     projectServer.store.close();
   });
 
+  it("defers startup sync so the client handshake is answered first", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const codexDir = join(rootDir, "codex");
+    mkdirSync(codexDir, { recursive: true });
+    writeFileSync(join(codexDir, "deferred.jsonl"), [
+      JSON.stringify({ timestamp: "2026-07-16T00:00:00Z", type: "session_meta", payload: { id: "session-1", cwd: rootDir } }),
+      JSON.stringify({
+        timestamp: "2026-07-16T00:00:01Z",
+        type: "response_item",
+        payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "deferred sync note" }] }
+      })
+    ].join("\n"));
+    ensureProjectConfig(rootDir);
+    writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({
+      sources: {
+        git: { enabled: false },
+        codex: { enabled: true, roots: ["./codex"], includeDefaultRoots: false },
+        claude: { enabled: false, roots: [] }
+      },
+      sync: { autoSyncOnServerStart: true }
+    }, null, 2));
+
+    const projectServer = await createProjectMemoryServer({ rootDir, deferStartupSync: true });
+
+    // Returning without syncing is the point: the transport gets to connect and
+    // answer `initialize` before this long synchronous work blocks the loop.
+    expect(projectServer.startupSync).toBeTypeOf("function");
+    expect(projectServer.store.getProjectSummary().sources).toBe(0);
+
+    await projectServer.startupSync?.();
+    expect(projectServer.store.getProjectSummary().sources).toBeGreaterThan(0);
+
+    projectServer.store.close();
+  });
+
+  it("omits startupSync when the caller wants sync to finish before serving", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    ensureProjectConfig(rootDir);
+    writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({
+      sources: { git: { enabled: false }, codex: { enabled: false, roots: [] }, claude: { enabled: false, roots: [] } },
+      sync: { autoSyncOnServerStart: true }
+    }, null, 2));
+
+    const projectServer = await createProjectMemoryServer(rootDir);
+    expect(projectServer.startupSync).toBeUndefined();
+    projectServer.store.close();
+  });
+
   it("applies project redaction rules before startup sync writes", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);

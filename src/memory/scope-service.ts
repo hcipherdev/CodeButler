@@ -3,6 +3,7 @@ import type { MemoryStore } from "../storage/store.js";
 import type { MemoryScope, OperationActor } from "../types.js";
 import { withTransaction } from "../storage/transactions.js";
 import { sanitizeScope, scopeKey, assessApplicability } from "./scope.js";
+import { assertWritableLayer } from "./peer-layer.js";
 
 export interface UpdateMemoryScopeInput {
   memoryId: string;
@@ -20,6 +21,7 @@ export function updateMemoryScope(store: MemoryStore, input: UpdateMemoryScopeIn
   return withTransaction(store.db, () => {
     const row = store.db.prepare(`select * from ${table} where id = ?`).get(id);
     if (!row) throw new Error("Unknown memory ID");
+    assertWritableLayer(store, input.category, id);
     const updates = [{ table, id }];
     if (input.category === "candidate" && typeof row.promoted_memory_id === "string") updates.push({ table: "memories", id: row.promoted_memory_id });
     const durableId = input.category === "promoted" ? id : row.promoted_memory_id;

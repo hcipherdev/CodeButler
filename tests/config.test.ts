@@ -62,7 +62,13 @@ describe("project config", () => {
         claude: { maxAgeDays: null },
         manual: { maxAgeDays: null }
       },
-      overrides: []
+      overrides: [],
+      layers: {
+        enabled: true,
+        graceDays: 30,
+        branch: { onDeleted: "archive", onMerged: "keep", maxIdleDays: null },
+        device: { maxIdleDays: null }
+      }
     });
     expect(existsSync(join(rootDir, ".code-butler", ".gitignore"))).toBe(true);
     expect(readFileSync(join(rootDir, ".code-butler", ".gitignore"), "utf8")).toBe(

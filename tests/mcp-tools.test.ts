@@ -442,7 +442,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("registers and invokes 22 MCP tools with lifecycle validation and wiring", async () => {
+  it("registers and invokes 28 MCP tools with lifecycle validation and wiring", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
@@ -474,8 +474,14 @@ describe("MCP tool handlers", () => {
       now: () => new Date("2026-07-12T16:05:00.000Z")
     });
 
-    expect(registrations).toHaveLength(22);
+    expect(registrations).toHaveLength(28);
     expect(registrations.map((registration) => registration.name)).toContain("update_memory_status");
+    expect(registrations.map((registration) => registration.name)).toContain("update_memory_layer");
+    expect(registrations.map((registration) => registration.name)).toContain("suggest_memory_layer_promotions");
+    expect(registrations.map((registration) => registration.name)).toContain("suggest_branch_memory_triage");
+    expect(registrations.map((registration) => registration.name)).toContain("resolve_branch_memory_triage");
+    expect(registrations.map((registration) => registration.name)).toContain("explain_memory_promotions");
+    expect(registrations.map((registration) => registration.name)).toContain("explain_layer_retention");
     expect(registrations.map((registration) => registration.name)).toContain("list_source_failures");
     const find = registrations.find((registration) => registration.name === "find_memories")!;
     expect(find.inputSchema.lifecycleStatus!.safeParse("all")).toMatchObject({ success: true });
@@ -517,6 +523,34 @@ describe("MCP tool handlers", () => {
       lifecycleStatus: "superseded",
       statusReason: "Policy B replaces policy A."
     });
+    const updateLayer = registrations.find((registration) => registration.name === "update_memory_layer")!;
+    expect(updateLayer.inputSchema.layer!.safeParse("device")).toMatchObject({ success: true });
+    const layerResponse = await updateLayer.callback({
+      memoryId: replacement.memory.id,
+      category: "promoted",
+      layer: "branch:review",
+      reason: "Reviewing branch-specific memory."
+    });
+    expect(JSON.parse(layerResponse.content[0]!.text)).toMatchObject({
+      memoryId: replacement.memory.id,
+      category: "promoted",
+      layer: "branch:review"
+    });
+    expect(store.readMemory(replacement.memory.id)!.layer).toBe("branch:review");
+    const suggestions = registrations.find((registration) => registration.name === "suggest_memory_layer_promotions")!;
+    expect(suggestions.inputSchema.minScore!.safeParse(1.1)).toMatchObject({ success: false });
+    const suggestionResponse = await suggestions.callback({ minScore: 0, limit: 5 });
+    expect(JSON.parse(suggestionResponse.content[0]!.text).suggestions).toEqual([
+      expect.objectContaining({
+        memoryId: replacement.memory.id,
+        action: { tool: "update_memory_layer", arguments: expect.objectContaining({ layer: "core" }) }
+      })
+    ]);
+    const branchTriage = registrations.find((registration) => registration.name === "suggest_branch_memory_triage")!;
+    expect(branchTriage.inputSchema.staleDays!.safeParse(0)).toMatchObject({ success: false });
+    const branchResolve = registrations.find((registration) => registration.name === "resolve_branch_memory_triage")!;
+    expect(branchResolve.inputSchema.action!.safeParse("promote_to_core")).toMatchObject({ success: true });
+    expect(branchResolve.inputSchema.action!.safeParse("auto_promote")).toMatchObject({ success: false });
     store.close();
   });
 
@@ -540,7 +574,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("keeps the architecture copies consistent with the complete 22-tool list", () => {
+  it("keeps the architecture copies consistent with the complete 28-tool list", () => {
     const rootArchitecturePath = join(process.cwd(), "architecture.html");
     const published = readFileSync(join(process.cwd(), "docs", "public", "architecture.html"), "utf8");
     const architecture = existsSync(rootArchitecturePath)
@@ -552,13 +586,15 @@ describe("MCP tool handlers", () => {
     if (existsSync(rootArchitecturePath)) {
       expect(published).toBe(architecture);
     }
-    expect(architecture).toContain("MCP Tools (22)");
-    expect(architecture).toContain("22 exposed tools");
-    expect(toolNames).toHaveLength(22);
+    expect(architecture).toContain("MCP Tools (28)");
+    expect(architecture).toContain("28 exposed tools");
+    expect(toolNames).toHaveLength(28);
     expect([...toolNames].sort()).toEqual([
       "cleanup_temporary_memory",
       "current_project",
       "explain_code_change",
+      "explain_layer_retention",
+      "explain_memory_promotions",
       "find_decisions",
       "find_memories",
       "find_related_commits",
@@ -567,15 +603,19 @@ describe("MCP tool handlers", () => {
       "read_memory_source",
       "refresh_project_summary",
       "remember_project_memory",
+      "resolve_branch_memory_triage",
       "run_doctor",
       "search_project_memory",
       "search_temporary_memory",
+      "suggest_branch_memory_triage",
+      "suggest_memory_layer_promotions",
       "summarize_active_context",
       "summarize_memory_health",
       "summarize_project_brief",
       "summarize_project_state",
       "summarize_recent_activity",
       "sync_project_memory",
+      "update_memory_layer",
       "update_memory_scope",
       "update_memory_status"
     ].sort());

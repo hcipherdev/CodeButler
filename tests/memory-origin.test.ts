@@ -109,7 +109,7 @@ it("migration 11 preserves legacy unknown origins", () => {
     (id,type,title,summary,reason,confidence,evidence_json,related_files_json,dedupe_key,promotion_state,evidence_signature,created_at,updated_at)
     values ('legacy','decision','Old','Old','Old',1,'[]','[]','legacy','candidate','','2026-01-01','2026-01-01')`);
   s.init();
-  expect(CURRENT_SCHEMA_VERSION).toBe(12);
+  expect(CURRENT_SCHEMA_VERSION).toBe(18);
   expect(s.listMemoryCandidates({}).find(x => x.id === "legacy")!.origin).toBeNull();
 });
 

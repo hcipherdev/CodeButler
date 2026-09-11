@@ -1,8 +1,39 @@
 import { scopesDisjoint } from "./scope.js";
 import { createEvidenceSignature } from "./evidence-signature.js";
+import { createMemorySubjectKey } from "./lifecycle.js";
 import type { MemoryStore } from "../storage/store.js";
 import { withTransaction } from "../storage/transactions.js";
-import type { DurableMemory, MemoryQualityStatus } from "../types.js";
+import type { DurableMemory, EvidenceRef, MemoryQualityStatus, MemoryScope, MemoryType } from "../types.js";
+
+/** The minimum a stored memory or an unpromoted candidate must expose to be compared. */
+export interface ComparableMemoryFact {
+  type: MemoryType;
+  title: string;
+  summary: string;
+  scope?: MemoryScope | undefined;
+  evidence: EvidenceRef[];
+  subjectKey?: string | undefined;
+}
+
+/** Groups facts that speak about the same thing; candidates have no stored subject key. */
+export function memorySubjectGroupKey(memory: ComparableMemoryFact): string {
+  return `${memory.type}\0${memory.subjectKey ?? createMemorySubjectKey(memory.type, memory.title)}`;
+}
+
+export function normalizeMemorySummary(summary: string): string {
+  return summary.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Two facts about one subject that state different things on different evidence.
+ * Matching summaries are agreement, and a matching evidence signature is the same
+ * observation seen twice, so neither is a contradiction.
+ */
+export function memoryFactsConflict(left: ComparableMemoryFact, right: ComparableMemoryFact): boolean {
+  if (scopesDisjoint(left.scope, right.scope)) return false;
+  if (normalizeMemorySummary(left.summary) === normalizeMemorySummary(right.summary)) return false;
+  return createEvidenceSignature(left.evidence) !== createEvidenceSignature(right.evidence);
+}
 
 export interface MemoryConflictPair {
   fromMemoryId: string;
@@ -118,7 +149,7 @@ export function auditMemoryConflicts(
 function groupBySubject(memories: DurableMemory[]): Map<string, DurableMemory[]> {
   const groups = new Map<string, DurableMemory[]>();
   for (const memory of memories) {
-    const key = `${memory.type}\0${memory.subjectKey}`;
+    const key = memorySubjectGroupKey(memory);
     const group = groups.get(key) ?? [];
     group.push(memory);
     groups.set(key, group);
@@ -132,17 +163,11 @@ function findConflictPairs(memories: DurableMemory[]): MemoryConflictPair[] {
     const left = memories[leftIndex] as DurableMemory;
     for (let rightIndex = leftIndex + 1; rightIndex < memories.length; rightIndex += 1) {
       const right = memories[rightIndex] as DurableMemory;
-      if (scopesDisjoint(left.scope, right.scope)) continue;
-      if (normalizeSummary(left.summary) === normalizeSummary(right.summary)) continue;
-      if (createEvidenceSignature(left.evidence) === createEvidenceSignature(right.evidence)) continue;
+      if (!memoryFactsConflict(left, right)) continue;
       pairs.push(canonicalPair(left.id, right.id));
     }
   }
   return pairs;
-}
-
-function normalizeSummary(summary: string): string {
-  return summary.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 function canonicalPair(left: string, right: string): MemoryConflictPair {
