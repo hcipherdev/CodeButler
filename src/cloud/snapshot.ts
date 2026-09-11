@@ -339,11 +339,15 @@ export function databaseFingerprint(path: string): string {
   try {
     const names = (db.prepare("pragma table_list").all() as Array<{ name: string; type: string; schema: string }>).filter(t => t.schema === "main" && t.type === "table" && !t.name.startsWith("sqlite_") && ![...LOCAL_TABLES, "operation_log", "schema_migrations"].includes(t.name)).map(t => t.name).sort();
     const tables = names.map(name => {
-      const rows = db.prepare(`select * from ${quote(name)}`).all().map(row => {
-        if (name === "temporary_memories") row.project_id = "@project";
-        return JSON.stringify(row, (_k, v) => typeof v === "bigint" ? v.toString() : v instanceof Uint8Array ? Buffer.from(v).toString("base64") : v);
-      }).sort();
-      return [name, rows];
+      const columns = (db.prepare(`pragma table_info(${quote(name)})`).all() as Array<{ name: string }>).map(column => column.name);
+      const expressions = columns.map((column, index) => {
+        const value = name === "temporary_memories" && column === "project_id" ? "'@project'" : quote(column);
+        return `typeof(${value}) || ':' || coalesce(hex(cast(${value} as blob)), '') as c${index}`;
+      });
+      const rows = db.prepare(`select ${expressions.join(", ")} from ${quote(name)}`).all().map(row =>
+        JSON.stringify(columns.map((_column, index) => (row as Record<string, string>)[`c${index}`]))
+      ).sort();
+      return [name, columns, rows];
     });
     return sha256(JSON.stringify(tables));
   } finally { db.close(); }
