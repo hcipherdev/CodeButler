@@ -104,6 +104,20 @@ Install the Code Butler CLI from npm:
 npm install -g code-butler
 ```
 
+On Windows, install Node.js 24 or newer first and make sure `node`, `npm`, and
+`code-butler` are available in a new PowerShell window:
+
+```powershell
+node --version
+npm --version
+code-butler --help
+```
+
+Do not install Code Butler into a Codex-managed runtime directory such as
+`AppData\Local\OpenAI\Codex\runtimes\...`. Codex may replace those directories
+during updates. Use a normal Node.js installation or another stable user-local
+Node prefix that you control.
+
 Recommended: initialize Code Butler in each project where you want agents to
 use the full memory workflow:
 
@@ -235,6 +249,29 @@ command = "code-butler"
 args = ["mcp", "--project-root", "/absolute/path/to/project"]
 ```
 
+For a global Codex setup that works in whichever Git repository the Codex
+session is opened in, omit `--project-root`:
+
+```toml
+[mcp_servers.code-butler]
+command = "code-butler"
+args = ["mcp"]
+startup_timeout_sec = 120
+```
+
+Use the project-pinned form only when you intentionally want one server entry to
+always use the same repository regardless of the client's current working
+directory.
+
+On Windows, prefer the `.cmd` shim if PowerShell script execution is disabled:
+
+```toml
+[mcp_servers.code-butler]
+command = "code-butler.cmd"
+args = ["mcp"]
+startup_timeout_sec = 120
+```
+
 Restart the Codex session after editing the config so it starts the MCP server.
 
 ### Add to Claude Code
@@ -364,6 +401,57 @@ For source-built MCP setup, point your MCP client at the built CLI:
 
 ```bash
 node /absolute/path/to/code-butler/dist/cli.js mcp --project-root /absolute/path/to/project
+```
+
+### Windows Source Install And Update
+
+If the npm package is unavailable, or if you want to install from a local
+checkout on Windows, use a stable Node.js 24 installation or user-local Node
+prefix. Do not use a Codex runtime folder as the permanent install location,
+because Codex can rotate those folders during updates.
+
+From PowerShell:
+
+```powershell
+cd C:\path\to\CodeButler
+git pull
+
+npm ci
+.\node_modules\.bin\tsc.cmd -p tsconfig.build.json
+npm pack --ignore-scripts
+npm install -g .\code-butler-1.0.0.tgz
+
+code-butler --help
+```
+
+If you keep a separate stable Node prefix rather than installing Node system
+wide, add that prefix to your user `PATH` and run npm from that prefix:
+
+```powershell
+$nodePrefix = "$env:LOCALAPPDATA\CodeButler\node24"
+$env:PATH = "$nodePrefix;$env:PATH"
+
+& "$nodePrefix\npm.cmd" ci
+& ".\node_modules\.bin\tsc.cmd" -p tsconfig.build.json
+& "$nodePrefix\npm.cmd" pack --ignore-scripts
+& "$nodePrefix\npm.cmd" install -g --prefix $nodePrefix .\code-butler-1.0.0.tgz
+```
+
+Then configure Codex globally:
+
+```toml
+[mcp_servers.code-butler]
+command = "code-butler.cmd"
+args = ["mcp"]
+startup_timeout_sec = 120
+```
+
+If `code-butler.cmd` is not on the environment `PATH` visible to Codex, add a
+small server-specific environment block:
+
+```toml
+[mcp_servers.code-butler.env]
+PATH = 'C:\Users\you\AppData\Local\CodeButler\node24;C:\Windows\System32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0'
 ```
 
 ## Daily Workflow
