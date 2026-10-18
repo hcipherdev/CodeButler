@@ -1,3 +1,4 @@
+// Tests project-summary provider contracts and bounded human-facing payloads.
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -46,6 +47,21 @@ function openAiConfig(overrides: Partial<ExtractorConfig> = {}): ExtractorConfig
 describe("project summary providers", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("uses the narrative budget instead of a short investigation profile budget", async () => {
+    process.env.TEST_PROJECT_SUMMARY_OPENAI_KEY = "test-key";
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200,
+      json: async () => ({ choices: [{ message: { content: JSON.stringify({ summaryMarkdown: "# Complete brief" }) } }] })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const config = {
+      extractor: openAiConfig({ maxTokens: 1200 }),
+      investigator: { ...openAiConfig({ maxTokens: 2500 }), enabled: true }
+    } as ProjectConfig;
+    await expect(createConfiguredProjectSummaryGenerator(config).generate(makeInput())).resolves.toBe("# Complete brief");
+    expect(JSON.parse(fetchMock.mock.calls[0]![1].body).max_tokens).toBe(8192);
   });
 
   it("maps OpenAI-compatible responses to summary markdown", async () => {
@@ -69,7 +85,7 @@ describe("project summary providers", () => {
       model: "gpt-test",
       temperature: 0
     });
-    expect(JSON.parse(init.body).messages[0].content).toContain("project narrative summary");
+    expect(JSON.parse(init.body).messages[0].content).toContain("project overview for a person");
   });
 
   it("fails clearly when OpenAI-compatible project summary requests time out", async () => {
@@ -158,8 +174,9 @@ describe("project summary providers", () => {
     const body = JSON.parse(init.body);
     expect(init.timeoutMs).toBe(300000);
     expect(body.max_tokens).toBe(8192);
-    expect(body.system).toContain("project narrative summary");
-    expect(body.messages[0].content).toContain("AGENTS.md");
+    expect(body.system).toContain("project overview for a person");
+    expect(body.messages[0].content).not.toContain("agentHints");
+    expect(body.messages[0].content).not.toContain("AGENTS.md");
   });
 
   it("fails clearly when configured provider credentials are missing", async () => {

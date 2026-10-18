@@ -1,4 +1,6 @@
+import { createStatement, memoryContentText } from "./statement.js";
 import { inferScope, normalizeScope, scopeKey } from "./scope.js";
+import { assertOrdinaryProject } from "../rules/identity.js";
 import { CORE_LAYER, normalizeLayer } from "./layer.js";
 import { createHash } from "node:crypto";
 
@@ -16,6 +18,9 @@ interface RememberOptions {
   originFactory?: OriginFactory;
   client?: MemoryOrigin["client"];
   defaultLayer?: string | undefined;
+  identitySalt?: string | undefined;
+  sourceTemporaryId?: string;
+  sourceEvidence?: import("../types.js").EvidenceRef[] | undefined;
 }
 
 export interface RememberProjectMemoryInput {
@@ -28,6 +33,7 @@ export interface RememberProjectMemoryInput {
   relatedFiles?: string[] | undefined;
   promote?: boolean | undefined;
   supersedesMemoryId?: string | undefined;
+  statement?: { fields?: import("../types.js").MemoryStatementFields | undefined } | undefined;
 }
 
 export interface RememberProjectMemoryResult {
@@ -41,6 +47,7 @@ export function rememberProjectMemory(
   input: RememberProjectMemoryInput,
   options: RememberOptions = {}
 ): RememberProjectMemoryResult {
+  assertOrdinaryProject(store.paths.rootDir);
   const shouldPromote = input.promote ?? true;
   if (input.supersedesMemoryId !== undefined && !shouldPromote) {
     throw new Error("Superseding a durable memory requires promotion");
@@ -63,9 +70,10 @@ function rememberProjectMemoryAtomically(
   const relatedFiles = normalizeRelatedFiles(input.relatedFiles);
   const reason = cleanMemoryText(input.reason ?? "Captured from explicit user memory request.");
   const now = (options.now ?? (() => new Date()))().toISOString();
+  const statement = createStatement(summary, type, options.actor === "desktop" ? "human" : "submitted", input.statement?.fields);
   const scope = normalizeScope(input.scope ?? inferScope(summary));
   const layer = normalizeLayer(input.layer ?? (!shouldPromote ? options.defaultLayer : undefined) ?? CORE_LAYER);
-  const stableId = stableMemoryId(type, summary);
+  const stableId = stableMemoryId(type, summary, options.identitySalt);
   const sourceId = `manual-memory:${type}:${stableId}${scopeKey(scope) === "unspecified" ? "" : `:scope:${scopeKey(scope)}`}${layer === CORE_LAYER ? "" : `:layer:${layer}`}`;
   const locator = `${sourceId}:chunk:0`;
 
@@ -75,8 +83,9 @@ function rememberProjectMemoryAtomically(
       type: "conversation",
       title: `Manual ${type} memory`,
       origin: "manual-memory",
-      rawContent: formatManualMemorySource({ type, title, summary, reason, relatedFiles, now }),
+      rawContent: [formatManualMemorySource({ type, title, summary, reason, relatedFiles, now }), "Statement fields: " + JSON.stringify(statement.fields)].join("\n\n"),
       metadata: {
+        ...(options.sourceTemporaryId ? { sourceTemporaryId: options.sourceTemporaryId } : {}),
         adapter: "manual",
         memoryType: type,
         capturedAt: now
@@ -84,7 +93,7 @@ function rememberProjectMemoryAtomically(
     },
     chunks: [
       {
-        text: summary,
+        text: memoryContentText({ title, summary, reason, statement }),
         metadata: {
           role: "user",
           memoryType: type,
@@ -100,9 +109,10 @@ function rememberProjectMemoryAtomically(
     type,
     title,
     summary,
+    statement,
     reason,
     confidence: 1,
-    evidence: [{ sourceType: "conversation" as const, sourceId, locator }],
+    evidence: [{ sourceType: "conversation" as const, sourceId, locator }, ...(options.sourceEvidence ?? [])],
     relatedFiles,
     dedupeKey: `manual-memory:${type}:${stableId}`
   };
@@ -112,7 +122,11 @@ function rememberProjectMemoryAtomically(
   }
   const context = {
     method: "manual" as const,
-    channel: options.actor === "mcp" ? "mcp" as const : "cli" as const,
+    channel: options.actor === "mcp"
+      ? "mcp" as const
+      : options.actor === "desktop"
+        ? "desktop" as const
+        : "cli" as const,
     ...(options.client ? { client: options.client } : {})
   };
   const origin = options.originFactory
@@ -123,7 +137,7 @@ function rememberProjectMemoryAtomically(
     qualityReasons: assessment.reasons,
     lastVerifiedAt: assessment.lastVerifiedAt ?? now
   });
-  const memory = shouldPromote ? store.promoteMemoryCandidate(candidate.id, "manual") : undefined;
+  const memory = shouldPromote ? store.promoteMemoryCandidate(candidate.id, "manual", { actor: options.actor }) : undefined;
   if (memory && input.supersedesMemoryId !== undefined) {
     updateMemoryStatus(store, {
       memoryId: input.supersedesMemoryId,
@@ -146,9 +160,10 @@ function normalizeRelatedFiles(files: string[] | undefined): string[] {
   return [...new Set((files ?? []).map((file) => file.trim()).filter(Boolean).map((file) => file.replace(/\\/g, "/")))];
 }
 
-function stableMemoryId(type: MemoryType, text: string): string {
+function stableMemoryId(type: MemoryType, text: string, identitySalt?: string): string {
+  const base = `${type}\0${text.toLowerCase().replace(/\s+/g, " ").trim()}`;
   return createHash("sha256")
-    .update(`${type}\0${text.toLowerCase().replace(/\s+/g, " ").trim()}`)
+    .update(identitySalt === undefined ? base : `${base}\0${identitySalt}`)
     .digest("hex")
     .slice(0, 16);
 }

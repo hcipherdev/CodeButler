@@ -1,3 +1,4 @@
+import { memoryStatementInputSchema, memoryStatementSchema } from "../../memory/statement.js";
 import { normalizeScope, memoryScopeSchema, targetEnvironmentSchema, SCOPE_GUIDANCE } from "../../memory/scope.js";
 import { memoryLayerSchema, memoryLayerInputSchema, memoryLayerFilterSchema, memoryLayerOwnerSchema, LAYER_GUIDANCE } from "../../memory/layer.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -9,11 +10,25 @@ import { asJsonContent, compactOptionalInput } from "./shared.js";
 const memoryType = z.enum(["decision", "bug_fix", "constraint", "rejected_approach"]);
 const branchTriageCategory = z.enum(["candidate", "promoted"]);
 const branchTriageAction = z.enum(["promote_to_core", "discard", "retain_branch"]);
+const reviewCategory = z.enum(["candidate", "promoted"]);
+const reviewAction = z.enum(["verify", "correct", "discard"]);
 
 export function registerMemoryToolGroup(
   server: McpServer,
   handlers: ProjectMemoryToolHandlers
 ): void {
+  const knowledgeFilter={reach:z.enum(["all","project","device","branch","branch_device"]).optional(),owner:z.enum(["self","peer","any"]).optional()};
+  server.registerTool("get_memory_history",{
+    description:"Read recorded lifecycle history with predecessor and replacement links, corrections, withdrawal and restoration. Private predecessors remain unavailable from core history.",
+    inputSchema:{id:z.string().min(1),category:reviewCategory,offset:z.number().int().min(0).optional(),limit:z.number().int().min(1).max(100).optional()}
+  },async input=>asJsonContent(await handlers.get_memory_history(compactOptionalInput<Parameters<ProjectMemoryToolHandlers["get_memory_history"]>[0]>(input))));
+  server.registerTool("read_project_handbook",{
+    description:"Read confirmed project-memory topics or a topic page. Defaults to current active durable whole-project knowledge; device and branch reach must be selected explicitly. Reading never creates assignments.",
+    inputSchema:{...knowledgeFilter,topicId:z.string().min(1).optional(),offset:z.number().int().min(0).optional(),limit:z.number().int().min(1).max(100).optional()}
+  },async input=>asJsonContent(await handlers.read_project_handbook(compactOptionalInput<NonNullable<Parameters<ProjectMemoryToolHandlers["read_project_handbook"]>[0]>>(input))));
+  server.registerTool("summarize_memory_movement",{
+    description:"Read made-durable, project-sharing, replacement and withdrawal activity for the rolling last seven days, including partial historical sharing coverage.",inputSchema:knowledgeFilter
+  },async input=>asJsonContent(await handlers.summarize_memory_movement(compactOptionalInput<NonNullable<Parameters<ProjectMemoryToolHandlers["summarize_memory_movement"]>[0]>>(input))));
   server.registerTool("find_memories", {
     description: "Find promoted or candidate durable project memories." + SCOPE_GUIDANCE + LAYER_GUIDANCE,
     inputSchema: {
@@ -38,6 +53,7 @@ export function registerMemoryToolGroup(
       layer: memoryLayerSchema.optional(),
       type: memoryType,
       text: z.string().min(1),
+      statement: memoryStatementInputSchema.optional(),
       title: z.string().min(1).optional(),
       reason: z.string().min(1).optional(),
       relatedFiles: z.array(z.string().min(1)).optional(),
@@ -105,6 +121,29 @@ export function registerMemoryToolGroup(
     }
   }, async input => asJsonContent(await handlers.resolve_branch_memory_triage(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["resolve_branch_memory_triage"]>[0]>(input)
+  )));
+
+  server.registerTool("resolve_memory_review", {
+    description: "Persist a human Verify, Correct, or Discard decision for a durable memory. Pass reviewToken from find_memories to reject stale decisions. Correct and Discard require a reason; Verify defaults to confirming current project state.",
+    inputSchema: {
+      memoryId: z.string().min(1),
+      category: reviewCategory,
+      action: reviewAction,
+      reason: z.string().trim().min(1).optional(),
+      reviewToken: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+      correction: z.object({
+        type: memoryType.optional(),
+        title: z.string().trim().min(1).optional(),
+        text: z.string().trim().min(1).optional(),
+        summary: z.string().trim().min(1).optional(),
+        reason: z.string().trim().min(1).optional(),
+        relatedFiles: z.array(z.string().trim().min(1)).optional(),
+        scope: memoryScopeSchema.optional(),
+        statement: memoryStatementSchema.optional()
+      }).strict().optional()
+    }
+  }, async input => asJsonContent(await handlers.resolve_memory_review(
+    compactOptionalInput<Parameters<ProjectMemoryToolHandlers["resolve_memory_review"]>[0]>(input)
   )));
 
   server.registerTool("explain_memory_promotions", {

@@ -4,11 +4,23 @@ import { z } from "zod";
 
 import type { ProjectMemoryToolHandlers } from "../tools.js";
 import { asJsonContent, compactOptionalInput } from "./shared.js";
+import { ruleQuerySchema, GLOBAL_RULES_INSTRUCTIONS } from "../../rules/match.js";
+import { agentRecordInputSchema, RECORD_RULE_ATTESTATION_DESCRIPTION } from "../../rules/attestations.js";
 
 export function registerSourceToolGroup(
   server: McpServer,
   handlers: ProjectMemoryToolHandlers
 ): void {
+  server.registerTool("get_applicable_rules", {
+    description: GLOBAL_RULES_INSTRUCTIONS,
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    inputSchema: ruleQuerySchema.shape
+  }, async input => ({ content: [{ type: "text" as const, text: JSON.stringify(await handlers.get_applicable_rules(input)) }] }));
+  server.registerTool("record_rule_attestation", {
+    description: RECORD_RULE_ATTESTATION_DESCRIPTION,
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: agentRecordInputSchema.shape
+  }, async input => asJsonContent(await handlers.record_rule_attestation(agentRecordInputSchema.parse(input))));
   server.registerTool("current_project", {
     description: "Report which project-local Code Butler store this MCP server is using.",
     inputSchema: {}
@@ -82,9 +94,9 @@ export function registerSourceToolGroup(
   }, async () => asJsonContent(await handlers.run_doctor()));
 
   server.registerTool("summarize_project_brief", {
-    description: "Read the local project narrative summary and freshness metadata without mutating files.",
+    description: "Read the human project summary, freshness metadata, on-demand agent retrieval guidance and runtime state, and bounded global core rules/catalog without mutating files. Use get_applicable_rules for planned actions and paths, and fetch all remaining required pages.",
     inputSchema: {}
-  }, async () => asJsonContent(await handlers.summarize_project_brief()));
+  }, async () => ({ content: [{ type: "text" as const, text: JSON.stringify(await handlers.summarize_project_brief()) }] }));
 
   server.registerTool("refresh_project_summary", {
     description: "Refresh the local project narrative summary without rewriting AGENTS.md or CLAUDE.md.",

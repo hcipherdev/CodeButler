@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { assertOrdinaryProject } from "../rules/identity.js";
 
 import { hashOperationIdentifier, recordCompletedOperation } from "../operations/log.js";
 import type {
@@ -24,14 +25,24 @@ import { scopeKey } from "./scope.js";
 import { updateMemoryLayer } from "./layer-service.js";
 import { suggestBranchMemoryTriage, type BranchTriageState } from "./branch-triage.js";
 import { suggestMemoryLayerPromotions } from "./layer-promotion.js";
+import { updateMemoryStatus } from "./lifecycle-service.js";
 import { peerLayers } from "./peer-layer.js";
+import { currentMemoryReview } from "./review-state.js";
 
 /**
  * Bumping this re-opens every stored decision, including deferrals a previous
  * policy declined. Decisions are keyed by it so a policy change is a re-evaluation
  * rather than a silent no-op.
  */
-export const PROMOTION_POLICY_VERSION = 1;
+export const PROMOTION_POLICY_VERSION = 2;
+
+/** Marks every decision taken by the core-candidate rule; undo selects on it. */
+const CORE_CANDIDATE_CODE = "core_candidate";
+/** Verifications by a person. MCP (an agent) and system verifies never corroborate. */
+const HUMAN_REVIEW_ACTORS = new Set<OperationActor>(["desktop", "cli"]);
+const UNDO_REASON = "Automatic promotion undone.";
+/** Dedupe-key prefix of replacements an AI review wrote (src/memory/review.ts, reconciliation.ts). */
+const AI_REPLACEMENT_PREFIX = "ai-reconciliation:";
 
 export type AutomaticPromotionCategory = "candidate" | "promoted";
 
@@ -116,6 +127,7 @@ export function planAutomaticPromotions(
   config: ProjectConfig,
   input: PlanAutomaticPromotionsInput = {}
 ): AutomaticPromotionPlan {
+  assertOrdinaryProject(store.paths.rootDir);
   const policy: AutomaticPromotionConfig = { ...config.promotion.automatic, ...(input.automatic ?? {}) };
   if (!policy.enabled) {
     return { scanned: 0, decisions: [], policyVersion: PROMOTION_POLICY_VERSION, enabled: false, complete: true };
@@ -149,6 +161,26 @@ export function planAutomaticPromotions(
 }
 
 /**
+ * Most core candidates are uncorroborated, so listing each skip would flood a report.
+ * Keeps every other decision and replaces core-candidate skips with counts by reason.
+ */
+export function collapseCoreCandidateSkips(plan: AutomaticPromotionPlan): AutomaticPromotionPlan & {
+  coreCandidateSkips: { total: number; byReason: Record<string, number> };
+} {
+  const isCoreSkip = (decision: AutomaticPromotionDecision) =>
+    decision.decision === "skip" && decision.reasonCodes.includes(CORE_CANDIDATE_CODE);
+  const byReason: Record<string, number> = {};
+  let total = 0;
+  for (const decision of plan.decisions.filter(isCoreSkip)) {
+    total += 1;
+    for (const code of decision.reasonCodes) {
+      if (code !== CORE_CANDIDATE_CODE && code !== "active_quality") byReason[code] = (byReason[code] ?? 0) + 1;
+    }
+  }
+  return { ...plan, decisions: plan.decisions.filter((decision) => !isCoreSkip(decision)), coreCandidateSkips: { total, byReason } };
+}
+
+/**
  * Applies one decision in a single transaction. Convergence and preflight checks
  * run before any write, so no automatic path can surface a raw uniqueness error.
  */
@@ -158,8 +190,21 @@ export function applyAutomaticPromotion(
   actor: OperationActor = "system",
   now?: string
 ): ApplyAutomaticPromotionResult {
+  assertOrdinaryProject(store.paths.rootDir);
   const decidedAt = (now === undefined ? new Date() : new Date(now)).toISOString();
   if (Number.isNaN(Date.parse(decidedAt))) throw new Error("now must be a valid timestamp");
+
+  // A core candidate's corroboration (a verify, its device-local quality) lives outside
+  // its version key, so a recorded skip would outlast the verify that should lift it.
+  if (decision.decision === "skip" && decision.reasonCodes.includes(CORE_CANDIDATE_CODE)) {
+    return {
+      memoryId: decision.memoryId,
+      category: decision.category,
+      decision: decision.decision,
+      applied: false,
+      reasonCodes: decision.reasonCodes
+    };
+  }
 
   return withTransaction(store.db, () => {
     const existing = findDecision(store, decision);
@@ -267,6 +312,92 @@ export function runAutomaticPromotions(
   return summary;
 }
 
+export interface UndoAutomaticPromotionsInput {
+  /** Undo this device's core-candidate promotions decided at or after this time. */
+  since?: string | undefined;
+  /** Undo the promotion of one candidate. */
+  memoryId?: string | undefined;
+  now?: string | undefined;
+}
+
+export interface UndoAutomaticPromotionItem {
+  memoryId: string;
+  durableMemoryId: string;
+  outcome: "undone" | "already_undone" | "changed_since";
+}
+
+export interface UndoAutomaticPromotionsResult {
+  undone: number;
+  skipped: number;
+  items: UndoAutomaticPromotionItem[];
+}
+
+/**
+ * Reverses core-candidate promotions this device decided: the durable copy is withdrawn
+ * and the candidate returns to candidate state. Both are synced rows, so other devices
+ * see the withdrawal, and the core-candidate rule keeps the candidate unpromoted until
+ * a person verifies it again. Nothing is deleted.
+ */
+export function undoAutomaticPromotions(
+  store: MemoryStore,
+  input: UndoAutomaticPromotionsInput,
+  actor: OperationActor = "cli"
+): UndoAutomaticPromotionsResult {
+  assertOrdinaryProject(store.paths.rootDir);
+  if ((input.since === undefined) === (input.memoryId === undefined)) {
+    throw new Error("Undo needs exactly one of since or memoryId");
+  }
+  if (input.since !== undefined && Number.isNaN(Date.parse(input.since))) throw new Error("since must be a valid timestamp");
+  const now = (input.now === undefined ? new Date() : new Date(input.now)).toISOString();
+  if (Number.isNaN(Date.parse(now))) throw new Error("now must be a valid timestamp");
+
+  const rows = (input.since !== undefined
+    ? store.db.prepare(
+        `select memory_id, core_memory_id, reason_codes_json from promotion_decisions
+          where decision = 'promote' and category = 'candidate' and policy_version >= 2 and decided_at >= ?
+          order by decided_at desc, id desc`
+      ).all(new Date(input.since).toISOString())
+    : store.db.prepare(
+        `select memory_id, core_memory_id, reason_codes_json from promotion_decisions
+          where decision = 'promote' and category = 'candidate' and policy_version >= 2 and memory_id = ?
+          order by decided_at desc, id desc`
+      ).all(store.contentPolicy.identifier(input.memoryId!))
+  ) as Array<{ memory_id: string; core_memory_id: string | null; reason_codes_json: string }>;
+
+  const latest = new Map<string, string>();
+  for (const row of rows) {
+    if (row.core_memory_id === null || latest.has(row.memory_id)) continue;
+    if (!parseReasonCodes(row.reason_codes_json).includes(CORE_CANDIDATE_CODE)) continue;
+    latest.set(row.memory_id, row.core_memory_id);
+  }
+
+  const items: UndoAutomaticPromotionItem[] = [];
+  for (const [memoryId, durableMemoryId] of latest) {
+    items.push(withTransaction(store.db, () => {
+      const candidate = store.db.prepare(
+        "select promotion_state, promoted_memory_id from memory_candidates where id = ?"
+      ).get(memoryId) as { promotion_state: string; promoted_memory_id: string | null } | undefined;
+      const durable = store.readMemory(durableMemoryId);
+      const item = { memoryId, durableMemoryId };
+      if (!candidate || !durable || candidate.promoted_memory_id !== durableMemoryId) return { ...item, outcome: "changed_since" as const };
+      if (candidate.promotion_state === "candidate" && durable.lifecycleStatus === "retracted") {
+        return { ...item, outcome: "already_undone" as const };
+      }
+      if (candidate.promotion_state !== "promoted" || durable.lifecycleStatus !== "current") {
+        return { ...item, outcome: "changed_since" as const };
+      }
+      updateMemoryStatus(store, { memoryId: durableMemoryId, status: "retracted", reason: UNDO_REASON, now, actor });
+      // A newer updated_at wins the cloud merge and makes earlier verifications stale.
+      store.db.prepare(
+        "update memory_candidates set promotion_state = 'candidate', updated_at = ? where id = ?"
+      ).run(now, memoryId);
+      return { ...item, outcome: "undone" as const };
+    }));
+  }
+  const undone = items.filter((item) => item.outcome === "undone").length;
+  return { undone, skipped: items.length - undone, items };
+}
+
 export function listPromotionDecisions(
   store: MemoryStore,
   input: { memoryId?: string | undefined; limit?: number | undefined } = {}
@@ -322,12 +453,13 @@ function collectPlanItems(
 ): PlanItem[] {
   // The existing read-only scorer supplies the score and its reason codes; a
   // minScore of 0 here keeps weak items visible so they get a recorded skip.
+  // Uncapped: an item outside a top-N list would score 0 and be recorded as a skip.
   const suggestions = suggestMemoryLayerPromotions(store, {
     layer: "all",
     includeCandidates: true,
     minConfidence: 0,
     minScore: 0,
-    limit: 100
+    limit: null
   });
   const scoreByKey = new Map(suggestions.suggestions.map((item) => [itemKey(item.category, item.memoryId), item.score]));
 
@@ -335,7 +467,7 @@ function collectPlanItems(
     ...(input.repoPath === undefined ? {} : { repoPath: input.repoPath }),
     includeActive: true,
     includeReviewed: true,
-    limit: 100,
+    limit: null,
     ...(input.now === undefined ? {} : { now: input.now })
   });
   const branchStateByKey = new Map(
@@ -377,7 +509,9 @@ function collectPlanItems(
   const peers = new Set(peerLayers(store));
   return [...candidates, ...promoted].filter((item) => {
     const parsed = parseLayer(item.layer);
-    if (parsed.kind === "core") return false;
+    // A core durable memory is already promoted; a core candidate is promoted in
+    // place by the core-candidate rule when it has been corroborated.
+    if (parsed.kind === "core") return item.category === "candidate" && policy.coreCandidates !== false;
     // Another device's local finding is theirs to promote; this device cannot even
     // write the row, and promoting it here would duplicate it on the next sync.
     if (peers.has(item.layer)) return false;
@@ -428,6 +562,10 @@ function decide(
       reasonCodes: parseReasonCodes(recorded.reason_codes_json),
       ...(recorded.core_memory_id === null ? {} : { coreMemoryId: recorded.core_memory_id })
     };
+  }
+
+  if (item.category === "candidate" && parseLayer(item.layer).kind === "core") {
+    return decideCoreCandidate(store, config, policy, item.memory as MemoryCandidate, base, coreBySubject);
   }
 
   // 1. Quality and lifecycle.
@@ -484,6 +622,84 @@ function decide(
   return { ...base, decision: "promote", reasonCodes: reasonCodes.sort() };
 }
 
+/**
+ * A core candidate is already shared, so the question is only whether it has been
+ * corroborated: a person verified it, its evidence spans independent sources, or an
+ * AI review judged it current. Extracted candidates carry an unspecified scope and
+ * one source, so the layer score (built for layer moves) is not used here.
+ */
+function decideCoreCandidate(
+  store: MemoryStore,
+  config: ProjectConfig,
+  policy: AutomaticPromotionConfig,
+  memory: MemoryCandidate,
+  base: Omit<AutomaticPromotionDecision, "decision" | "reasonCodes">,
+  coreBySubject: Map<string, DurableMemory[]>
+): AutomaticPromotionDecision {
+  const reasonCodes = [CORE_CANDIDATE_CODE];
+  const decision = { ...base, score: memory.confidence };
+  const skip = (...codes: string[]): AutomaticPromotionDecision =>
+    ({ ...decision, decision: "skip", reasonCodes: [...reasonCodes, ...codes].sort() });
+
+  // 1. Quality.
+  if (memory.qualityStatus !== "active") return skip(`quality_${memory.qualityStatus}`);
+  reasonCodes.push("active_quality");
+
+  const review = currentMemoryReview(store, "candidate", memory);
+  const verified = review?.action === "verify" && review.current ? review : undefined;
+  const humanVerified = verified !== undefined && HUMAN_REVIEW_ACTORS.has(verified.actor) ? verified : undefined;
+
+  // 2. A withdrawn durable copy (for example an undone promotion) stays withdrawn
+  // until a person verifies the candidate again.
+  const copy = memory.promotedMemoryId === undefined ? undefined : store.readMemory(memory.promotedMemoryId);
+  if (copy?.lifecycleStatus === "superseded") return skip("durable_copy_superseded");
+  if (copy?.lifecycleStatus === "retracted" && !(humanVerified && humanVerified.reviewedAt > copy.statusChangedAt)) {
+    return skip("previously_withdrawn");
+  }
+
+  // 3. Corroboration, each path with its own confidence bar.
+  const independentSources = new Set(memory.evidence.map((reference) => reference.sourceId)).size >= 2;
+  // An AI review verifies the replacement it just wrote; that is self-confirmation, so
+  // only an AI verdict on a memory it did not write corroborates.
+  const aiWritten = memory.dedupeKey.startsWith(AI_REPLACEMENT_PREFIX);
+  const aiVerified = verified?.actor === "ai" && !aiWritten;
+  if (humanVerified) {
+    reasonCodes.push("human_verified");
+  } else if (independentSources && memory.confidence >= config.promotion.confidenceThreshold) {
+    reasonCodes.push("independent_sources", "meets_confidence_threshold");
+  } else if (aiVerified && memory.confidence >= (policy.singleSourceMinConfidence ?? 0.9)) {
+    reasonCodes.push("ai_verified_current", "meets_single_source_confidence");
+  } else if (independentSources) {
+    return skip("independent_sources", "below_confidence_threshold");
+  } else if (aiVerified) {
+    return skip("ai_verified_current", "below_single_source_confidence");
+  } else if (verified?.actor === "ai" && aiWritten) {
+    return skip("ai_self_verified");
+  } else {
+    return skip("no_corroboration");
+  }
+
+  // 4. Reconcile against core before proposing any write.
+  const equivalent = findCoreEquivalent(memory, coreBySubject);
+  if (equivalent.kind === "equivalent") {
+    return {
+      ...decision,
+      decision: "converge",
+      reasonCodes: [...reasonCodes, "converged_existing_core_fact"].sort(),
+      coreMemoryId: equivalent.memory.id
+    };
+  }
+  if (equivalent.kind === "conflicting") {
+    return {
+      ...decision,
+      decision: "defer",
+      reasonCodes: [...reasonCodes, "core_fact_conflict"].sort(),
+      coreMemoryId: equivalent.memory.id
+    };
+  }
+  return { ...decision, decision: "promote", reasonCodes: reasonCodes.sort() };
+}
+
 type CoreMatch =
   | { kind: "none" }
   | { kind: "equivalent"; memory: DurableMemory }
@@ -532,7 +748,18 @@ function promoteToCore(
   if (decision.category === "candidate") {
     // Already atomic: writes the durable core row and updates the candidate's
     // promotion state and layer together, so no core candidate is left unpromoted.
-    return store.promoteMemoryCandidate(decision.memoryId, "auto", { layer: CORE_LAYER }).id;
+    const promoted = store.promoteMemoryCandidate(decision.memoryId, "auto", { layer: CORE_LAYER, actor });
+    // A candidate verified again after an undo reuses its withdrawn durable row.
+    if (promoted.lifecycleStatus === "retracted") {
+      updateMemoryStatus(store, {
+        memoryId: promoted.id,
+        status: "current",
+        reason: "Verified again after its automatic promotion was undone.",
+        now: new Date().toISOString(),
+        actor
+      });
+    }
+    return promoted.id;
   }
   const moved = updateMemoryLayer(store, {
     memoryId: decision.memoryId,

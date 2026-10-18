@@ -61,7 +61,57 @@ describe("memory quality gate", () => {
     store.close();
   });
 
-  it("includes current, superseded, and retracted durable memories in maintenance totals", () => {
+  it("pages every quality category in stored order and keeps list records compact", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    store.addSourceWithChunks({
+      source: { id: "page-source", type: "conversation", title: "page.md", origin: "test", rawContent: "Page evidence" },
+      chunks: [{ text: "Page evidence" }]
+    });
+    let historicalId = "";
+    const statuses = ["active", "needs_review", "quarantined"] as const;
+    for (let index = 0; index < 62; index += 1) {
+      const candidate = store.upsertMemoryCandidate({
+        type: "constraint",
+        title: `Page memory ${index}`,
+        summary: `Page fixture ${index}${index % 5 === 0 ? " special" : ""}.`,
+        reason: "Check order and pagination.",
+        confidence: 0.9,
+        evidence: [{ sourceType: "conversation", sourceId: "page-source", locator: "page-source:chunk:0" }],
+        relatedFiles: [],
+        dedupeKey: `page-${index}`
+      }, { qualityStatus: statuses[index % 3]!, qualityReasons: index % 3 ? ["curator_note"] : [] });
+      if (index % 2 === 0) {
+        const promoted = store.promoteMemoryCandidate(candidate.id);
+        if (index === 0) historicalId = promoted.id;
+      }
+    }
+    store.updateMemoryLifecycle(historicalId, { lifecycleStatus: "superseded" });
+    for (const qualityStatus of ["all", ...statuses] as const) {
+      for (const query of ["", "special"]) {
+        const input = { qualityStatus, query, lifecycleStatus: "all" as const };
+        const expected = [
+          ...store.listMemories({ ...input, limit: null }),
+          ...store.listMemoryCandidates({ qualityStatus, query, promotionState: "candidate", limit: null })
+        ].map(memory => memory.id);
+        const actual = [];
+        for (let offset = 0; offset < expected.length; offset += 7) {
+          actual.push(...store.searchMemoryLayer({ ...input, offset, limit: 7, summaryOnly: true }));
+        }
+        expect(actual.map(memory => memory.id)).toEqual(expected);
+        expect(actual.every(memory => memory.citations === undefined && memory.reviewToken === undefined)).toBe(true);
+      }
+    }
+    expect(store.searchMemoryLayer({ qualityStatus: "all", lifecycleStatus: "all", limit: 100 })
+      .some(memory => memory.id === historicalId)).toBe(true);
+    const detail = store.readMemorySearchResultsByIds([historicalId], { lifecycleStatus: "all" })[0];
+    expect(detail).toMatchObject({ id: historicalId, citations: expect.any(Array), reviewToken: expect.any(String) });
+    store.close();
+  });
+
+  it("audits historical rows but counts only live memories in health totals", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
@@ -84,15 +134,21 @@ describe("memory quality gate", () => {
 
     expect(summarizeMemoryHealth(store)).toMatchObject({
       scanned: 3,
-      total: 3,
-      active: 3,
+      historicalTotal: 3,
+      total: 1,
+      active: 1,
       needsReview: 0,
-      quarantined: 0
+      quarantined: 0,
+      retired: 1,
+      replaced: 1
     });
     expect(auditMemoryQuality(store, { now: "2026-07-12T00:00:00Z" })).toMatchObject({
       scanned: 3,
-      total: 3,
-      quarantined: 3
+      historicalTotal: 3,
+      total: 1,
+      quarantined: 1,
+      retired: 1,
+      replaced: 1
     });
     store.close();
   });

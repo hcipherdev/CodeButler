@@ -3,6 +3,13 @@ import type { DatabaseSync } from "node:sqlite";
 import type { EvidenceRef, SourceType } from "../types.js";
 
 export function rebuildPrivacyDerivedIndexes(db: DatabaseSync): void {
+  // Change tracking is reconstructible and may contain pre-scrub identifiers.
+  db.exec("delete from retrieval_changes; update retrieval_identity set id=lower(hex(randomblob(16)))");
+  rebuildSearchIndexes(db);
+}
+
+/** Rebuilds the full-text indexes from their source tables; v4 snapshots arrive without them. */
+export function rebuildSearchIndexes(db: DatabaseSync): void {
   db.exec(`
     delete from chunks_fts;
     insert into chunks_fts (chunk_id, source_id, source_type, title, text)

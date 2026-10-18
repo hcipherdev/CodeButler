@@ -1,3 +1,4 @@
+import { gitExecutable } from "../git-executable.js";
 import { spawnSync } from "node:child_process";
 
 import { readMemoryBranchContext } from "./branch.js";
@@ -72,7 +73,7 @@ function gitStatusForFacts(git: GitBranchFacts, args: string[]): number | undefi
 }
 
 function gitStatus(repoPath: string, args: string[]): number | undefined {
-  const result = spawnSync("git", ["-C", repoPath, ...args], {
+  const result = spawnSync(gitExecutable(), ["-C", repoPath, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "ignore"]
   });

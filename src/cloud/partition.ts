@@ -81,6 +81,7 @@ export function shareableLayers(db: DatabaseSync, deviceId: string, share: Share
     ? ["memories", "memory_candidates", "temporary_memories"]
     : ["memories", "memory_candidates"];
   const layers = new Set<string>();
+  tables.push("memory_events","memory_topics","memory_topic_links");
   for (const table of tables) {
     for (const row of db.prepare(`select distinct layer from ${table} where layer <> 'core'`).all() as Array<{ layer: string }>) {
       if (isOwnLayer(row.layer, deviceId)) layers.add(row.layer);
@@ -99,7 +100,8 @@ export function exportPartition(
   for (const [table, where] of spec) {
     if (UNSHARED_TABLES.has(table)) continue;
     if (share !== "all" && TEMPORARY_TABLES.has(table)) continue;
-    const rows = db.prepare(`select * from ${quote(table)} where ${where} order by rowid`).all() as Array<Record<string, unknown>>;
+    const restriction=table==="memory_events"&&share!=="all" ? " and category<>'temporary'" : "";
+    const rows = db.prepare(`select * from ${quote(table)} where (${where})${restriction} order by rowid`).all() as Array<Record<string, unknown>>;
     if (rows.length > 0) tables[table] = rows.map(normalizeRow);
   }
   return { layer, tables };

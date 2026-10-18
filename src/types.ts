@@ -1,3 +1,5 @@
+import type { MemoryReviewAction, OperationActor } from "./operations/types.js";
+
 export type SourceType = "conversation" | "commit" | "decision";
 export type {
   AutomaticPromotionDecisionKind,
@@ -6,6 +8,7 @@ export type {
   CreateSourceTombstoneInput,
   FinishOperationInput,
   LayerRetentionDecisionKind,
+  MemoryReviewAction,
   ListOperationsInput,
   OperationActor,
   OperationLogEntry,
@@ -25,7 +28,18 @@ export type TemporaryMemoryKind =
   | "user_instruction";
 export type MemoryPromotionState = "candidate" | "promoted";
 export type MemoryQualityStatus = "active" | "needs_review" | "quarantined";
+export type MemoryTrustDisplayStatus = "human_verified" | "ai_validated" | "evidence_backed" | "needs_review" | "quarantined";
+export type MemoryConfidenceBasis =
+  | "manual"
+  | "explicit_directive"
+  | "decision_file"
+  | "test_expectation"
+  | "model_extraction"
+  | "legacy_config_key"
+  | "legacy_docs_heading"
+  | "unknown";
 export type MemoryLifecycleStatus = "current" | "superseded" | "retracted";
+export type MemoryReconciliationVerdict = "current" | "changed" | "obsolete" | "low_value" | "uncertain";
 export type MemoryRelationType = "supersedes" | "potentially_contradicts";
 export type SyncSourceName = "git" | "codex" | "claude";
 export type DoctorStatus = "ok" | "warning" | "error";
@@ -71,6 +85,8 @@ export interface EvidenceCitation {
 
 export interface TrustSummary {
   status: MemoryQualityStatus;
+  displayStatus?: MemoryTrustDisplayStatus | undefined;
+  confidenceBasis?: MemoryConfidenceBasis | undefined;
   confidence?: number | undefined;
   evidenceCount: number;
   resolvedEvidenceCount: number;
@@ -78,6 +94,37 @@ export interface TrustSummary {
   sourceTypes: string[];
   reasons: string[];
   lastVerifiedAt?: string | undefined;
+}
+
+export interface MemoryReviewSummary {
+  id: string;
+  action: MemoryReviewAction;
+  reason: string;
+  reviewedAt: string;
+  actor: OperationActor;
+  resolvedReasons: string[];
+  current: boolean;
+  replacementMemoryId?: string | undefined;
+  replacementCategory?: "candidate" | "promoted" | undefined;
+  verdict?: MemoryReconciliationVerdict | undefined;
+  policyVersion?: string | undefined;
+  provider?: string | undefined;
+  model?: string | undefined;
+  confidence?: number | undefined;
+  citationIds?: string[] | undefined;
+  reconciliationRunId?: string | undefined;
+  reconciliationItemId?: string | undefined;
+}
+
+export interface MemoryReviewProvenance {
+  verdict: MemoryReconciliationVerdict;
+  policyVersion: string;
+  confidence: number;
+  citationIds: string[];
+  reconciliationRunId: string;
+  reconciliationItemId: string;
+  provider?: string | undefined;
+  model?: string | undefined;
 }
 
 export interface MemorySource {
@@ -177,9 +224,43 @@ export interface MemoryOrigin {
   arch: string;
   generatedAt: string;
   method: "deterministic" | "llm" | "manual";
-  channel: "sync" | "cli" | "mcp";
+  channel: "sync" | "cli" | "mcp" | "desktop";
   client?: { name: string; version?: string };
   generator?: { provider?: string; model?: string };
+}
+
+export interface MemoryStatementFields {
+  choice?: string | undefined;
+  rationale?: string | undefined;
+  alternatives?: string | undefined;
+  requirement?: string | undefined;
+  appliesWhen?: string | undefined;
+  symptom?: string | undefined;
+  cause?: string | undefined;
+  fix?: string | undefined;
+  tried?: string | undefined;
+  droppedBecause?: string | undefined;
+  revisitIf?: string | undefined;
+}
+
+export interface MemoryStatement {
+  version: 1;
+  text: string;
+  fields: MemoryStatementFields;
+  origin: "human" | "submitted" | "deterministic" | "extracted" | "ai_wording_accepted";
+}
+
+export interface MemoryPresentation {
+  headline: string;
+  text: string;
+  slots: Array<{ label: string; value: string }>;
+  missing: string[];
+  sharing: string;
+  applies: string;
+  state: string;
+  verified: boolean;
+  claim: "meaningful" | "missing_claim";
+  derived: boolean;
 }
 
 export interface ExtractedMemory {
@@ -188,6 +269,7 @@ export interface ExtractedMemory {
   applicability?: Applicability;
   origin?: MemoryOrigin | null;
   type: MemoryType;
+  statement?: MemoryStatement | undefined;
   title: string;
   summary: string;
   reason: string;
@@ -242,16 +324,21 @@ export interface MemorySearchResult {
   kind: "candidate" | "promoted";
   id: string;
   type: MemoryType;
+  statement?: MemoryStatement | undefined;
+  presentation?: MemoryPresentation;
   title: string;
   summary: string;
   reason: string;
   confidence: number;
+  confidenceBasis?: MemoryConfidenceBasis | undefined;
   evidence: EvidenceRef[];
   relatedFiles: string[];
   dedupeKey: string;
   qualityStatus: MemoryQualityStatus;
   qualityReasons: string[];
   lastVerifiedAt?: string | undefined;
+  reviewToken?: string | undefined;
+  review?: MemoryReviewSummary | undefined;
   subjectKey?: string | undefined;
   lifecycleStatus?: MemoryLifecycleStatus | undefined;
   validFrom?: string | undefined;
@@ -259,6 +346,7 @@ export interface MemorySearchResult {
   statusReason?: string | undefined;
   statusChangedAt?: string | undefined;
   citations?: EvidenceCitation[] | undefined;
+  displayStatus?: MemoryTrustDisplayStatus | undefined;
   trust?: TrustSummary | undefined;
   ranking?: RankingMetadata | undefined;
 }
@@ -379,6 +467,8 @@ export interface ExtractorContext {
 }
 
 export interface RejectedMemory {
+  /** Which field failed, when the reason alone does not say. */
+  detail?: string | undefined;
   index: number;
   reason: string;
 }
@@ -432,6 +522,10 @@ export interface AutomaticPromotionConfig {
   minScore: number;
   mergedBranches: boolean;
   deviceMemories: boolean;
+  /** Promote corroborated candidates already in the core layer (main-branch findings). */
+  coreCandidates: boolean;
+  /** Confidence bar for a core candidate whose only corroboration is an AI "current" verdict. */
+  singleSourceMinConfidence: number;
 }
 
 export interface PromotionConfig {
@@ -450,6 +544,12 @@ export interface SyncConfig {
    * partitions existed.
    */
   shareLocalLayers: "durable" | "all" | "none";
+  /**
+   * What happens when local and cloud memory both changed since the last sync. `merge`
+   * runs the three-way merge automatically and stops only when it would delete a large
+   * share of this device's memories; `ask` leaves every such case for a person.
+   */
+  conflictPolicy: "merge" | "ask";
 }
 
 export type RetrievalMode = "fts" | "hybrid";
@@ -633,6 +733,7 @@ export interface InvestigatorConfigInput extends Partial<InvestigatorConfig> {
 }
 
 export interface ProjectConfig {
+  globalRules?: { enabled: boolean; exclude: string[] };
   configPath: string;
   sources: {
     git: GitSourceConfig;

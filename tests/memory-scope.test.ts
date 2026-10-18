@@ -61,7 +61,7 @@ it("corrects linked scopes atomically and rejects collisions without changing or
  expect(s.readMemory(m.id)!.scope).toEqual(normalizeScope(windows));
  updateMemoryScope(s, { memoryId: a.id, category: "candidate", scope: { kind: "project" }, reason: "Confirmed on all platforms" });
  expect(s.readMemory(m.id)!.scope).toEqual({ kind: "project" });
- expect(s.listMemoryCandidates({}).find(x => x.id === a.id)!.scope).toEqual({ kind: "project" });
+ expect(s.listMemoryCandidates({ qualityStatus: "all" }).find(x => x.id === a.id)!.scope).toEqual({ kind: "project" });
  expect(s.readMemory(m.id)!.origin).toBeNull();
  expect(s.listOperations({ operationType: "scope_change" })).toHaveLength(1);
  expect(JSON.stringify(s.listOperations({ operationType: "scope_change" }))).not.toContain("Confirmed on all platforms");
@@ -81,11 +81,11 @@ it("preserves scope through transfer and imports old records as unspecified", ()
  s.upsertTemporaryMemory({ id: "task", kind: "task_state", title: "Watcher", summary: "polling", scope: linux });
  const file = join(root(), "export.json"); exportPrivacy(s, { outputPath: file });
  const target = store(); importPrivacy(target, { inputPath: file });
- expect(target.listMemories()[0]!.scope).toEqual(normalizeScope(windows));
+ expect(target.listMemories({ qualityStatus: "all" })[0]!.scope).toEqual(normalizeScope(windows));
  const doc = JSON.parse(readFileSync(file, "utf8"));
  for (const table of ["memories", "memory_candidates", "temporary_memories"]) for (const row of doc.tables[table]) { delete row.scope_json; delete row.scope_key; delete row.base_id; }
  writeFileSync(file, JSON.stringify(doc)); const legacy = store(); importPrivacy(legacy, { inputPath: file });
- expect(legacy.listMemories()[0]!.scope).toEqual({ kind: "unspecified" });
+ expect(legacy.listMemories({ qualityStatus: "all" })[0]!.scope).toEqual({ kind: "unspecified" });
 });
 it("upgrades schema 11 without changing IDs or foreign-key relations", () => {
  const s = openMemoryStore(root()); stores.push(s);

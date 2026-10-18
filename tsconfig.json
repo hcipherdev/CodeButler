@@ -16,5 +16,5 @@
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts", "test/**/*.ts", "vitest.config.ts"]
 }

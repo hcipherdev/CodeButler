@@ -1035,7 +1035,7 @@
               <div class="layer-toggle">▼</div>
             </summary>
             <div class="layer-body">
-              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>28 exposed tools</div>
+              <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>34 exposed tools</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Global launcher via code-butler mcp</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Search, explain, investigate, summarize</div>
               <div class="layer-item"><div class="dot" style="background:var(--orange)"></div>Memory health, doctor, project briefs</div>
@@ -1062,9 +1062,11 @@
 
       <!-- RIGHT: MCP Tools -->
       <div>
-        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (28)</div>
+        <div class="section-label" style="font-size:10px;margin-bottom:14px">MCP Tools (34)</div>
         <div class="mcp-col">
           <div class="mcp-group-label">Search & Read</div>
+          <div class="mcp-card"><div class="mcp-tool-name">get_applicable_rules</div><div class="mcp-tool-desc">Read manually authored global rules for planned actions and paths</div></div>
+          <div class="mcp-card"><div class="mcp-tool-name">record_rule_attestation</div><div class="mcp-tool-desc">Record a rule check result for a subject so verified checks are not repeated</div></div>
           <div class="mcp-card">
             <div class="mcp-tool-name">current_project</div>
             <div class="mcp-tool-desc">Report active project-local store</div>
@@ -1080,6 +1082,18 @@
           <div class="mcp-card">
             <div class="mcp-tool-name">find_memories</div>
             <div class="mcp-tool-desc">Find memories; optional hybrid ranking for promoted results</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">get_memory_history</div>
+            <div class="mcp-tool-desc">Read recorded lifecycle history and safe memory links</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">read_project_handbook</div>
+            <div class="mcp-tool-desc">Read confirmed topics and current project knowledge</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">summarize_memory_movement</div>
+            <div class="mcp-tool-desc">Read seven-day activity with historical coverage</div>
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">remember_project_memory</div>
@@ -1104,6 +1118,10 @@
           <div class="mcp-card">
             <div class="mcp-tool-name">resolve_branch_memory_triage</div>
             <div class="mcp-tool-desc">Promote, discard, or retain branch memories</div>
+          </div>
+          <div class="mcp-card">
+            <div class="mcp-tool-name">resolve_memory_review</div>
+            <div class="mcp-tool-desc">Verify, correct, or discard a reviewed memory</div>
           </div>
           <div class="mcp-card">
             <div class="mcp-tool-name">explain_memory_promotions</div>
@@ -1677,7 +1695,7 @@
       </div>
       <div class="file-row">
         <div class="file-path">src/mcp/tools.ts</div>
-        <div class="file-desc">MCP registration facade for 28 exposed tools</div>
+        <div class="file-desc">MCP registration facade for 34 exposed tools</div>
       </div>
       <div class="file-row">
         <div class="file-path">src/mcp/tool-groups/*</div>

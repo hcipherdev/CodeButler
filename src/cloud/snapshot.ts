@@ -1,13 +1,19 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { purgeRetrieval } from "../retrieval/privacy.js";
+import { invalidateHandbookExport } from "../memory/export.js";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync, backup } from "node:sqlite";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { z } from "zod";
 import { portableProjectConfig } from "../config.js";
-import { CURRENT_SCHEMA_VERSION } from "../storage/migrations.js";
+import { CURRENT_SCHEMA_VERSION, initializeSchema } from "../storage/migrations.js";
 import { verifyDatabaseFile } from "../privacy/backup.js";
+import { rebuildSearchIndexes } from "../storage/privacy-maintenance.js";
+import { buildDatabaseFromRowStream, encodeRowStream } from "./row-stream.js";
 import { installationDeviceId } from "../memory/origin.js";
+import { EncryptionError } from "./crypto-helper.js";
 import {
   decodePartition,
   encodePartition,
@@ -22,12 +28,12 @@ import {
   type PartitionPayload,
   type ShareLocalLayers
 } from "./partition.js";
-import { assertNoDatabaseHandles } from "./gate.js";
+import { assertNoDatabaseHandles, registerDatabaseHandle, withProjectGate } from "./gate.js";
 import { atomicJson, atomicWrite, binding, saveBinding, syncDirectory, readJson, sha256, stateDirectory, UUID, type Binding } from "./state.js";
 
 export const MAX_COMPRESSED = 256 * 1024 * 1024;
 export const MAX_EXPANDED = 1024 * 1024 * 1024;
-const LOCAL_TABLES = ["sync_sources", "sync_cursors", "branch_triage_reviews", "promotion_decisions", "layer_retention_decisions", "peer_partitions"];
+const LOCAL_TABLES = ["sync_sources", "sync_cursors", "extraction_jobs", "extraction_status", "branch_triage_reviews", "promotion_decisions", "layer_retention_decisions", "peer_partitions"];
 const SQLITE_SIDE_SUFFIXES = ["", "-wal", "-shm"];
 /**
  * Payloads travel as content-addressed blocks rather than inside the manifest, so a
@@ -41,8 +47,14 @@ const SQLITE_SIDE_SUFFIXES = ["", "-wal", "-shm"];
  * compressed payload at 1 MiB blocks, 22.4% at 256 KiB, and 4.5% at 64 KiB — 0.55 MiB
  * instead of 12.32 MiB. Going smaller still saves bytes (2.2% at 16 KiB) but multiplies
  * per-block bookkeeping, so requests are batched rather than blocks made tinier.
+ *
+ * That measurement is for format v3, which ships the SQLite file. Project memory now
+ * ships v4 (see row-stream.ts): page files renumber pages whenever a table grows, so a
+ * merge still re-sent ~80% of them, while a row stream cut on content re-sends under 1%.
+ * BLOCK_SIZE remains the largest block either format produces.
  */
 export const BLOCK_SIZE = 64 * 1024;
+export const SMALL_CORE_BLOCK_SIZE = 16 * 1024;
 const SHA256 = z.string().regex(/^[a-f0-9]{64}$/);
 const CORE_SEGMENT = "core";
 const FILE_SEGMENT_PREFIX = "file:";
@@ -58,7 +70,8 @@ const segmentSchema = z.object({
 });
 export type SnapshotSegment = z.infer<typeof segmentSchema>;
 const manifestSchema = z.object({
-  format: z.literal("code-butler-cloud"), version: z.literal(3), appVersion: z.literal("1.0.0"),
+  /** 3: the core segment is a SQLite file. 4: it is a row stream (see row-stream.ts) without search indexes. */
+  format: z.literal("code-butler-cloud"), version: z.union([z.literal(3), z.literal(4)]), appVersion: z.literal("1.0.0"),
   schemaVersion: z.number().int().min(1).max(CURRENT_SCHEMA_VERSION), projectId: UUID,
   parentRevision: z.number().int().nonnegative(), installationId: UUID, checkoutId: UUID.optional(),
   fingerprint: SHA256,
@@ -72,14 +85,68 @@ export interface MaterializedSnapshot {
   /** Peer partitions to import read-only; this device's own are never taken back. */
   partitions: PartitionPayload[];
 }
-export function splitBlocks(bytes: Buffer): Array<{ checksum: string; data: Buffer }> {
+export function splitBlocks(bytes: Buffer, blockSize = BLOCK_SIZE): Array<{ checksum: string; data: Buffer }> {
   if (bytes.length === 0) return [{ checksum: sha256(bytes), data: bytes }];
   const blocks: Array<{ checksum: string; data: Buffer }> = [];
-  for (let offset = 0; offset < bytes.length; offset += BLOCK_SIZE) {
-    const data = bytes.subarray(offset, Math.min(offset + BLOCK_SIZE, bytes.length));
+  for (let offset = 0; offset < bytes.length; offset += blockSize) {
+    const data = bytes.subarray(offset, Math.min(offset + blockSize, bytes.length));
     blocks.push({ checksum: sha256(data), data: Buffer.from(data) });
   }
   return blocks;
+}
+/** Derived from a fixed label so every device cuts identical bytes at identical offsets. */
+const GEAR = Uint32Array.from({ length: 256 }, (_, i) => createHash("sha256").update(`code-butler/cdc-gear/${i}`).digest().readUInt32BE(0));
+export interface ContentDefinedSizes { min: number; avg: number; max: number }
+/**
+ * FastCDC-style split: a boundary depends only on the ~32 bytes before it, so inserted
+ * or removed pages re-align within a block or two instead of shifting every later
+ * fixed-offset block. Readers need no change; they only join blocks by checksum.
+ */
+export function splitContentDefined(bytes: Buffer, { min, avg, max }: ContentDefinedSizes): Array<{ checksum: string; data: Buffer }> {
+  if (!(0 < min && min < avg && avg < max && max <= BLOCK_SIZE)) throw new Error("Invalid content-defined block sizes");
+  if (bytes.length === 0) return [{ checksum: sha256(bytes), data: bytes }];
+  // The gear hash shifts left, so its top bits cover the most recent bytes. A stricter
+  // mask before `avg` and a looser one after it keep block sizes close to `avg`.
+  const bits = Math.round(Math.log2(avg)), top = (n: number) => (~0 << (32 - n)) >>> 0;
+  const strict = top(bits + 1), loose = top(bits - 1);
+  const blocks: Array<{ checksum: string; data: Buffer }> = [];
+  for (let start = 0; start < bytes.length;) {
+    const end = Math.min(bytes.length, start + max), normal = Math.min(end, start + avg);
+    let cut = end, hash = 0;
+    for (let i = Math.min(end, start + min); i < end; i++) {
+      hash = ((hash << 1) + GEAR[bytes[i]!]!) >>> 0;
+      if ((hash & (i < normal ? strict : loose)) === 0) { cut = i + 1; break; }
+    }
+    const data = Buffer.from(bytes.subarray(start, cut));
+    blocks.push({ checksum: sha256(data), data });
+    start = cut;
+  }
+  return blocks;
+}
+/** Distinct objects one revision may reference (the envelope's limit). */
+const OBJECT_LIMIT = 32768;
+/**
+ * Cuts a v4 core row stream on content, so inserted or removed rows change only the blocks
+ * around them. The smallest average that stays inside the object budget wins; measured on
+ * real projects, 8 KiB averages re-sent under 1% of a merged snapshot. Past every average,
+ * fixed full-size blocks are always within the budget the v3 path already guarantees.
+ */
+function splitRowStream(bytes: Buffer, budget: number): Array<{ checksum: string; data: Buffer }> {
+  for (const avg of [8 * 1024, 16 * 1024, 32 * 1024]) {
+    if (bytes.length / avg > budget * 0.75) continue;
+    const parts = splitContentDefined(bytes, { min: avg / 4, avg, max: BLOCK_SIZE });
+    if (new Set(parts.map(part => part.checksum)).size <= budget) return parts;
+  }
+  return splitBlocks(bytes, BLOCK_SIZE);
+}
+/** The SQLite file a v4 core row stream describes; verified afterwards like any received database. */
+function databaseFromRowStream(stream: Buffer): Buffer {
+  const directory = mkdtempSync(join(tmpdir(), "butler-rows-"));
+  try {
+    const path = join(directory, "memory.sqlite");
+    buildDatabaseFromRowStream(stream, path);
+    return readFileSync(path);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 }
 export function joinBlocks(segment: SnapshotSegment, resolve: (checksum: string) => Buffer): Buffer {
   const parts = segment.blocks.map(checksum => {
@@ -151,8 +218,12 @@ export function bundleResolver(blocks: Map<string, Buffer>): (checksum: string) 
   };
 }
 export function excluded(path: string): boolean {
+  if(path==="handbook-export.meta.json"||path==="handbook"||path.startsWith("handbook/"))return true;
+  if (path === "setup.meta.json") return true;
   const parts = path.split("/");
-  return parts.some(p => p === "config.local.json" || p === "logs" || p === "backups" || p === "staging" || p.startsWith(".cloud") || p === "cloud" || p === "device.json" || (p.startsWith(".env") && p !== ".env.example") || p.endsWith(".lock") || p.endsWith(".tmp") || p === ".DS_Store") || /^memory\.sqlite(?:-|\.)/.test(path);
+  return parts.some(p => p === "config.local.json" || p === "logs" || p === "backups" || p === "staging" || p.startsWith(".cloud") || p === ".foreground-intents" || p === "gate-timing.json" || p === "watcher-timing.json" || p === "cloud" || p === "device.json" || (p.startsWith(".env") && p !== ".env.example") || p.endsWith(".lock") || p.endsWith(".tmp") || p === ".DS_Store") ||
+    /^memory\.sqlite(?:-|\.)/.test(path) ||
+    /^memory-local\.sqlite(?:$|-|\.)/.test(path) || parts.includes("retrieval");
 }
 export function validArchivePath(path: string, platform: string = process.platform): void {
   if (!path || path.includes("\\") || path.startsWith("/") || path.includes("\0") || path.split("/").some(p => !p || p === "." || p === "..") || /^[a-z]:/i.test(path)) throw new Error("Invalid snapshot path");
@@ -224,6 +295,9 @@ function layerRowSpec(match: string): ReadonlyArray<readonly [string, string]> {
    * derived from device-local memories.
    */
   return [
+    ["memory_events", match], ["memory_topic_links", match], ["memory_topics", match],
+    ["memory_review_resolution_compensations", match],
+    ["memory_review_resolutions", match],
     ["memory_relations", `from_memory_id in (${memories}) or to_memory_id in (${memories})`],
     ["memory_links", `(owner_kind = 'memory' and owner_id in (${memories})) or (owner_kind = 'candidate' and owner_id in (${candidates}))`],
     ["embedding_jobs", ownedByMemory],
@@ -349,19 +423,29 @@ export function preserveLocalLayers(original: DatabaseSync, target: DatabaseSync
 export function databaseFingerprint(path: string): string {
   const db = new DatabaseSync(path, { readOnly: true });
   try {
-    const names = (db.prepare("pragma table_list").all() as Array<{ name: string; type: string; schema: string }>).filter(t => t.schema === "main" && t.type === "table" && !t.name.startsWith("sqlite_") && ![...LOCAL_TABLES, "operation_log", "schema_migrations"].includes(t.name)).map(t => t.name).sort();
-    const tables = names.map(name => {
+    const names = (db.prepare("pragma table_list").all() as Array<{ name: string; type: string; schema: string }>).filter(t => t.schema === "main" && t.type === "table" && !t.name.startsWith("sqlite_") && ![...LOCAL_TABLES, "operation_log", "schema_migrations", "retrieval_identity", "retrieval_changes"].includes(t.name)).map(t => t.name).sort();
+    // The hash of JSON.stringify([[name, columns, sortedRows], …]), fed as it is produced rather than built
+    // as one string about twice the size of the database: the same value with far less memory and copying.
+    const hash = createHash("sha256");
+    let pending = "[";
+    const feed = (text: string) => { pending += text; if (pending.length >= 1 << 20) { hash.update(pending); pending = ""; } };
+    names.forEach((name, table) => {
       const columns = (db.prepare(`pragma table_info(${quote(name)})`).all() as Array<{ name: string }>).map(column => column.name);
       const expressions = columns.map((column, index) => {
         const value = name === "temporary_memories" && column === "project_id" ? "'@project'" : quote(column);
         return `typeof(${value}) || ':' || coalesce(hex(cast(${value} as blob)), '') as c${index}`;
       });
-      const rows = db.prepare(`select ${expressions.join(", ")} from ${quote(name)}`).all().map(row =>
-        JSON.stringify(columns.map((_column, index) => (row as Record<string, string>)[`c${index}`]))
-      ).sort();
-      return [name, columns, rows];
+      const rows: string[] = [];
+      for (const row of db.prepare(`select ${expressions.join(", ")} from ${quote(name)}`).iterate()) {
+        rows.push(JSON.stringify(columns.map((_column, index) => (row as Record<string, string>)[`c${index}`])));
+      }
+      rows.sort();
+      feed(`${table ? "," : ""}[${JSON.stringify(name)},${JSON.stringify(columns)},[`);
+      rows.forEach((row, index) => feed(`${index ? "," : ""}${JSON.stringify(row)}`));
+      feed("]]");
     });
-    return sha256(JSON.stringify(tables));
+    hash.update(`${pending}]`);
+    return hash.digest("hex");
   } finally { db.close(); }
 }
 export interface CaptureResult {
@@ -377,19 +461,73 @@ export interface CaptureResult {
    */
   peers: Map<string, string>;
 }
+export interface CaptureStageHooks {
+  afterCopy?: (() => void | Promise<void>) | undefined;
+  /** Write format v4: the core as a row stream in content-defined blocks. Project memory sync only. */
+  rowStream?: boolean | undefined;
+}
+/** Copies the live database into `temporary` under the project gate, as one consistent read. */
+async function copyLiveDatabase(root: string, temporary: string): Promise<void> {
+  const dir = join(root, ".code-butler");
+  await withProjectGate(root, async () => {
+    const release = registerDatabaseHandle(dir);
+    try {
+      const source = new DatabaseSync(join(dir, "memory.sqlite"), { readOnly: true });
+      try {
+        source.exec("begin");source.prepare("select count(*) from sqlite_master").get();
+        await backup(source, temporary);
+      } finally {if(source.isTransaction) source.exec("rollback");source.close();}
+    } finally { release(); }
+  }, { name: "Cloud snapshot copy" });
+}
+/** Leaves only shared core content in a captured copy whose device-local tables are already empty. */
+function stripToCore(db: DatabaseSync): void {
+  deleteNonCoreRows(db);
+  // Core history may retain an unavailable private link, never its private explanation.
+  db.exec("update memory_events set reason='' where layer='core' and related_layer is not null and related_layer<>'core'");
+}
+/**
+ * The fingerprint captureSnapshot reports, without exporting partitions or encoding and splitting the core:
+ * for checks that only ask whether local memory changed since an earlier capture. Partitions never count
+ * toward the fingerprint, so which layers are shared does not matter here.
+ */
+export async function captureFingerprint(root: string): Promise<string> {
+  const dir = join(root, ".code-butler");
+  const temporary = join(stateDirectory(root), `capture-${process.pid}-${randomUUID()}.sqlite`);
+  mkdirSync(stateDirectory(root), { recursive: true, mode: 0o700 });
+  cleanAbandonedCaptureFiles(stateDirectory(root));
+  try {
+    await copyLiveDatabase(root, temporary);
+    verifyDatabaseFile(temporary);
+    const db = new DatabaseSync(temporary);
+    try {
+      for (const name of LOCAL_TABLES) db.exec(`delete from ${quote(name)}`);
+      stripToCore(db);
+    } finally { db.close(); }
+    verifyDatabaseFile(temporary);
+    const hashes = filesIn(dir).map(path => [path, path === "memory.sqlite" ? databaseFingerprint(temporary) : sha256(readFileSync(join(dir, path)))]);
+    return sha256(JSON.stringify(hashes));
+  } finally { removeSqliteTempFiles(temporary); }
+}
 export async function captureSnapshot(
   root: string,
   projectId: string,
   parentRevision: number,
   checkoutId?: string,
-  share: ShareLocalLayers = "durable"
+  share: ShareLocalLayers = "durable",
+  hooks: CaptureStageHooks = {}
 ): Promise<CaptureResult> {
   const dir = join(root, ".code-butler");
-  const temporary = join(stateDirectory(root), `capture-${randomUUID()}.sqlite`);
+  const temporary = join(stateDirectory(root), `capture-${process.pid}-${randomUUID()}.sqlite`);
   mkdirSync(stateDirectory(root), { recursive: true, mode: 0o700 });
-  const source = new DatabaseSync(join(dir, "memory.sqlite"), { readOnly: true });
-  try { await backup(source, temporary); } finally { source.close(); }
+  cleanAbandonedCaptureFiles(stateDirectory(root));
+  const copyStarted = performance.now();
+  try { await copyLiveDatabase(root, temporary); }
+  catch (error) { removeSqliteTempFiles(temporary); throw error; }
+  const copyMs = performance.now() - copyStarted;
   try {
+    await hooks.afterCopy?.();
+    const exportStarted = performance.now();
     verifyDatabaseFile(temporary);
     // Partitions are read from the same consistent backup copy, before the non-core
     // rows are stripped from it: one capture, one point in time, two payloads.
@@ -407,23 +545,33 @@ export async function captureSnapshot(
           payload: encodePartition(exportPartition(db, layer, layerRowSpec(layerIs(layer)), share))
         });
       }
-      deleteNonCoreRows(db);
+      stripToCore(db);
+      if(db.prepare("select 1 from sqlite_master where name='retrieval_changes'").get()) {
+        // A row stream carries no free pages, so only a shipped page file needs the VACUUM to drop deleted content.
+        db.exec(`pragma secure_delete=ON; delete from retrieval_changes; update retrieval_identity set id='snapshot'${hooks.rowStream ? "" : "; vacuum"}`);
+      }
     } finally { db.close(); }
+    const exportMs = performance.now() - exportStarted;
     // Re-verify: the deletes above are the only mutation, so a dangling reference
     // introduced here must surface now rather than on the receiving device.
     verifyDatabaseFile(temporary);
+    const hashStarted = performance.now();
     const logicalHash = databaseFingerprint(temporary);
     const segments: SnapshotSegment[] = [];
     const blocks = new Map<string, Buffer>();
     const hashes: Array<[string, string]> = [];
     let total = 0;
+    const partitionBlocks = partitions.reduce((count, partition) => count + Math.ceil(partition.payload.length / BLOCK_SIZE), 0);
     for (const path of filesIn(dir)) {
-      const bytes = path === "memory.sqlite" ? readFileSync(temporary) : readFileSync(join(dir, path));
+      const bytes = path === "memory.sqlite" ? hooks.rowStream ? encodeRowStream(temporary) : readFileSync(temporary) : readFileSync(join(dir, path));
       if (path === "config.json") assertPortableConfigBytes(bytes);
       total += bytes.length;
       if (total > MAX_EXPANDED) throw new Error("Snapshot exceeds expanded limit");
       const core = path === "memory.sqlite";
-      const parts = splitBlocks(bytes);
+      // Objects the rest of the snapshot may still need: later files up to the expanded limit, and partitions.
+      const coreBudget = OBJECT_LIMIT - Math.ceil((MAX_EXPANDED - bytes.length) / BLOCK_SIZE) - partitionBlocks;
+      const smallCoreFits = core && bytes.length <= 128 * 1024 * 1024 && Math.ceil(bytes.length / SMALL_CORE_BLOCK_SIZE) <= coreBudget;
+      const parts = core && hooks.rowStream ? splitRowStream(bytes, coreBudget) : splitBlocks(bytes, smallCoreFits ? SMALL_CORE_BLOCK_SIZE : BLOCK_SIZE);
       for (const block of parts) blocks.set(block.checksum, block.data);
       const fingerprint = core ? logicalHash : sha256(bytes);
       segments.push({
@@ -452,13 +600,31 @@ export async function captureSnapshot(
         writerInstallationId: deviceId
       });
     }
-    const snapshot: Snapshot = { format: "code-butler-cloud", version: 3, appVersion: "1.0.0", schemaVersion: CURRENT_SCHEMA_VERSION, projectId, parentRevision, installationId: deviceId, ...(checkoutId ? { checkoutId: UUID.parse(checkoutId) } : {}), fingerprint: sha256(JSON.stringify(hashes)), segments };
+    const snapshot: Snapshot = { format: "code-butler-cloud", version: hooks.rowStream ? 4 : 3, appVersion: "1.0.0", schemaVersion: CURRENT_SCHEMA_VERSION, projectId, parentRevision, installationId: deviceId, ...(checkoutId ? { checkoutId: UUID.parse(checkoutId) } : {}), fingerprint: sha256(JSON.stringify(hashes)), segments };
     const encoded = Buffer.from(JSON.stringify(snapshot));
     if (encoded.length > MAX_EXPANDED) throw new Error("Encoded snapshot exceeds expanded limit");
     const bytes = gzipSync(encoded);
     if (bytes.length > MAX_COMPRESSED) throw new Error("Snapshot exceeds compressed limit");
+    try { atomicJson(join(stateDirectory(root), "snapshot-timing.json"), {
+      recordedAt: new Date().toISOString(), copyMs: Math.round(copyMs), exportMs: Math.round(exportMs),
+      hashAndCompressionMs: Math.round(performance.now() - hashStarted)
+    }); } catch { /* Diagnostics must not mask a successful capture. */ }
     return { snapshot, bytes, blocks, peers };
   } finally { removeSqliteTempFiles(temporary); }
+}
+
+function cleanAbandonedCaptureFiles(directory: string): void {
+  const names = readdirSync(directory);
+  for (const name of names) {
+    const match = /^capture-(\d+)-[a-f0-9-]{36}\.sqlite(?:-wal|-shm)?$/i.exec(name);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) continue;
+    try { process.kill(pid, 0); continue; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue; }
+    try { rmSync(join(directory, name), { force: true }); }
+    catch { /* Cleanup is best effort and never blocks a fresh capture. */ }
+  }
 }
 
 function removeSqliteTempFiles(path: string): void {
@@ -471,7 +637,19 @@ function removeSqliteTempFiles(path: string): void {
  */
 export function decodeSnapshot(bytes: Buffer, platform: string = process.platform): Snapshot {
   if (bytes.length > MAX_COMPRESSED) throw new Error("Snapshot exceeds compressed limit");
-  const snapshot = manifestSchema.parse(JSON.parse(gunzipSync(bytes, { maxOutputLength: MAX_EXPANDED }).toString()));
+  const raw: unknown = JSON.parse(gunzipSync(bytes, { maxOutputLength: MAX_EXPANDED }).toString());
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const format = (raw as { format?: unknown; version?: unknown });
+    if (format.format === "code-butler-cloud" && typeof format.version === "number" && format.version > 4) throw new EncryptionError("incompatible-format");
+    const version = (raw as { schemaVersion?: unknown }).schemaVersion;
+    if (typeof version === "number" && version > CURRENT_SCHEMA_VERSION) {
+      throw new EncryptionError("upgrade-required", {
+        remoteSchemaVersion: version,
+        supportedSchemaVersion: CURRENT_SCHEMA_VERSION
+      });
+    }
+  }
+  const snapshot = manifestSchema.parse(raw);
   const seen = new Set<string>();
   const paths = new Set(fileSegments(snapshot).map(segmentPath));
   let total = 0;
@@ -525,7 +703,7 @@ export function materializeSnapshot(
 ): MaterializedSnapshot {
   const files = fileSegments(manifest).map(segment => ({
     path: segmentPath(segment),
-    data: joinBlocks(segment, resolve)
+    data: segment.kind === "core" && manifest.version === 4 ? databaseFromRowStream(joinBlocks(segment, resolve)) : joinBlocks(segment, resolve)
   }));
   const config = files.find(file => file.path === "config.json");
   if (config) assertPortableConfigBytes(config.data);
@@ -562,10 +740,14 @@ export function applySnapshot(root: string, materialized: MaterializedSnapshot):
   const staged = join(state, `restore-${randomUUID()}.sqlite`);
   writeFileSync(staged, materialized.files.find(f => f.path === "memory.sqlite")!.data);
   try {
-    verifySnapshotDatabase(snapshot, staged);
+    verifyAndMigrateSnapshotDatabase(snapshot, staged);
     const target = new DatabaseSync(staged);
     const original = new DatabaseSync(join(dir, "memory.sqlite"));
     try {
+      const existingTombstones=new Set((original.prepare("select source_type,source_id_hash from source_tombstones").all() as Array<{source_type:string;source_id_hash:string}>).map(r=>JSON.stringify(r)));
+      if((target.prepare("select source_type,source_id_hash from source_tombstones").all() as Array<{source_type:string;source_id_hash:string}>).some(r=>!existingTombstones.has(JSON.stringify(r)))) {purgeRetrieval(root);invalidateHandbookExport(root);}
+      // A restored canonical database has a new identity even if its journal sequence matches.
+      target.prepare("update retrieval_identity set id=?").run(randomUUID());
       const checkpoint = original.prepare("pragma wal_checkpoint(TRUNCATE)").get() as { busy: number };
       if (checkpoint.busy) throw new Error("Cloud restore deferred: SQLite is busy");
       for (const name of LOCAL_TABLES) {
@@ -591,7 +773,8 @@ export function applySnapshot(root: string, materialized: MaterializedSnapshot):
       }
       if (materialized.partitions.length > 0) repairPartitionReferences(target);
       target.prepare("update temporary_memories set project_id = ?").run(root);
-      target.prepare("update temporary_memories_fts set project_id = ?").run(root);
+      // A v4 snapshot carries no search index, and a v3 one indexed another checkout's rows; rebuild from what was restored.
+      rebuildSearchIndexes(target);
     } finally { original.close(); target.close(); }
     const existing = filesIn(dir);
     const previousBinding = binding(root);
@@ -612,6 +795,20 @@ export function applySnapshot(root: string, materialized: MaterializedSnapshot):
       verifyDatabaseFile(join(dir, "memory.sqlite")); rmSync(join(state, "apply-journal.json")); syncDirectory(state);
     } catch (error) { recoverApply(root); throw error; }
   } finally { rmSync(staged, { force: true }); }
+}
+
+/** Verify the authored bytes first, then upgrade only the private staged copy. */
+export function verifyAndMigrateSnapshotDatabase(snapshot: Snapshot, databasePath: string): boolean {
+  verifySnapshotDatabase(snapshot, databasePath);
+  if (snapshot.schemaVersion === CURRENT_SCHEMA_VERSION) return false;
+  const db = new DatabaseSync(databasePath);
+  try {
+    initializeSchema(db, databasePath, { backupRetention: 0, createBackup: false });
+  } finally {
+    db.close();
+  }
+  verifyDatabaseFile(databasePath);
+  return true;
 }
 
 export function verifySnapshotDatabase(snapshot: Snapshot, databasePath: string): void {

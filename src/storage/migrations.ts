@@ -564,8 +564,390 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
         rebuildScopedTable(db, "operation_log", sql => sql.replace("'layer_retention'", "'layer_retention', 'cloud_merge'"));
       }
     }
+  },
+  {
+    version: 19,
+    name: "add durable memory review resolutions",
+    up(db) {
+      db.exec(`
+        create table if not exists memory_review_resolutions (
+          id text primary key,
+          memory_id text not null,
+          category text not null check (category in ('candidate', 'promoted')),
+          layer text not null,
+          memory_version text not null,
+          context_fingerprint text not null,
+          action text not null check (action in ('verify', 'correct', 'discard')),
+          resolved_reasons_json text not null default '[]',
+          reason text not null,
+          reviewed_at text not null,
+          actor text not null check (actor in ('cli', 'mcp', 'desktop', 'system')),
+          replacement_memory_id text,
+          replacement_category text check (replacement_category is null or replacement_category in ('candidate', 'promoted')),
+          unique (memory_id, category, memory_version, context_fingerprint, action)
+        );
+        create index if not exists idx_memory_review_resolution_memory
+          on memory_review_resolutions(memory_id, category, reviewed_at desc);
+        create index if not exists idx_memory_review_resolution_context
+          on memory_review_resolutions(memory_id, category, memory_version, context_fingerprint, reviewed_at desc);
+        create index if not exists idx_memory_review_resolution_layer
+          on memory_review_resolutions(layer, reviewed_at desc);
+      `);
+
+      const operationLog = db.prepare("select sql from sqlite_master where type = 'table' and name = 'operation_log'").get() as { sql: string } | undefined;
+      if (operationLog && (!operationLog.sql.includes("'memory_review'") || !operationLog.sql.includes("'desktop'"))) {
+        rebuildScopedTable(db, "operation_log", sql => sql
+          .replace("'cloud_merge'", "'cloud_merge', 'memory_review'")
+          .replace("'cli', 'mcp', 'system'", "'cli', 'mcp', 'desktop', 'system'"));
+      }
+      for (const table of ["branch_triage_reviews", "promotion_decisions", "layer_retention_decisions"]) {
+        const row = db.prepare("select sql from sqlite_master where type = 'table' and name = ?").get(table) as { sql: string } | undefined;
+        if (row && !row.sql.includes("'desktop'")) {
+          rebuildScopedTable(db, table, sql =>
+            sql.replace("'cli', 'mcp', 'system'", "'cli', 'mcp', 'desktop', 'system'"));
+        }
+      }
+
+      for (const table of ["memory_candidates", "memories"]) {
+        const rows = db.prepare(
+          `select id, quality_reasons_json from ${table}
+           where dedupe_key like 'deterministic:config:%'
+              or dedupe_key like 'deterministic:docs:%'`
+        ).all() as Array<{ id: string; quality_reasons_json: string }>;
+        const update = db.prepare(
+          `update ${table}
+           set quality_status = 'quarantined', quality_reasons_json = ?
+           where id = ?`
+        );
+        for (const row of rows) {
+          let reasons: string[] = [];
+          try {
+            const parsed: unknown = JSON.parse(row.quality_reasons_json);
+            if (Array.isArray(parsed)) reasons = parsed.filter((reason): reason is string => typeof reason === "string");
+          } catch {
+            reasons = [];
+          }
+          update.run(JSON.stringify([...new Set([...reasons, "legacy_low_signal_heuristic"])].sort()), row.id);
+        }
+      }
+    }
+  },
+  {
+    version: 20,
+    name: "move memory quality local and add reconciliation audit",
+    up(db) {
+      rebuildDurableMemoryTableWithoutQuality(db, "memories");
+      rebuildDurableMemoryTableWithoutQuality(db, "memory_candidates");
+
+      const review = db.prepare(
+        "select sql from sqlite_master where type = 'table' and name = 'memory_review_resolutions'"
+      ).get() as { sql: string } | undefined;
+      if (review) {
+        rebuildScopedTable(db, "memory_review_resolutions", sql => sql
+          .replace("'cli', 'mcp', 'desktop', 'system'", "'cli', 'mcp', 'desktop', 'system', 'ai'")
+          .replace(/,\s*unique\s*\(\s*memory_id\s*,\s*category\s*,\s*memory_version\s*,\s*context_fingerprint\s*,\s*action\s*\)\s*/i, "\n"));
+      }
+      ensureColumn(db, "memory_review_resolutions", "verdict", "text check (verdict is null or verdict in ('current', 'changed', 'obsolete', 'low_value', 'uncertain'))");
+      ensureColumn(db, "memory_review_resolutions", "policy_version", "text");
+      ensureColumn(db, "memory_review_resolutions", "provider", "text");
+      ensureColumn(db, "memory_review_resolutions", "model", "text");
+      ensureColumn(db, "memory_review_resolutions", "confidence", "real check (confidence is null or (confidence >= 0 and confidence <= 1))");
+      ensureColumn(db, "memory_review_resolutions", "citation_ids_json", "text not null default '[]'");
+      ensureColumn(db, "memory_review_resolutions", "reconciliation_run_id", "text");
+      ensureColumn(db, "memory_review_resolutions", "reconciliation_item_id", "text");
+      db.exec(`
+        create index if not exists idx_memory_review_resolution_identity
+          on memory_review_resolutions(memory_id, category, memory_version, context_fingerprint, action, reviewed_at desc);
+        create index if not exists idx_memory_review_resolution_reconciliation
+          on memory_review_resolutions(reconciliation_run_id, reconciliation_item_id);
+        create table if not exists memory_review_resolution_compensations (
+          id text primary key,
+          resolution_id text not null references memory_review_resolutions(id),
+          memory_id text not null,
+          category text not null check (category in ('candidate', 'promoted')),
+          layer text not null,
+          reason text not null,
+          reverted_at text not null,
+          actor text not null check (actor in ('cli', 'mcp', 'desktop', 'system', 'ai')),
+          reconciliation_run_id text,
+          reconciliation_item_id text,
+          unique (resolution_id)
+        );
+        create index if not exists idx_memory_review_compensation_memory
+          on memory_review_resolution_compensations(memory_id, category, reverted_at desc);
+        create index if not exists idx_memory_review_compensation_layer
+          on memory_review_resolution_compensations(layer, reverted_at desc);
+      `);
+
+      const operationLog = db.prepare(
+        "select sql from sqlite_master where type = 'table' and name = 'operation_log'"
+      ).get() as { sql: string } | undefined;
+      if (operationLog && !operationLog.sql.includes("'ai'")) {
+        rebuildScopedTable(db, "operation_log", sql => sql.replace(
+          "'cli', 'mcp', 'desktop', 'system'",
+          "'cli', 'mcp', 'desktop', 'system', 'ai'"
+        ));
+      }
+    }
+  }
+  ,{
+    version: 21,
+    name: "index quotation windows and journal retrieval changes",
+    up(db: DatabaseSync) {
+      db.exec(`
+        create index if not exists idx_chunks_source_position on chunks(source_id, chunk_index);
+        create table retrieval_identity (id text not null);
+        insert into retrieval_identity values (lower(hex(randomblob(16))));
+        create table retrieval_changes (
+          sequence integer primary key autoincrement,
+          entity text not null, entity_id text not null, operation text not null,
+          before_json text, after_json text
+        );
+      `);
+      // Triggers journal direct SQL, imports and cascades in the writer transaction too.
+      for (const table of ["memories", "memory_candidates", "sources", "chunks", "commits", "memory_relations",
+        "memory_review_resolutions", "memory_review_resolution_compensations", "branch_triage_reviews",
+        "promotion_decisions", "layer_retention_decisions", "peer_partitions", "source_tombstones", "temporary_memories", "embedding_vectors", "sync_sources"]) {
+        const columns = db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
+        const key = columns.some(c => c.name === "id") ? "id" : table === "commits" ? "hash" : columns[0]!.name;
+        const dependencies=columns.filter(c=>["memory_id","category","from_memory_id","to_memory_id","source_id","layer","changed_files_json"].includes(c.name));
+        const context=(row:string)=>`json_object(${dependencies.map(c=>`'${c.name}',${row}.${c.name}`).join(",")})`;
+        for (const operation of ["insert", "update", "delete"]) {
+          const row = operation === "delete" ? "old" : "new";
+          db.exec(`create trigger retrieval_${table}_${operation} after ${operation} on ${table} begin
+            insert into retrieval_changes(entity,entity_id,operation,before_json,after_json) values ('${table}',${row}.${key},'${operation}',${operation==="insert" ? "null" : context("old")},${operation==="delete" ? "null" : context("new")}); end;`);
+        }
+      }
+    }
+  },
+  {
+    version: 22,
+    name: "retain pending memory extraction evidence",
+    up(db: DatabaseSync) {
+      db.exec(`
+        create table extraction_jobs (
+          adapter text not null check (adapter in ('git', 'codex', 'claude')),
+          source_type text not null check (source_type in ('conversation', 'commit')),
+          source_id text not null,
+          enqueued_at text not null,
+          attempts integer not null default 0,
+          last_attempt_at text,
+          last_error text,
+          primary key (source_type, source_id)
+        );
+        create index idx_extraction_jobs_order on extraction_jobs(enqueued_at, source_type, source_id);
+        create trigger extraction_jobs_source_deleted after delete on sources begin
+          delete from extraction_jobs where source_type = 'conversation' and source_id = old.id;
+        end;
+        create trigger extraction_jobs_commit_deleted after delete on commits begin
+          delete from extraction_jobs where source_type = 'commit' and source_id = old.hash;
+        end;
+        create table extraction_status (
+          id integer primary key check (id = 1),
+          last_success_at text
+        );
+        insert into extraction_status (id) values (1);
+      `);
+    }
+  },
+  {
+    version: 23,
+    name: "add human-readable memory statements",
+    up(db: DatabaseSync) {
+      ensureColumn(db, "memory_candidates", "statement_json", "text");
+      ensureColumn(db, "memories", "statement_json", "text");
+    }
+  },
+  {
+    version: 24,
+    name: "add memory history and topic handbooks",
+    up(db: DatabaseSync) {
+      db.exec(`
+        create table memory_events (
+          id text primary key, event_key text not null unique, kind text not null check(kind in ('coverage','made_durable','sharing_changed','replaced','withdrawn','restored','corrected','wording_accepted','wording_undone')),
+          memory_id text not null, category text not null check(category in ('candidate','promoted','temporary')), layer text not null,
+          related_memory_id text, related_category text, related_layer text,
+          from_value text, to_value text, reason text not null default '',
+          actor text not null, occurred_at text not null, recorded integer not null default 0
+        );
+        create index memory_events_time on memory_events(occurred_at,kind,layer);
+        create index memory_events_memory on memory_events(memory_id,category,occurred_at);
+        create table memory_topics (
+          id text primary key, topic_id text not null, layer text not null,
+          name text not null, introduction text not null default '', prefixes_json text not null check(json_valid(prefixes_json) and json_type(prefixes_json)='array'),
+          parents_json text not null check(json_valid(parents_json) and json_type(parents_json)='array'), deleted integer not null default 0 check(deleted in (0,1)), created_at text not null
+        );
+        create index memory_topics_identity on memory_topics(topic_id,layer);
+        create table memory_topic_links (
+          id text primary key, topic_id text not null, memory_id text not null,
+          category text not null check(category='promoted'), layer text not null, mode text not null check(mode in ('include','exclude','default')),
+          created_at text not null
+        );
+        create index memory_topic_links_identity on memory_topic_links(topic_id,memory_id,layer);
+        insert into memory_events(id,event_key,kind,memory_id,category,layer,actor,occurred_at)
+          values ('coverage-'||lower(hex(randomblob(16))), 'coverage-'||lower(hex(randomblob(16))),
+            'coverage','','promoted','core','system',strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+        insert into memory_events(id,event_key,kind,memory_id,category,layer,actor,occurred_at,recorded)
+          select 'recorded-durable-'||id,'recorded-durable-'||id,'made_durable',id,'promoted',layer,
+            'system',promoted_at,1 from memories;
+        insert or ignore into memory_events(id,event_key,kind,memory_id,category,layer,
+            related_memory_id,related_category,related_layer,reason,actor,occurred_at,recorded)
+            select 'recorded-replaced-'||r.id,'recorded-replaced-'||r.id,
+            'replaced',r.to_memory_id,'promoted',m.layer,r.from_memory_id,'promoted',n.layer,
+            coalesce(r.reason,''),'system',r.created_at,1
+          from memory_relations r join memories m on m.id=r.to_memory_id
+            left join memories n on n.id=r.from_memory_id where r.relation_type='supersedes';
+        insert or ignore into memory_events(id,event_key,kind,memory_id,category,layer,reason,actor,occurred_at,recorded)
+          select 'recorded-withdrawn-'||id,'recorded-withdrawn-'||id||'-'||status_changed_at,
+            'withdrawn',id,'promoted',layer,coalesce(status_reason,''),'system',status_changed_at,1
+          from memories where lifecycle_status='retracted';
+        insert or ignore into memory_events(id,event_key,kind,memory_id,category,layer,
+            related_memory_id,related_category,related_layer,reason,actor,occurred_at,recorded)
+          select 'recorded-review-'||r.id,'recorded-review-'||r.id,
+            case when r.action='discard' then 'withdrawn'
+              when r.category='candidate' then 'corrected' else 'replaced' end,
+            r.memory_id,r.category,r.layer,r.replacement_memory_id,r.replacement_category,
+            case r.replacement_category when 'promoted' then (select layer from memories where id=r.replacement_memory_id)
+              else (select layer from memory_candidates where id=r.replacement_memory_id) end,
+            r.reason,r.actor,r.reviewed_at,1
+          from memory_review_resolutions r where r.action in ('correct','discard')
+            and not exists(select 1 from memory_events e where e.memory_id=r.memory_id
+              and e.category=r.category and e.occurred_at=r.reviewed_at
+              and e.kind=case when r.action='discard' then 'withdrawn'
+                when r.category='candidate' then 'corrected' else 'replaced' end
+              and e.related_memory_id is r.replacement_memory_id);
+        insert or ignore into memory_events(id,event_key,kind,memory_id,category,layer,reason,actor,occurred_at,recorded)
+          select 'recorded-restore-'||c.id,'recorded-restore-'||c.id,'restored',
+            c.memory_id,c.category,c.layer,c.reason,c.actor,c.reverted_at,1
+          from memory_review_resolution_compensations c join memory_review_resolutions r on r.id=c.resolution_id
+          where r.action in ('correct','discard');
+        insert or ignore into memory_events(id,event_key,kind,memory_id,category,layer,reason,actor,occurred_at,recorded)
+          select 'recorded-replacement-withdraw-'||c.id,'recorded-replacement-withdraw-'||c.id,'withdrawn',
+            r.replacement_memory_id,r.replacement_category,
+            coalesce(case r.replacement_category when 'promoted' then (select layer from memories where id=r.replacement_memory_id)
+              else (select layer from memory_candidates where id=r.replacement_memory_id) end,r.layer),
+            'Replacement withdrawn because review '||r.id||' was reverted.',c.actor,c.reverted_at,1
+          from memory_review_resolution_compensations c join memory_review_resolutions r on r.id=c.resolution_id
+          where r.action='correct' and r.replacement_memory_id is not null
+            and not exists(select 1 from memory_events e where e.kind='withdrawn'
+              and e.memory_id=r.replacement_memory_id and e.category=r.replacement_category and e.occurred_at=c.reverted_at);
+        insert or ignore into memory_events(id,event_key,kind,memory_id,category,layer,reason,actor,occurred_at,recorded)
+          select 'recorded-triage-'||r.id,'recorded-triage-'||r.id,'withdrawn',
+            r.memory_id,r.category,r.layer,r.reason,r.actor,r.reviewed_at,1
+          from branch_triage_reviews r where r.action='discard'
+            and not exists(select 1 from memory_events e where e.kind='withdrawn'
+              and e.memory_id=r.memory_id and e.category=r.category and e.occurred_at=r.reviewed_at);
+        insert or ignore into memory_events(id,event_key,kind,memory_id,category,layer,from_value,to_value,reason,actor,occurred_at,recorded)
+          select 'recorded-share-'||r.id,'recorded-share-'||r.id,'sharing_changed',
+            r.promoted_memory_id,'promoted','core',r.layer,'core',r.reason,r.actor,r.reviewed_at,1
+          from branch_triage_reviews r where r.action='promote_to_core' and r.promoted_memory_id is not null and r.layer<>'core';
+        insert or ignore into memory_events(id,event_key,kind,memory_id,category,layer,reason,actor,occurred_at,recorded)
+          select 'recorded-retention-'||r.id,'recorded-retention-'||r.id,'withdrawn',
+            r.memory_id,r.category,r.layer,'Layer retention archive (policy v'||r.policy_version||').',r.actor,r.decided_at,1
+          from layer_retention_decisions r where r.decision='archive'
+            and not exists(select 1 from memory_events e where e.kind='withdrawn'
+              and e.memory_id=r.memory_id and e.category=r.category and e.occurred_at=r.decided_at);
+      `);
+      rebuildScopedTable(db, "memory_review_resolutions", sql => sql.replace("'verify', 'correct', 'discard'", "'verify', 'correct', 'discard', 'accept_wording'"));
+      for (const table of ["memory_events", "memory_topics", "memory_topic_links"]) {
+        for (const operation of ["insert", "update", "delete"]) {
+          const row = operation === "delete" ? "old" : "new";
+          db.exec(`create trigger retrieval_${table}_${operation} after ${operation} on ${table} begin
+            insert into retrieval_changes(entity,entity_id,operation) values ('${table}',${row}.id,'${operation}'); end;`);
+        }
+      }
+    }
   }
 ] as const;
+
+function rebuildDurableMemoryTableWithoutQuality(
+  db: DatabaseSync,
+  table: "memory_candidates" | "memories"
+): void {
+  const objects = db.prepare(
+    "select sql from sqlite_master where tbl_name = ? and type in ('index', 'trigger') and sql is not null"
+  ).all(table) as Array<{ sql: string }>;
+  const next = `${table}_v20_next`;
+  if (table === "memory_candidates") {
+    db.exec(`
+      create table ${next} (
+        id text primary key,
+        type text not null check (type in ('decision', 'bug_fix', 'constraint', 'rejected_approach')),
+        title text not null,
+        summary text not null,
+        reason text not null,
+        confidence real not null,
+        evidence_json text not null,
+        related_files_json text not null,
+        dedupe_key text not null,
+        promotion_state text not null check (promotion_state in ('candidate', 'promoted')),
+        promoted_memory_id text references memories(id),
+        evidence_signature text not null,
+        created_at text not null,
+        updated_at text not null,
+        origin_json text,
+        scope_json text not null default '{"kind":"unspecified"}',
+        scope_key text not null default 'unspecified',
+        layer text not null default 'core',
+        unique (dedupe_key, scope_key, layer)
+      );
+      insert into ${next}
+        (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+         dedupe_key, promotion_state, promoted_memory_id, evidence_signature, created_at, updated_at,
+         origin_json, scope_json, scope_key, layer)
+      select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+             dedupe_key, promotion_state, promoted_memory_id, evidence_signature, created_at, updated_at,
+             origin_json, scope_json, scope_key, layer
+        from memory_candidates;
+    `);
+  } else {
+    db.exec(`
+      create table ${next} (
+        id text primary key,
+        type text not null check (type in ('decision', 'bug_fix', 'constraint', 'rejected_approach')),
+        title text not null,
+        summary text not null,
+        reason text not null,
+        confidence real not null,
+        evidence_json text not null,
+        related_files_json text not null,
+        dedupe_key text not null,
+        evidence_signature text not null,
+        source text not null check (source in ('auto', 'manual')),
+        subject_key text not null,
+        lifecycle_status text not null default 'current' check (lifecycle_status in ('current', 'superseded', 'retracted')),
+        valid_from text not null,
+        valid_until text,
+        status_reason text,
+        status_changed_at text not null,
+        created_at text not null,
+        promoted_at text not null,
+        lifecycle_generation text not null default '',
+        origin_json text,
+        scope_json text not null default '{"kind":"unspecified"}',
+        scope_key text not null default 'unspecified',
+        layer text not null default 'core',
+        unique (dedupe_key, evidence_signature, source, scope_key, layer)
+      );
+      insert into ${next}
+        (id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+         dedupe_key, evidence_signature, source, subject_key, lifecycle_status, valid_from,
+         valid_until, status_reason, status_changed_at, created_at, promoted_at, lifecycle_generation,
+         origin_json, scope_json, scope_key, layer)
+      select id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+             dedupe_key, evidence_signature, source, subject_key, lifecycle_status, valid_from,
+             valid_until, status_reason, status_changed_at, created_at, promoted_at, lifecycle_generation,
+             origin_json, scope_json, scope_key, layer
+        from memories;
+    `);
+  }
+  db.exec(`drop table ${table}`);
+  db.exec(`alter table ${next} rename to ${table}`);
+  for (const object of objects) {
+    if (/quality_status|quality_reasons_json|last_verified_at/i.test(object.sql)) continue;
+    db.exec(object.sql);
+  }
+}
 
 /** Rebuild with FKs disabled by initializeSchema; retain indexes, triggers and IDs. */
 function rebuildScopedTable(db: DatabaseSync, table: string, transform: (sql: string) => string): void {
@@ -595,7 +977,7 @@ export function createV3MemorySubjectKey(type: MemoryType, title: string): strin
 export function initializeSchema(
   db: DatabaseSync,
   databasePath: string,
-  options: { migrations?: readonly SchemaMigration[]; backupRetention?: number } = {}
+  options: { migrations?: readonly SchemaMigration[]; backupRetention?: number; createBackup?: boolean } = {}
 ): void {
   const migrations = validateMigrations(options.migrations ?? SCHEMA_MIGRATIONS);
   db.exec("PRAGMA busy_timeout = 5000");
@@ -619,7 +1001,7 @@ export function initializeSchema(
       return;
     }
 
-    if (hasDataToProtect(db)) backupPath = createDatabaseBackup(databasePath);
+    if (options.createBackup !== false && hasDataToProtect(db)) backupPath = createDatabaseBackup(databasePath);
     for (const migration of pending) {
       migration.up(db);
       const appliedAt = new Date().toISOString();

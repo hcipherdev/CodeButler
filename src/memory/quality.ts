@@ -4,8 +4,17 @@ import type {
   EvidenceRef,
   ExtractedMemory,
   MemoryCandidate,
+  MemoryLayerOwner,
   MemoryQualityStatus
 } from "../types.js";
+import {
+  currentMemoryReview,
+  effectiveTerminalMemoryReview,
+  matchingMemoryVerification,
+  type MemoryReviewCategory
+} from "./review-state.js";
+import { hasExactLegacyV1Signature } from "./legacy.js";
+import { assessClaim, claimText } from "./statement.js";
 
 export interface MemoryQualityAssessment {
   status: MemoryQualityStatus;
@@ -28,17 +37,49 @@ export interface MemoryAuditChange {
 export interface MemoryAuditResult {
   scanned: number;
   total: number;
+  historicalTotal: number;
   complete: boolean;
   active: number;
   needsReview: number;
   quarantined: number;
   rejected: number;
+  retired: number;
+  replaced: number;
   updated: number;
   changes: MemoryAuditChange[];
   topReasons: Array<{ reason: string; count: number }>;
 }
 
 type AuditableMemory = ExtractedMemory | MemoryCandidate | DurableMemory;
+
+export interface LiveMemoryPopulationEntry {
+  category: MemoryReviewCategory;
+  memory: MemoryCandidate | DurableMemory;
+}
+
+export interface MemoryPopulationSnapshot {
+  candidates: MemoryCandidate[];
+  promoted: DurableMemory[];
+  live: LiveMemoryPopulationEntry[];
+  historicalTotal: number;
+  retired: number;
+  replaced: number;
+}
+
+const MANUAL_REVIEW_QUARANTINE_REASONS = new Set([
+  "manual_review_corrected",
+  "manual_review_discarded"
+]);
+const PRESERVED_QUALITY_REASONS = new Set([
+  "branch_triage_discarded",
+  "layer_retention_archived",
+  "automatic_promotion_conflict",
+  "cloud_merge_conflict",
+  // v19 recorded this assessment before v20 moved quality device-local. Keep
+  // near-matches reviewable, while legacy-v1 retirement still requires the
+  // complete exact structural signature.
+  "legacy_low_signal_heuristic"
+]);
 
 export function assessMemoryQuality(
   store: MemoryStore,
@@ -48,10 +89,11 @@ export function assessMemoryQuality(
     source?: DurableMemory["source"] | undefined;
     currentStatus?: MemoryQualityStatus | undefined;
     potentialConflict?: boolean | undefined;
+    ignoreReviewResolution?: boolean | undefined;
   } = {}
 ): MemoryQualityAssessment {
   const reasons = new Set<string>();
-  const parts = [memory.title, memory.summary, memory.reason];
+  const parts = [memory.title, claimText(memory), memory.reason, ...Object.values(memory.statement?.fields ?? {})];
   const text = parts.join("\n");
 
   if (!Number.isFinite(memory.confidence) || memory.confidence < 0 || memory.confidence > 1) {
@@ -71,12 +113,39 @@ export function assessMemoryQuality(
   }
 
   if (isHtmlOrMarkup(text)) reasons.add("html_or_markup_content");
+  if (assessClaim(memory) === "missing_claim") reasons.add("missing_claim");
   if (isCodeOrDiff(text)) reasons.add("code_or_diff_content");
   if (parts.some(isJsonFragment)) reasons.add("json_fragment_content");
   if (parts.some(isTableFragment)) reasons.add("table_fragment_content");
   if (hasVeryLowProseRatio(text)) reasons.add("low_prose_ratio");
+  if (isLegacyLowSignalMemory(memory)) reasons.add("legacy_low_signal_heuristic");
   if (hasNewerRelatedCommits(store, memory, options.source)) reasons.add("stale_related_file_evidence");
   if (options.potentialConflict ?? hasPotentialConflict(store, memory)) reasons.add("potential_conflict");
+
+  // Device-local decisions remain cached until their fingerprint changes. Shared
+  // review outcomes below are authoritative and do not depend on cached labels.
+  if ("qualityReasons" in memory) {
+    for (const reason of memory.qualityReasons) {
+      if (PRESERVED_QUALITY_REASONS.has(reason)) reasons.add(reason);
+    }
+  }
+
+  if (!options.ignoreReviewResolution && "id" in memory) {
+    const category: MemoryReviewCategory | undefined = "promotionState" in memory
+      ? "candidate"
+      : "lifecycleStatus" in memory
+        ? "promoted"
+        : undefined;
+    const latestReview = category === undefined ? undefined : currentMemoryReview(store, category, memory);
+    const terminal = category === undefined ? undefined : effectiveTerminalMemoryReview(store, category, memory);
+    if (terminal?.action === "correct") reasons.add("manual_review_corrected");
+    if (terminal?.action === "discard") reasons.add("manual_review_discarded");
+    const verification = category !== undefined && latestReview?.action === "verify" && latestReview.current
+      ? matchingMemoryVerification(store, category, memory)
+      : undefined;
+    if ((latestReview?.action === "verify" && !latestReview.current) || latestReview?.action === "accept_wording") reasons.add("review_context_changed");
+    for (const reason of verification?.resolvedReasons ?? []) reasons.delete(reason);
+  }
 
   const hardReasons = [
     "invalid_confidence",
@@ -86,7 +155,11 @@ export function assessMemoryQuality(
     "code_or_diff_content",
     "json_fragment_content",
     "table_fragment_content",
-    "low_prose_ratio"
+    "low_prose_ratio",
+    "legacy_low_signal_heuristic",
+    "branch_triage_discarded",
+    "layer_retention_archived",
+    ...MANUAL_REVIEW_QUARANTINE_REASONS
   ];
   const rejected = hardReasons.some((reason) => reasons.has(reason));
   const status: MemoryQualityStatus = rejected
@@ -105,20 +178,53 @@ export function assessMemoryQuality(
   };
 }
 
+function isLegacyLowSignalMemory(memory: AuditableMemory): boolean {
+  return hasExactLegacyV1Signature(memory);
+}
+
 export function summarizeMemoryHealth(store: MemoryStore): Omit<MemoryAuditResult, "updated" | "changes"> {
-  const candidates = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: null });
-  const promoted = store.listMemories({ lifecycleStatus: "all", qualityStatus: "all", limit: null });
-  const all = [...candidates, ...promoted];
-  const reasons = all.flatMap((memory) => memory.qualityReasons);
+  const population = readMemoryPopulation(store);
+  const live = population.live.map((item) => item.memory);
+  const reasons = live.flatMap((memory) => memory.qualityReasons);
   return {
-    scanned: all.length,
-    total: all.length,
+    scanned: population.historicalTotal,
+    total: live.length,
+    historicalTotal: population.historicalTotal,
     complete: true,
-    active: all.filter((memory) => memory.qualityStatus === "active").length,
-    needsReview: all.filter((memory) => memory.qualityStatus === "needs_review").length,
-    quarantined: all.filter((memory) => memory.qualityStatus === "quarantined").length,
-    rejected: all.filter((memory) => memory.qualityStatus === "quarantined").length,
+    active: live.filter((memory) => memory.qualityStatus === "active").length,
+    needsReview: live.filter((memory) => memory.qualityStatus === "needs_review").length,
+    quarantined: live.filter((memory) => memory.qualityStatus === "quarantined").length,
+    rejected: live.filter((memory) => memory.qualityStatus === "quarantined").length,
+    retired: population.retired,
+    replaced: population.replaced,
     topReasons: topReasons(reasons)
+  };
+}
+
+/** The single live-population definition used by health and reconciliation. */
+export function readMemoryPopulation(store: MemoryStore, owner: MemoryLayerOwner = "self"): MemoryPopulationSnapshot {
+  const candidates = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", owner, limit: null });
+  const promoted = store.listMemories({ lifecycleStatus: "all", qualityStatus: "all", owner, limit: null });
+  const candidateStates = candidates.map((memory) => ({
+    memory,
+    terminal: effectiveTerminalMemoryReview(store, "candidate", memory)
+  }));
+  return {
+    candidates,
+    promoted,
+    live: [
+      ...candidateStates
+        .filter((item) => item.terminal === undefined)
+        .map((item) => ({ category: "candidate" as const, memory: item.memory })),
+      ...promoted
+        .filter((memory) => memory.lifecycleStatus === "current")
+        .map((memory) => ({ category: "promoted" as const, memory }))
+    ],
+    historicalTotal: candidates.length + promoted.length,
+    retired: candidateStates.filter((item) => item.terminal?.action === "discard").length +
+      promoted.filter((memory) => memory.lifecycleStatus === "retracted").length,
+    replaced: candidateStates.filter((item) => item.terminal?.action === "correct").length +
+      promoted.filter((memory) => memory.lifecycleStatus === "superseded").length
   };
 }
 
@@ -126,9 +232,11 @@ export function auditMemoryQuality(
   store: MemoryStore,
   options: { fix?: boolean | undefined; now?: string | undefined } = {}
 ): MemoryAuditResult {
+  if (options.fix) store.maintainLocalQualityCache();
   const now = options.now ?? new Date().toISOString();
-  const candidates = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: null });
-  const promoted = store.listMemories({ lifecycleStatus: "all", qualityStatus: "all", limit: null });
+  const population = readMemoryPopulation(store);
+  const candidates = population.candidates;
+  const promoted = population.promoted;
   const changes: MemoryAuditChange[] = [];
   const all = [
     ...candidates.map((memory) => ({ kind: "candidate" as const, memory })),
@@ -164,33 +272,48 @@ export function auditMemoryQuality(
     }
   }
 
-  const health = options.fix ? summarizeMemoryHealth(store) : summarizeProjectedHealth(all, changes);
+  const health = options.fix ? summarizeMemoryHealth(store) : summarizeProjectedHealth(store, all, changes);
   return {
     ...health,
     updated: options.fix ? changes.length : 0,
     changes,
-    topReasons: topReasons(changes.flatMap((change) => change.reasons))
+    topReasons: health.topReasons
   };
 }
 
 function summarizeProjectedHealth(
+  store: MemoryStore,
   all: Array<{ kind: "candidate" | "promoted"; memory: MemoryCandidate | DurableMemory }>,
   changes: MemoryAuditChange[]
 ): Omit<MemoryAuditResult, "updated" | "changes"> {
   const changed = new Map(changes.map((change) => [`${change.kind}:${change.id}`, change]));
-  const statuses = all.map((item) => {
+  const live = all.filter((item) => item.kind === "candidate"
+    ? effectiveTerminalMemoryReview(store, "candidate", item.memory) === undefined
+    : (item.memory as DurableMemory).lifecycleStatus === "current");
+  const statuses = live.map((item) => {
     const change = changed.get(`${item.kind}:${item.memory.id}`);
     return change?.nextStatus ?? item.memory.qualityStatus;
   });
+  const reasons = live.flatMap((item) => {
+    const change = changed.get(`${item.kind}:${item.memory.id}`);
+    return change?.reasons ?? item.memory.qualityReasons;
+  });
   return {
     scanned: all.length,
-    total: all.length,
+    total: live.length,
+    historicalTotal: all.length,
     complete: true,
     active: statuses.filter((status) => status === "active").length,
     needsReview: statuses.filter((status) => status === "needs_review").length,
     quarantined: statuses.filter((status) => status === "quarantined").length,
     rejected: statuses.filter((status) => status === "quarantined").length,
-    topReasons: topReasons(changes.flatMap((change) => change.reasons))
+    retired: all.filter((item) => item.kind === "candidate"
+      ? effectiveTerminalMemoryReview(store, "candidate", item.memory)?.action === "discard"
+      : (item.memory as DurableMemory).lifecycleStatus === "retracted").length,
+    replaced: all.filter((item) => item.kind === "candidate"
+      ? effectiveTerminalMemoryReview(store, "candidate", item.memory)?.action === "correct"
+      : (item.memory as DurableMemory).lifecycleStatus === "superseded").length,
+    topReasons: topReasons(reasons)
   };
 }
 

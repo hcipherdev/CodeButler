@@ -111,6 +111,15 @@ export function readSource(
   } : undefined;
 }
 
+/** Citation and existence reads must not materialize the conversation body. */
+export function readSourceMetadata(
+  db: DatabaseSync, contentPolicy: StorageContentPolicy, sourceId: string
+): Omit<MemorySource, "rawContent"> | undefined {
+  const row = db.prepare("select id, type, title, origin, metadata_json from sources where id = ?")
+    .get(contentPolicy.identifier(sourceId)) as Omit<SourceRow, "raw_content"> | undefined;
+  return row ? { id: row.id, type: row.type, title: row.title, origin: row.origin, metadata: parseJsonObject(row.metadata_json) } : undefined;
+}
+
 export function readChunkWindow(
   db: DatabaseSync,
   contentPolicy: StorageContentPolicy,
@@ -131,6 +140,13 @@ export function readChunkWindow(
   return rows.map(chunkFromRow);
 }
 
+export function listSourceChunks(db: DatabaseSync, contentPolicy: StorageContentPolicy, sourceId: string): MemoryChunk[] {
+  const rows = db.prepare(
+    "select id, source_id, chunk_index, text, metadata_json from chunks where source_id = ? order by chunk_index"
+  ).all(contentPolicy.identifier(sourceId)) as unknown as ChunkRow[];
+  return rows.map(chunkFromRow);
+}
+
 export function readConversationWindow(
   db: DatabaseSync,
   contentPolicy: StorageContentPolicy,
@@ -141,6 +157,11 @@ export function readConversationWindow(
 ): MemoryChunk[] {
   const canonicalSourceId = contentPolicy.identifier(sourceId);
   const canonicalChunkId = contentPolicy.locator(anchorChunkId);
+  if (before <= 0 && after <= 0) {
+    const row = db.prepare("select id, source_id, chunk_index, text, metadata_json from chunks where id = ? and source_id = ?")
+      .get(canonicalChunkId, canonicalSourceId) as ChunkRow | undefined;
+    return row ? [chunkFromRow(row)] : [];
+  }
   const anchor = db.prepare(
     `select chunk_index from chunks where id = ? and source_id = ?`
   ).get(canonicalChunkId, canonicalSourceId) as { chunk_index: number } | undefined;

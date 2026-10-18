@@ -60,7 +60,9 @@ export function updateMemoryStatus(
         lifecycleStatus: "superseded",
         validUntil: input.now,
         statusReason: input.reason,
-        statusChangedAt: input.now
+        statusChangedAt: input.now,
+        actor: input.actor,
+        replacementMemoryId: replacementId
       });
       store.addMemoryRelation({
         fromMemoryId: replacementId,
@@ -74,6 +76,7 @@ export function updateMemoryStatus(
       return updated;
     }
 
+    if (input.status === memory.lifecycleStatus) return memory;
     if (input.status === "current") {
       for (const relation of store.listMemoryRelations({
         toMemoryId: input.memoryId,
@@ -87,7 +90,8 @@ export function updateMemoryStatus(
       lifecycleStatus: input.status,
       validUntil: input.status === "current" ? null : input.now,
       statusReason: input.reason,
-      statusChangedAt: input.now
+      statusChangedAt: input.now,
+      actor: input.actor
     });
     recordLifecycleChange(store, input, memory.lifecycleStatus);
     scheduleEmbeddingCleanup(store, input.memoryId);

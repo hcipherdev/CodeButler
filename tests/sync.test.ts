@@ -397,7 +397,7 @@ describe("automatic sync", () => {
 
   it("filters conversation logs to the current project by default", async () => {
     const { rootDir, repoDir, claudeDir } = createFixtureWorkspace();
-    const encodedProjectDir = join(rootDir, "claude", "projects", repoDir.replace(/^\/+/, "").replaceAll("/", "-"));
+    const encodedProjectDir = join(rootDir, "claude", "projects", repoDir.replace(/^[A-Za-z]:[\\/]/, "").replace(/^\/+/, "").replace(/[\\/]/g, "-"));
     const unrelatedDir = join(rootDir, "claude", "projects", "-Users-example-Documents-other");
     mkdirSync(encodedProjectDir, { recursive: true });
     mkdirSync(unrelatedDir, { recursive: true });
@@ -845,6 +845,77 @@ describe("automatic sync", () => {
     expect(result.sources.git.imported).toBe(1);
     expect(result.memories.error).toBe("injected extractor failure");
     expect(calls).toBe(1);
+    store.close();
+  });
+
+  it("retries stored evidence after an extractor failure without reimporting it", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    let store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const failed = await syncProjectMemory(store, config, {
+      source: "git",
+      extractorProvider: { async extract() { throw new SyntaxError("Malformed extractor JSON"); } }
+    });
+    expect(failed.sources.git.imported).toBe(1);
+    expect(failed.memories).toMatchObject({ error: "Malformed extractor JSON", pending: 1 });
+    expect(store.listPendingExtractionEvidence()).toEqual([
+      expect.objectContaining({ adapter: "git", sourceType: "commit", attempts: 1 })
+    ]);
+    store.close();
+
+    store = openMemoryStore(rootDir);
+    store.init();
+    const extract = vi.fn(async (context: Parameters<ExtractorProvider["extract"]>[0]) => {
+      expect(context.commits).toHaveLength(1);
+      return { memories: [], rejected: [] };
+    });
+    const retried = await syncProjectMemory(store, config, { source: "git", extractorProvider: { extract } });
+    expect(retried.sources.git.imported).toBe(0);
+    expect(retried.memories).toMatchObject({ pending: 0, skipped: false });
+    expect(extract).toHaveBeenCalledOnce();
+    expect(store.getExtractionStatus()).toMatchObject({ pending: 0, lastSuccessAt: expect.any(String) });
+    store.close();
+  });
+
+  it("retries malformed extractor JSON once during the same pass", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const extract = vi.fn()
+      .mockRejectedValueOnce(new SyntaxError("Expected ',' after array element"))
+      .mockResolvedValueOnce({ memories: [], rejected: [] });
+    const result = await syncProjectMemory(store, config, { source: "git", extractorProvider: { extract } });
+    expect(extract).toHaveBeenCalledTimes(2);
+    expect(result.memories).toMatchObject({ pending: 0, skipped: false });
+    expect(store.listPendingExtractionEvidence()).toEqual([]);
+    store.close();
+  });
+
+  it("reconstructs queued conversation chunks for a later extraction pass", async () => {
+    const { rootDir } = createFixtureWorkspace();
+    let store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    await syncProjectMemory(store, config, {
+      source: "codex",
+      extractorProvider: { async extract() { throw new Error("Provider unavailable"); } }
+    });
+    expect(store.getExtractionStatus().pending).toBe(1);
+    store.close();
+
+    store = openMemoryStore(rootDir);
+    store.init();
+    const extract = vi.fn(async (context: Parameters<ExtractorProvider["extract"]>[0]) => {
+      expect(context.conversations).toHaveLength(1);
+      expect(context.conversations[0]!.chunks?.[0]?.id).toBe(`${context.conversations[0]!.sourceId}:chunk:0`);
+      return { memories: [], rejected: [] };
+    });
+    const result = await syncProjectMemory(store, config, { source: "codex", extractorProvider: { extract } });
+    expect(result.sources.codex.imported).toBe(0);
+    expect(result.memories.pending).toBe(0);
+    expect(extract).toHaveBeenCalledOnce();
     store.close();
   });
 

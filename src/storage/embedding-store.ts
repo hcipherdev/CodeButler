@@ -1,3 +1,4 @@
+import { memoryContentText, parseStatement } from "../memory/statement.js";
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 
@@ -34,13 +35,15 @@ export function listEmbeddingOwners(db: DatabaseSync): EmbeddingOwner[] {
   const chunks = db.prepare("select id, text from chunks order by id asc")
     .all() as Array<{ id: string; text: string }>;
   const memories = db.prepare(
-    `select id, title, summary, reason, lifecycle_generation
+    `select id, type, title, summary, reason, statement_json, lifecycle_generation
      from memories
      where lifecycle_status = 'current'
      order by id asc`
   ).all() as Array<{
     id: string;
     title: string;
+    type: import("../types.js").MemoryType;
+    statement_json: string | null;
     summary: string;
     reason: string;
     lifecycle_generation: string;
@@ -54,7 +57,7 @@ export function listEmbeddingOwners(db: DatabaseSync): EmbeddingOwner[] {
       ownerVersion: ""
     })),
     ...memories.map<EmbeddingOwner>((row) => {
-      const text = [row.title, row.summary, row.reason].join("\n\n");
+      const text = memoryContentText({ ...row, statement: parseStatement(row.statement_json, row.type) });
       return {
         ownerKind: "memory",
         ownerId: row.id,

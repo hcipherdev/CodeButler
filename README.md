@@ -17,7 +17,9 @@ Ask questions like:
 
 In short: Git tells an agent what changed; Code Butler helps it recover why it
 changed, what was decided, and which constraints still apply. Project memory
-stays local by default in each repository's `.code-butler/` directory.
+stays local by default in each repository's `.code-butler/` directory, and
+optional [end-to-end encrypted cloud sync](#encrypted-cloud-sync-optional) with
+quantum-resistant key exchange carries it between your computers.
 
 ## Why Use It
 
@@ -35,6 +37,9 @@ Use it to:
 - Keep a generated project narrative summary available for future agents.
 - Search temporary working context separately from durable project memory.
 - Audit memory quality and diagnose setup issues with `code-butler doctor`.
+- Sync memory across your computers with end-to-end encryption and hybrid
+  post-quantum key exchange (X25519 + ML-KEM-768). The server never sees your
+  memories.
 
 ## What It Looks Like
 
@@ -93,30 +98,105 @@ Memory can come from:
 
 ## Requirements
 
+- macOS, Windows, or Linux
 - Node.js 24 or newer. Code Butler uses Node's built-in SQLite support.
 - Git
+- For encrypted cloud sync only: macOS or Windows, and a Rust toolchain to build
+  the native crypto helper (see Quick Start)
 
 ## Quick Start
 
-Install the Code Butler CLI from npm:
+> **Version note:** this repository is Code Butler 2.0. The npm registry still
+> serves the earlier 1.x release, whose cloud sync has been retired. Until 2.0
+> is published to npm, build from source to get the current version. The
+> `npx -y code-butler` and `npm install -g code-butler` examples below install
+> 1.x; with a source build, use the `code-butler` command instead.
+
+Install from source on macOS, Windows, or Linux. Local project memory works on
+all three. Encrypted cloud sync needs the native crypto helper, which builds on
+macOS and Windows only.
+
+### macOS
+
+Install the prerequisites once:
+
+- Node.js 24 or newer, from [nodejs.org](https://nodejs.org/) or Homebrew
+  (`brew install node`). With Homebrew or a version manager such as nvm,
+  `npm install -g` works without `sudo`; do not use `sudo` with npm.
+- Git and the compiler tools: `xcode-select --install`
+- Only for encrypted cloud sync, Rust: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+  then open a new terminal.
+
+Build and install:
 
 ```bash
-npm install -g code-butler
+git clone https://github.com/hcipherdev/CodeButler.git
+cd CodeButler
+npm ci
+npm run package:crypto   # only for encrypted cloud sync; needs Rust
+npm pack
+npm install -g ./code-butler-2.0.0.tgz
+code-butler --version
 ```
 
-On Windows, install Node.js 24 or newer first and make sure `node`, `npm`, and
-`code-butler` are available in a new PowerShell window:
+`npm pack` builds the package and names the file after the version in
+`package.json`.
+
+### Windows
+
+Install the prerequisites once:
+
+- Node.js 24 or newer from [nodejs.org](https://nodejs.org/) (keep "Add to PATH"
+  selected).
+- [Git for Windows](https://git-scm.com/download/win).
+- Only for encrypted cloud sync, Rust from [rustup.rs](https://rustup.rs/). When
+  `rustup-init.exe` asks, install the Visual Studio C++ Build Tools ("Desktop
+  development with C++").
+
+Then open a **new** PowerShell window, so the new tools are on `PATH`:
 
 ```powershell
-node --version
-npm --version
-code-butler --help
+node --version   # must be v24 or newer
+git clone https://github.com/hcipherdev/CodeButler.git
+cd CodeButler
+npm ci
+npm run package:crypto   # only for encrypted cloud sync; needs Rust
+npm pack
+npm install -g .\code-butler-2.0.0.tgz
+code-butler --version
 ```
+
+If PowerShell reports that running scripts is disabled, use `npm.cmd` and
+`code-butler.cmd` instead of `npm` and `code-butler`, or allow local scripts for
+your account with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. If
+`code-butler` is not found, open a new PowerShell window and check that the
+folder printed by `npm prefix -g` is on your `PATH`.
 
 Do not install Code Butler into a Codex-managed runtime directory such as
 `AppData\Local\OpenAI\Codex\runtimes\...`. Codex may replace those directories
 during updates. Use a normal Node.js installation or another stable user-local
-Node prefix that you control.
+Node prefix that you control (see
+[Windows Source Install And Update](#windows-source-install-and-update)).
+
+### Linux
+
+Follow the macOS steps without `npm run package:crypto`, installing Node.js 24
+or newer and Git with your package manager. Encrypted cloud sync is not
+available on Linux yet.
+
+### Update
+
+From your `CodeButler` folder, pull and reinstall:
+
+```bash
+git pull
+npm ci
+npm run package:crypto   # only if you use encrypted cloud sync
+npm pack
+npm install -g ./code-butler-2.0.0.tgz   # use the file name npm pack prints
+```
+
+### Set up a project
 
 Recommended: initialize Code Butler in each project where you want agents to
 use the full memory workflow:
@@ -204,6 +284,10 @@ code-butler doctor
 ```
 
 ## MCP Setup
+
+The `npx -y code-butler` examples in this section run the 1.x release from npm.
+If you installed 2.0 from source (see Quick Start), use the `code-butler`
+command variants instead.
 
 MCP is how Codex, Claude Code, VS Code, and other agents call Code Butler's
 memory tools. The safest setup is to point the client at one project
@@ -379,7 +463,8 @@ Once connected, agents can call tools such as:
 
 ## Build From Source
 
-Clone the repository, install dependencies, and build the CLI:
+The Quick Start installs from source. For development, clone the repository,
+install dependencies, and build the CLI without installing it globally:
 
 ```bash
 npm install
@@ -390,6 +475,13 @@ Run the built CLI locally:
 
 ```bash
 node dist/cli.js --help
+```
+
+Encrypted cloud sync also needs the native crypto helper. On macOS or Windows,
+with a Rust toolchain installed, build it into the package layout:
+
+```bash
+npm run package:crypto
 ```
 
 During development, you can run the TypeScript entrypoint directly:
@@ -406,9 +498,9 @@ node /absolute/path/to/code-butler/dist/cli.js mcp --project-root /absolute/path
 
 ### Windows Source Install And Update
 
-If the npm package is unavailable, or if you want to install from a local
-checkout on Windows, use a stable Node.js 24 installation or user-local Node
-prefix. Do not use a Codex runtime folder as the permanent install location,
+The Windows steps in Quick Start are the usual install. Use this variant to
+install into a separate, stable user-local Node prefix. Use a stable Node.js 24
+installation or user-local Node prefix. Do not use a Codex runtime folder as the permanent install location,
 because Codex can rotate those folders during updates.
 
 From PowerShell:
@@ -419,8 +511,9 @@ git pull
 
 npm ci
 .\node_modules\.bin\tsc.cmd -p tsconfig.build.json
+npm run package:crypto   # optional: needs Rust; required for encrypted cloud sync
 npm pack --ignore-scripts
-npm install -g .\code-butler-1.0.0.tgz
+npm install -g .\code-butler-2.0.0.tgz
 
 code-butler --help
 ```
@@ -434,8 +527,9 @@ $env:PATH = "$nodePrefix;$env:PATH"
 
 & "$nodePrefix\npm.cmd" ci
 & ".\node_modules\.bin\tsc.cmd" -p tsconfig.build.json
+& "$nodePrefix\npm.cmd" run package:crypto
 & "$nodePrefix\npm.cmd" pack --ignore-scripts
-& "$nodePrefix\npm.cmd" install -g --prefix $nodePrefix .\code-butler-1.0.0.tgz
+& "$nodePrefix\npm.cmd" install -g --prefix $nodePrefix .\code-butler-2.0.0.tgz
 ```
 
 Then configure Codex globally:
@@ -510,43 +604,79 @@ For durable instructions, keep `AGENTS.md` and `CLAUDE.md` short. They should
 tell agents how to consult Code Butler, not try to store the project's memory
 themselves.
 
-## Cloud Sync Beta (Optional)
+## Encrypted Cloud Sync (Optional)
 
 Cloud sync is an opt-in way to carry a project's Code Butler memory between
-your devices. It synchronizes snapshots of Butler's portable project state; it
-does not run your agent or MCP tools in the cloud. Local MCP and offline use
-continue to work if cloud sync is unavailable.
+your computers. It does not run your agent or MCP tools in the cloud, and local
+MCP and offline use keep working when cloud sync is unavailable.
 
-You need a beta code for the Code Butler cloud service. On your first device,
-connect from inside the project, enter that code at the hidden prompt, and
-enable the project:
+Your memory is end-to-end encrypted on your own computer before it ever leaves
+it. The server only stores ciphertext and a signed device registry, so it
+cannot read your project memory, and neither can anyone who breaches it.
+
+**Quantum-resistant by design.** The keys that unlock your projects travel
+between your computers using hybrid post-quantum key exchange: classic X25519
+combined with ML-KEM-768, the NIST-standardized post-quantum algorithm. Traffic
+recorded today stays protected against tomorrow's quantum computers, and the
+data itself is sealed with 256-bit ChaCha20-Poly1305. Device signatures use
+Ed25519.
+
+A native helper (`butler-crypto`, built from `native/` in this repository)
+keeps private keys out of JavaScript and stores them in Windows DPAPI or the
+macOS Keychain. Everything is open source, so you can audit it yourself. Cloud
+sync currently runs on macOS and Windows. See the
+[encrypted sync protocol](docs/encrypted-sync-protocol.md) for exactly what the
+server can and cannot observe.
+
+Cloud sync needs a source build that includes the native helper
+(`npm run package:crypto`, see Quick Start). A desktop app for managing
+accounts, passkeys, and new computers is not publicly released yet. From the
+CLI, on your first computer:
 
 ```bash
-code-butler cloud connect --server https://cloud.codebutler.dev
-code-butler cloud enable
+code-butler cloud register --server https://cloud.codebutler.dev --email you@example.com
+code-butler cloud init --recovery-file ./code-butler-recovery.json
+code-butler cloud enable --new
 code-butler cloud status
 ```
 
-On another device, clone or open the code repository first. Then connect with
-the same beta code, choose the existing cloud project, and enable it:
+`register` sends an email code, then asks for a new password at a hidden
+prompt. `init` creates your encrypted vault and writes an offline recovery file;
+it prints a separate recovery code. Store both somewhere safe and offline. They
+are the only way back in if you lose every approved computer.
+
+To add another computer, sign in there and request approval:
 
 ```bash
-code-butler cloud connect --server https://cloud.codebutler.dev
+code-butler cloud login --server https://cloud.codebutler.dev --email you@example.com
+code-butler cloud device request
+```
+
+Compare the printed fingerprint and approve it from a computer that is already
+approved (in the desktop Account Center, or with
+`code-butler cloud device approve --fingerprint <fingerprint>`). Then run
+`code-butler cloud device complete` on the new computer until it reports
+`enrolled`, and in a checkout of the same code repository list and connect the
+project:
+
+```bash
 code-butler cloud projects
 code-butler cloud enable --project PROJECT_UUID
 ```
 
 Restart MCP sessions that were already running after enabling cloud sync. If
-both devices make offline changes, synchronization pauses rather than merging
-SQLite databases; resolve it explicitly with `code-butler cloud resolve --keep
-local` or `code-butler cloud resolve --keep cloud`.
+both computers change memory offline, Code Butler merges what it can and pauses
+on real conflicts; resolve them with `code-butler cloud resolve --keep local` or
+`--keep cloud`. Remove a lost computer with `code-butler cloud device revoke
+--device DEVICE_ID`, which also rotates project keys. Disable sync for a
+checkout with `code-butler cloud disable`; local memory remains on disk.
 
-Cloud sync is a beta service, not end-to-end encrypted storage: the server can
-read uploaded snapshots, so keep the beta code private and review project-memory
-files before enabling it. Device-local credentials, source roots, and sync
-cursors are not uploaded. If a conflict appears, both versions are preserved;
-pick the version you want to keep explicitly. Disable sync for a checkout with
-`code-butler cloud disable`; local memory remains on disk.
+### Upgrading from 1.x cloud sync
+
+The 1.x beta cloud service (beta codes, `code-butler cloud connect`) has been
+retired, and its storage was readable by the server. Your local memory is
+unaffected. To keep syncing, register an account as above and enable each
+project again with `code-butler cloud enable --new` on one computer.
 
 ## Manual Memory
 

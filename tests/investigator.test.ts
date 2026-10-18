@@ -49,12 +49,15 @@ describe("native RLM investigation", () => {
           mode: "conservative",
           minScore: 0.85,
           mergedBranches: true,
-          deviceMemories: true
+          deviceMemories: true,
+          coreCandidates: true,
+          singleSourceMinConfidence: 0.9
         }
       },
       sync: {
         autoSyncOnServerStart: true,
-        shareLocalLayers: "durable"
+        shareLocalLayers: "durable",
+        conflictPolicy: "merge"
       },
       retrieval: { mode: "fts", rrfK: 60 },
       embeddings: {

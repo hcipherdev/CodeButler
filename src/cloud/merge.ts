@@ -1,8 +1,10 @@
+import { parseStatement } from "../memory/statement.js";
 import type { DatabaseSync } from "node:sqlite";
 
 import { normalizeMemorySummary, type ComparableMemoryFact } from "../memory/conflicts.js";
 import { parseScope } from "../memory/scope.js";
 import type { EvidenceRef, MemoryType } from "../types.js";
+import type { MemoryStore } from "../storage/store.js";
 
 /**
  * A row-level three-way merge of the shared `core` database.
@@ -56,11 +58,14 @@ const MERGE_TABLES: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["decisions", ["id"]],
   ["memories", ["id"]],
   ["memory_candidates", ["id"]],
+  ["memory_review_resolutions", ["id"]],
+  ["memory_review_resolution_compensations", ["id"]],
   ["memory_links", ["id"]],
   ["memory_relations", ["id"]],
   ["relations", ["id"]],
   ["temporary_memories", ["id"]],
   ["temporary_memory_links", ["id"]]
+  ,["memory_events", ["id"]], ["memory_topics", ["id"]], ["memory_topic_links", ["id"]]
 ];
 /**
  * Secondary uniqueness keys. Two devices that independently record the same fact derive
@@ -72,12 +77,23 @@ const NATURAL_KEYS: Readonly<Record<string, readonly string[]>> = {
   memories: ["dedupe_key", "evidence_signature", "source", "scope_key", "layer"],
   memory_candidates: ["dedupe_key", "scope_key", "layer"],
   temporary_memories: ["base_id", "scope_key", "layer"],
+  memory_review_resolutions: ["id"],
+  memory_review_resolution_compensations: ["resolution_id"],
   memory_relations: ["from_memory_id", "to_memory_id", "relation_type"]
 };
 const MEMORY_TABLES = new Set(["memories", "memory_candidates"]);
 /** Only shared rows are merged; a local layer belongs to its own device. */
-const LAYERED_TABLES = new Set(["memories", "memory_candidates", "temporary_memories"]);
+const LAYERED_TABLES = new Set([
+  "memory_events", "memory_topics", "memory_topic_links",
+  "memories",
+  "memory_candidates",
+  "memory_review_resolutions",
+  "memory_review_resolution_compensations",
+  "temporary_memories"
+]);
 const CONFLICT_QUALITY_REASON = "cloud_merge_conflict";
+/** Written in place of `temporary_memories.project_id` while merging; `applyCoreMerge` puts the local path back. */
+export const MASKED_PROJECT = "@project";
 
 type Row = Record<string, unknown>;
 
@@ -107,6 +123,12 @@ export function mergeCore(
     localId?: string | undefined;
   }
   const planned: PlannedRow[] = [];
+  const aliases=new Map<string,string>();
+  // Recover convergence on every merge, including events arriving after the original identity merge.
+  for(const table of ["memories","memory_candidates","temporary_memories"])for(const row of (tableColumns(local,table).length&&tableColumns(remote,table).length ? readRows(remote,table,["id"],tableColumns(local,table)).values() : [])){
+    const duplicate=heldUnderAnotherId(local,table,["id"],row);
+    if(duplicate&&(!MEMORY_TABLES.has(table)||statementFact(duplicate)===statementFact(row)))aliases.set(table+":"+String(row.id),String(duplicate.id));
+  }
 
   for (const [table, key] of MERGE_TABLES) {
     const columns = tableColumns(local, table);
@@ -155,12 +177,31 @@ export function mergeCore(
     if (item.action === "insert_remote" || item.action === "take_remote") {
       // Guaranteed by decideRow: neither action is reachable without a remote row.
       if (item.row === undefined) throw new Error("Cloud merge cannot adopt a missing row");
-      if (heldUnderAnotherId(local, item.table, item.key, item.row)) {
+      const row={...item.row};
+      const remap=(field:string,table:string)=>{if(typeof row[field]==="string")row[field]=aliases.get(table+":"+row[field])??row[field];};
+      const categoryTable=(category:unknown)=>category==="candidate"?"memory_candidates":category==="temporary"?"temporary_memories":"memories";
+      if(item.table==="memory_candidates")remap("promoted_memory_id","memories");
+      if(item.table==="memory_relations"){remap("from_memory_id","memories");remap("to_memory_id","memories");}
+      if(item.table==="memory_links")remap("owner_id",row.owner_kind==="candidate"?"memory_candidates":"memories");
+      if(item.table==="temporary_memory_links")remap("memory_id","temporary_memories");
+      if(["memory_events","memory_topic_links","memory_review_resolutions","memory_review_resolution_compensations"].includes(item.table)){
+        remap("memory_id",categoryTable(row.category));remap("related_memory_id",categoryTable(row.related_category));remap("replacement_memory_id",categoryTable(row.replacement_category));
+      }
+      const duplicate = heldUnderAnotherId(local, item.table, item.key, row);
+      if (duplicate) {
+        if (MEMORY_TABLES.has(item.table) && statementFact(duplicate) !== statementFact(item.row)) {
+          result.flagged += 1;
+          result.reviewMemoryIds.push(String(duplicate.id));
+          result.decisions.push({ table: item.table, key: item.id, action: "flag_conflict", reason: "divergent_statement_existing_identity" });
+          continue;
+        }
         result.decisions.push({ table: item.table, key: item.id, action: "keep_local", reason: "converged_existing_identity" });
         result.converged += 1;
+        if(MEMORY_TABLES.has(item.table)&&newer(row,duplicate))writeRow(local,item.table,item.key,item.columns,{...row,id:duplicate.id});
+        if(["memories","memory_candidates","temporary_memories"].includes(item.table))aliases.set(item.table+":"+String(item.row.id),String(duplicate.id));
         continue;
       }
-      writeRow(local, item.table, item.key, item.columns, item.row);
+      writeRow(local, item.table, item.key, item.columns, row);
       result.adopted += 1;
     } else if (item.action === "flag_conflict") {
       result.flagged += 1;
@@ -175,18 +216,60 @@ export function mergeCore(
   return result;
 }
 
+/** This device's shared memories before a merge, and how many of them the merge deletes. */
+export interface MergeDeletionSummary { shared: number; deleted: number }
+export type MergeHoldReason = "large-deletion";
+/**
+ * An automatic merge applies the other device's deletions unasked, so a merge that would
+ * empty out much of this device's memory — a wiped or reset peer looks exactly like a
+ * bulk deletion — waits for a person instead. Small projects get a higher share because
+ * a few ordinary deletions are already a large fraction of them.
+ */
+const HOLD_MIN_DELETED = 20;
+const HOLD_SMALL_PROJECT = 50;
+const HOLD_SHARE = 0.15;
+const HOLD_SMALL_PROJECT_SHARE = 0.30;
+export function automaticMergeHold({ shared, deleted }: MergeDeletionSummary): MergeHoldReason | undefined {
+  const share = shared < HOLD_SMALL_PROJECT ? HOLD_SMALL_PROJECT_SHARE : HOLD_SHARE;
+  return deleted >= HOLD_MIN_DELETED && deleted > shared * share ? "large-deletion" : undefined;
+}
+/** Thrown inside the merge transaction so nothing is written when a merge is held. */
+export class MergeHeldError extends Error {
+  constructor(readonly reason: MergeHoldReason, readonly summary: MergeDeletionSummary) {
+    super(`Automatic merge held: it would delete ${summary.deleted} of ${summary.shared} shared memories`);
+  }
+}
+export function sharedMemoryCount(db: DatabaseSync): number {
+  let count = 0;
+  for (const table of MEMORY_TABLES) {
+    const columns = tableColumns(db, table);
+    if (!columns.length) continue;
+    count += Number((db.prepare(`select count(*) n from ${quote(table)}${columns.includes("layer") ? " where layer = 'core'" : ""}`).get() as { n: number }).n);
+  }
+  return count;
+}
+/** What a merge did to memories and candidates; evidence rows (sources, chunks) are left out. */
+export function memoryChanges(result: MergeCoreResult): { adopted: number; deleted: number; flagged: number } {
+  const count = (actions: MergeAction[]) => result.decisions.filter(d => MEMORY_TABLES.has(d.table) && actions.includes(d.action)).length;
+  return { adopted: count(["insert_remote", "take_remote"]), deleted: count(["delete_local"]), flagged: result.flagged };
+}
+
 /** Marks both sides of an unreconcilable edit for an explicit decision. */
-export function flagMergeConflicts(local: DatabaseSync, memoryIds: readonly string[], now: string): number {
+export function flagMergeConflicts(store: MemoryStore, memoryIds: readonly string[], now: string): number {
   let flagged = 0;
-  for (const table of ["memories", "memory_candidates"]) {
+  for (const [table, category] of [["memories", "promoted"], ["memory_candidates", "candidate"]] as const) {
     for (const id of memoryIds) {
-      const row = local.prepare(`select quality_reasons_json from ${table} where id = ?`).get(id) as
-        { quality_reasons_json: string } | undefined;
-      if (!row) continue;
-      const reasons = new Set<string>(parseReasons(row.quality_reasons_json));
+      const memory = category === "promoted"
+        ? store.readMemory(id)
+        : store.listMemoryCandidates({ qualityStatus: "all", owner: "any", limit: null }).find(item => item.id === id);
+      if (!memory) continue;
+      const reasons = new Set<string>(memory.qualityReasons);
       reasons.add(CONFLICT_QUALITY_REASON);
-      local.prepare(`update ${table} set quality_status = 'needs_review', quality_reasons_json = ?, last_verified_at = ? where id = ?`)
-        .run(JSON.stringify([...reasons].sort()), now, id);
+      store.updateMemoryQuality(category, id, {
+        qualityStatus: "needs_review",
+        qualityReasons: [...reasons].sort(),
+        lastVerifiedAt: now
+      });
       flagged += 1;
     }
   }
@@ -242,7 +325,8 @@ function conflict(table: string, here: Row, there: Row, reason: string): { actio
     const right = comparable(there);
     const equivalent = left.type === right.type &&
       normalizeMemorySummary(left.title) === normalizeMemorySummary(right.title) &&
-      normalizeMemorySummary(left.summary) === normalizeMemorySummary(right.summary);
+      normalizeMemorySummary(left.summary) === normalizeMemorySummary(right.summary) &&
+      statementFact(here) === statementFact(there);
     if (equivalent) {
       // Same fact, differing only in bookkeeping: last writer wins, which is a
       // convergence rather than a choice between two claims.
@@ -264,6 +348,15 @@ function newer(candidate: Row, against: Row): boolean {
     if (typeof left === "string" && typeof right === "string" && left !== right) return left > right;
   }
   return false;
+}
+
+function statementFact(row: Row): string {
+  const statement = parseStatement(row.statement_json, String(row.type) as MemoryType);
+  return JSON.stringify({
+    text: normalizeMemorySummary(statement?.text ?? String(row.summary ?? "")),
+    fields: Object.entries(statement?.fields ?? {}).sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => [key, value?.trim()])
+  });
 }
 
 function comparable(row: Row): ComparableMemoryFact {
@@ -310,20 +403,22 @@ function readRows(db: DatabaseSync, table: string, key: readonly string[], colum
   const scoped = LAYERED_TABLES.has(table) && columns.includes("layer");
   const sql = `select ${columns.map(quote).join(", ")} from ${quote(table)}${scoped ? " where layer = 'core'" : ""}`;
   for (const row of db.prepare(sql).all() as Row[]) {
-    rows.set(key.map((column) => String(row[column])).join(" "), row);
+    // The checkout path differs per device and v4 snapshots carry a placeholder; it is never a content change.
+    if (table === "temporary_memories" && "project_id" in row) row.project_id = MASKED_PROJECT;
+    rows.set(key.map((column) => String(row[column])).join("\0"), row);
   }
   return rows;
 }
 
-/** True when this fact already exists locally under a different row id. */
-function heldUnderAnotherId(db: DatabaseSync, table: string, key: readonly string[], row: Row): boolean {
+/** Return the matching natural-key fact held under a different row id. */
+function heldUnderAnotherId(db: DatabaseSync, table: string, key: readonly string[], row: Row): Row | undefined {
   const natural = NATURAL_KEYS[table];
-  if (!natural || !natural.every((column) => column in row)) return false;
+  if (!natural || !natural.every((column) => column in row)) return undefined;
   const conditions = natural.map((column) => `${quote(column)} is ?`).join(" and ");
   const excluded = key.map((column) => `${quote(column)} is not ?`).join(" and ");
-  const found = db.prepare(`select 1 from ${quote(table)} where ${conditions} and ${excluded} limit 1`)
+  const found = db.prepare(`select * from ${quote(table)} where ${conditions} and ${excluded} limit 1`)
     .get(...natural.map((column) => sqlValue(row[column])), ...key.map((column) => sqlValue(row[column])));
-  return found !== undefined;
+  return found as Row | undefined;
 }
 
 function writeRow(db: DatabaseSync, table: string, key: readonly string[], columns: readonly string[], row: Row): void {
@@ -335,7 +430,7 @@ function writeRow(db: DatabaseSync, table: string, key: readonly string[], colum
 }
 
 function deleteRow(db: DatabaseSync, table: string, key: readonly string[], id: string): void {
-  const parts = id.split(" ");
+  const parts = id.split("\0");
   db.prepare(`delete from ${quote(table)} where ${key.map((column) => `${quote(column)} = ?`).join(" and ")}`).run(...parts);
 }
 

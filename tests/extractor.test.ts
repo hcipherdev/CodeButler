@@ -122,7 +122,7 @@ describe("OpenAI-compatible extractor", () => {
     await expect(extractor.extract({ conversations: [], commits: [] })).resolves.toEqual({
       memories: [],
       rejected: [
-        { index: 0, reason: "invalid_memory_record" },
+        { index: 0, reason: "invalid_memory_record", detail: "invalid_type:undefined" },
         { index: 1, reason: "conversation_evidence_requires_exact_chunk_locator" }
       ]
     });

@@ -1,6 +1,6 @@
 {
   "name": "code-butler",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Local-first Project Memory MCP server for reconstructing project reasoning.",
   "license": "Apache-2.0",
   "type": "module",
@@ -22,13 +22,18 @@
     "developer-tools"
   ],
   "files": [
-    "dist"
+    "dist",
+    "!dist/macos"
   ],
   "bin": {
     "code-butler": "dist/cli.js"
   },
   "scripts": {
-    "build": "node scripts/build.mjs",
+    "build:crypto": "node scripts/build/build-crypto.mjs",
+    "package:crypto": "node scripts/build/package-crypto.mjs",
+    "check:native-package": "node scripts/build/check-native-package.mjs",
+    "test:native-package": "node scripts/build/smoke-native-package.mjs",
+    "build": "node scripts/build/build.mjs",
     "test": "vitest run",
     "test:publish": "vitest run --no-file-parallelism --maxWorkers=1 --minWorkers=1",
     "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -36,19 +41,29 @@
     "docs:build": "vitepress build docs",
     "serve": "node dist/server.js",
     "prepack": "npm run build",
-    "prepublishOnly": "npm run typecheck && npm run test:publish"
+    "prepublishOnly": "npm run typecheck && npm run test:publish && npm run check:native-package"
   },
   "engines": {
     "node": ">=24.0.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.13.0",
+    "@simplewebauthn/browser": "^14.0.0",
+    "@simplewebauthn/server": "^14.0.3",
+    "nodemailer": "^10.0.10",
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/cli": "^2.11.4",
+    "@tauri-apps/plugin-clipboard-manager": "^2.4.0",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
     "@types/node": "^24.0.0",
+    "@types/nodemailer": "^8.0.2",
+    "esbuild": "^0.21.5",
     "tsx": "^4.19.0",
     "typescript": "^5.8.0",
+    "vite": "^5.4.21",
     "vitepress": "^1.6.4",
     "vitest": "^3.2.0"
   }

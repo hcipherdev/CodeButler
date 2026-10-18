@@ -4,6 +4,8 @@ import type { OperationActor } from "../types.js";
 import { withTransaction } from "../storage/transactions.js";
 import { sanitizeLayerInput } from "./layer.js";
 import { assertWritableLayer } from "./peer-layer.js";
+import { recordMemoryEvent } from "./events.js";
+import { moveTopicMemberships } from "./topics.js";
 
 export interface UpdateMemoryLayerInput {
   memoryId: string;
@@ -23,6 +25,7 @@ export function updateMemoryLayer(store: MemoryStore, input: UpdateMemoryLayerIn
     const row = store.db.prepare(`select * from ${table} where id = ?`).get(id);
     if (!row) throw new Error("Unknown memory ID");
     assertWritableLayer(store, input.category, id);
+    if (row.layer === layer) return {memoryId:id, category:input.category, layer, updatedMemoryIds:[]};
     const updates = [{ table, id }];
     if (input.category === "candidate" && typeof row.promoted_memory_id === "string") updates.push({ table: "memories", id: row.promoted_memory_id });
     const durableId = input.category === "promoted" ? id : row.promoted_memory_id;
@@ -32,13 +35,21 @@ export function updateMemoryLayer(store: MemoryStore, input: UpdateMemoryLayerIn
       }
     }
     try {
-      for (const update of updates) store.db.prepare(`update ${update.table} set layer = ? where id = ?`).run(layer, update.id);
+      for (const update of updates) {
+        if(update.table==="memories") {
+          const prior=store.db.prepare("select layer from memories where id=?").get(update.id) as {layer:string};
+          moveTopicMemberships(store,update.id,prior.layer,layer);
+        }
+        store.db.prepare(`update ${update.table} set layer = ? where id = ?`).run(layer, update.id);
+      }
     } catch (error) {
       if (String(error).includes("UNIQUE constraint")) throw new Error("Layer correction collides with an existing memory; no records changed");
       throw error;
     }
     const op = store.beginOperation({ operationType: "layer_change", actor, metadata: { memoryIdHash: hash(id), reasonHash: hash(input.reason.trim()), category: input.category === "candidate" ? "candidates" : input.category === "temporary" ? "temporary_memories" : "memories" } });
     store.completeOperation(op.id);
+    recordMemoryEvent(store.db,store.contentPolicy,{kind:"sharing_changed",memoryId:typeof durableId==="string" ? durableId : id,
+      category:typeof durableId==="string" ? "promoted" : input.category,layer,from:String(row.layer),to:layer,reason:input.reason,actor});
     return { memoryId: id, category: input.category, layer, updatedMemoryIds: updates.map(x => x.id) };
   });
 }

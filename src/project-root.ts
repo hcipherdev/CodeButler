@@ -1,5 +1,6 @@
 import { existsSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { assertOrdinaryProject } from "./rules/identity.js";
 
 export type ProjectRootSource = "argument" | "environment" | "git" | "cwd";
 
@@ -18,6 +19,7 @@ export interface ResolveProjectRootOptions {
 
 export function resolveProjectRoot(options: ResolveProjectRootOptions = {}): ProjectRootResolution {
   const cwd = resolve(options.cwd ?? process.cwd());
+  assertOrdinaryProject(cwd);
   const explicitRoot = normalizeOptionalPath(cwd, options.projectRoot);
   if (explicitRoot) {
     assertDirectory(explicitRoot, "--project-root");
@@ -81,6 +83,7 @@ function normalizeOptionalPath(cwd: string, value: string | undefined): string |
 }
 
 function assertDirectory(path: string, label: string): void {
+  assertOrdinaryProject(path);
   try {
     if (statSync(path).isDirectory()) return;
   } catch {

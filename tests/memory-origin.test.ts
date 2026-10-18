@@ -1,6 +1,8 @@
+// Tests memory origin preservation through capture, promotion, and migrations.
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, expect, it, vi } from "vitest";
 import { createMemoryOrigin, installationDeviceId, type OriginFactory } from "../src/memory/origin.js";
@@ -35,7 +37,8 @@ it("creates installation identity lazily, respects the global directory, and dis
 
 it("publishes one complete identity under concurrent processes", async () => {
   const home = root();
-  const script = `import { installationDeviceId } from ${JSON.stringify(resolve("src/memory/origin.ts"))}; console.log(installationDeviceId(process.argv[1]));`;
+  const script = `// Tests memory origin preservation through capture, promotion, and migrations.
+import { installationDeviceId } from ${JSON.stringify(pathToFileURL(resolve("src/memory/origin.ts")).href)}; console.log(installationDeviceId(process.argv[1]));`;
   const outputs = await Promise.all(Array.from({ length: 5 }, () => promisify(execFile)(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script, home])));
   expect(new Set(outputs.map(x => x.stdout.trim())).size).toBe(1);
   expect(outputs[0]!.stdout.trim()).toBe(installationDeviceId(home));
@@ -44,12 +47,12 @@ it("publishes one complete identity under concurrent processes", async () => {
 it("preserves first origin across duplicate updates, promotion, lifecycle changes and search", () => {
   const s = store(); const first = s.upsertMemoryCandidate(memory());
   const promoted = s.promoteMemoryCandidate(first.id);
-  expect(s.searchMemoryLayer({ query: "SQLite" })[0]!.origin).toEqual(origin());
+  expect(s.searchMemoryLayer({ query: "SQLite", qualityStatus: "all" })[0]!.origin).toEqual(origin());
   expect(s.readMemorySearchResultsByIds([promoted.id])[0]!.origin).toEqual(origin());
   expect(s.searchMemoryLayer({ query: "installation-a" })).toEqual([]);
   s.upsertMemoryCandidate(memory(origin("win32")));
   expect(s.promoteMemoryCandidate(first.id).origin).toEqual(origin());
-  expect(s.listMemoryCandidates({})[0]!.origin).toEqual(origin());
+  expect(s.listMemoryCandidates({ qualityStatus: "all" })[0]!.origin).toEqual(origin());
   s.updateMemoryLifecycle(promoted.id, { lifecycleStatus: "retracted", statusReason: "Historical" });
   expect(s.readMemory(promoted.id)!.origin).toEqual(origin());
   const unknown = s.upsertMemoryCandidate({ ...memory(null), dedupeKey: "legacy" });
@@ -83,14 +86,14 @@ it("round-trips origins and accepts legacy exports without stamping the receivin
   source.upsertTemporaryMemory({ title: "Next", summary: "Review storage", kind: "task_state", origin: origin() });
   const output = join(root(), "export.json"); exportPrivacy(source, { outputPath: output });
   const target = store(); importPrivacy(target, { inputPath: output });
-  expect(target.listMemories({})[0]!.origin).toEqual(origin());
-  expect(target.listMemoryCandidates({})[0]!.origin).toEqual(origin());
+  expect(target.listMemories({ qualityStatus: "all" })[0]!.origin).toEqual(origin());
+  expect(target.listMemoryCandidates({ qualityStatus: "all" })[0]!.origin).toEqual(origin());
   expect(target.db.prepare("select origin_json from temporary_memories").get()).toMatchObject({ origin_json: JSON.stringify(origin()) });
   const legacy = JSON.parse(readFileSync(output, "utf8"));
   for (const table of ["memories", "memory_candidates", "temporary_memories"]) for (const row of legacy.tables[table]) delete row.origin_json;
   writeFileSync(output, JSON.stringify(legacy));
   const older = store(); importPrivacy(older, { inputPath: output });
-  expect(older.listMemories({})[0]!.origin).toBeNull();
+  expect(older.listMemories({ qualityStatus: "all" })[0]!.origin).toBeNull();
 });
 
 it("validates imported origin and redacts optional client fields at storage", () => {
@@ -109,8 +112,8 @@ it("migration 11 preserves legacy unknown origins", () => {
     (id,type,title,summary,reason,confidence,evidence_json,related_files_json,dedupe_key,promotion_state,evidence_signature,created_at,updated_at)
     values ('legacy','decision','Old','Old','Old',1,'[]','[]','legacy','candidate','','2026-01-01','2026-01-01')`);
   s.init();
-  expect(CURRENT_SCHEMA_VERSION).toBe(18);
-  expect(s.listMemoryCandidates({}).find(x => x.id === "legacy")!.origin).toBeNull();
+  expect(CURRENT_SCHEMA_VERSION).toBe(24);
+  expect(s.listMemoryCandidates({ qualityStatus: "all" }).find(x => x.id === "legacy")!.origin).toBeNull();
 });
 
 it("returns origin in CLI JSON and a readable origin line", async () => {

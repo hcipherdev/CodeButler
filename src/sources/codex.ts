@@ -9,6 +9,41 @@ export interface ConversationSyncResult {
   imported: number;
   conversations: ExtractorConversationInput[];
 }
+export interface ConversationFileScan {
+  filePath: string;
+  scannedCursor?: string | undefined;
+  signature?: string;
+  result?: ConversationParseResult;
+  deferred?: boolean;
+}
+
+const MAX_SCANNED_CONVERSATIONS_PER_PASS = 100;
+
+export function discoverConversationFiles(config: ConversationLogSourceConfig): string[] {
+  return config.roots.flatMap(root => findJsonlFiles(root));
+}
+
+export function scanCodexFiles(files: string[], cursors: ReadonlyMap<string, string>): ConversationFileScan[] {
+  return scanConversationFiles(files, cursors, parseCodexFile);
+}
+
+export function scanClaudeFiles(files: string[], cursors: ReadonlyMap<string, string>): ConversationFileScan[] {
+  return scanConversationFiles(files, cursors, parseClaudeFile);
+}
+
+function scanConversationFiles(files: string[], cursors: ReadonlyMap<string, string>, parser: (path: string) => ConversationParseResult): ConversationFileScan[] {
+  let parsed = 0;
+  return files.map(filePath => {
+    try {
+      const signature = fileSignature(filePath);
+      const scannedCursor = cursors.get(filePath);
+      if (scannedCursor === signature) return { filePath, scannedCursor, signature };
+      if (parsed >= MAX_SCANNED_CONVERSATIONS_PER_PASS) return { filePath, scannedCursor, signature, deferred: true };
+      parsed += 1;
+      return { filePath, scannedCursor, signature, result: parser(filePath) };
+    } catch { return { filePath }; }
+  });
+}
 
 export interface ConversationSourceRootStatus {
   root: string;
@@ -40,17 +75,21 @@ export interface ConversationSourceStatus {
 export function syncCodexSource(
   store: MemoryStore,
   config: CodexLogSourceConfig,
-  projectRoot: string
+  projectRoot: string,
+  queueForExtraction = false,
+  scan?: ConversationFileScan[]
 ): ConversationSyncResult {
-  return syncConversationLogSource(store, "codex", config, projectRoot, parseCodexFile);
+  return syncConversationLogSource(store, "codex", config, projectRoot, parseCodexFile, queueForExtraction, scan);
 }
 
 export function syncClaudeSource(
   store: MemoryStore,
   config: ConversationLogSourceConfig,
-  projectRoot: string
+  projectRoot: string,
+  queueForExtraction = false,
+  scan?: ConversationFileScan[]
 ): ConversationSyncResult {
-  return syncConversationLogSource(store, "claude", config, projectRoot, parseClaudeFile);
+  return syncConversationLogSource(store, "claude", config, projectRoot, parseClaudeFile, queueForExtraction, scan);
 }
 
 export function getCodexSourceStatus(
@@ -74,16 +113,19 @@ function syncConversationLogSource(
   sourceName: "codex" | "claude",
   config: ConversationLogSourceConfig,
   projectRoot: string,
-  parser: (filePath: string) => ConversationParseResult
+  parser: (filePath: string) => ConversationParseResult,
+  queueForExtraction: boolean,
+  scan?: ConversationFileScan[]
 ): ConversationSyncResult {
   const conversations: ExtractorConversationInput[] = [];
   let imported = 0;
 
-  for (const root of config.roots) {
-    for (const filePath of findJsonlFiles(root)) {
+  const entries: ConversationFileScan[] = scan ?? discoverConversationFiles(config).map(filePath => ({ filePath }));
+  for (const entry of entries) {
+      const filePath = entry.filePath;
       let signature: string;
       try {
-        signature = fileSignature(filePath);
+        signature = entry.signature ?? fileSignature(filePath);
       } catch {
         store.recordSourceFailure({
           adapter: sourceName,
@@ -98,7 +140,10 @@ function syncConversationLogSource(
         store.resolveSourceFailures(sourceName, filePath);
         continue;
       }
-      const result = parser(filePath);
+      if (entry.deferred) continue;
+      if (scan && cursor !== entry.scannedCursor) continue;
+      if (entry.result && fileSignature(filePath) !== signature) continue;
+      const result = entry.result ?? parser(filePath);
       if (!result.ok) {
         if (result.errorCode === "no_supported_messages") {
           store.resolveSourceFailures(sourceName, filePath);
@@ -116,11 +161,13 @@ function syncConversationLogSource(
       store.resolveSourceFailures(sourceName, filePath);
       const parsed = result.value;
       if (!shouldIncludeConversation(parsed, filePath, projectRoot, config.projectOnly)) continue;
-      store.setSyncCursor(sourceName, filePath, signature);
       if (parsed.source.id && store.findSourceTombstone("conversation", parsed.source.id)) {
+        store.setSyncCursor(sourceName, filePath, signature);
         continue;
       }
-      store.addSourceWithChunks({ source: parsed.source, chunks: parsed.chunks });
+      const storedId = store.addSourceWithChunks({ source: parsed.source, chunks: parsed.chunks });
+      if (queueForExtraction) store.enqueueExtractionEvidence(sourceName, "conversation", storedId);
+      store.setSyncCursor(sourceName, filePath, signature);
       const conversation: ExtractorConversationInput = {
         sourceId: parsed.source.id!,
         title: parsed.source.title,
@@ -132,7 +179,6 @@ function syncConversationLogSource(
       }
       conversations.push(conversation);
       imported += 1;
-    }
   }
 
   return { imported, conversations };
@@ -380,7 +426,7 @@ function isSameOrInside(candidate: string, root: string): boolean {
 }
 
 function encodeProjectPath(path: string): string {
-  return path.replace(/^\/+/, "").replaceAll("/", "-");
+  return path.replace(/^[A-Za-z]:[\\/]/, "").replace(/^\/+/, "").replace(/[\\/]/g, "-");
 }
 
 function findJsonlFiles(root: string): string[] {

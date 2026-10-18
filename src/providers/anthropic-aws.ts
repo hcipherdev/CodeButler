@@ -10,6 +10,7 @@ export interface AnthropicAwsMessageRequest {
   regionEnv: string;
   baseUrl?: string | undefined;
   timeoutMs?: number | undefined;
+  signal?: AbortSignal | undefined;
 }
 
 export interface AnthropicAwsMessageResponse {
@@ -30,6 +31,7 @@ export type AnthropicAwsHttpClient = (
     headers: Record<string, string>;
     body: string;
     timeoutMs?: number | undefined;
+    signal?: AbortSignal | undefined;
   }
 ) => Promise<AnthropicAwsHttpResponse>;
 
@@ -69,7 +71,8 @@ export async function runAnthropicAwsMessage(
       "X-Api-Key": apiKey
     },
     body,
-    timeoutMs: request.timeoutMs
+    timeoutMs: request.timeoutMs,
+    signal: request.signal
   });
 
   if (!response.ok) {
@@ -86,6 +89,7 @@ async function nodeHttpsRequest(
     headers: Record<string, string>;
     body: string;
     timeoutMs?: number | undefined;
+    signal?: AbortSignal | undefined;
   }
 ): Promise<AnthropicAwsHttpResponse> {
   const parsedUrl = new URL(url);
@@ -97,7 +101,8 @@ async function nodeHttpsRequest(
         port: parsedUrl.port || undefined,
         path: `${parsedUrl.pathname}${parsedUrl.search}`,
         method: init.method,
-        headers: init.headers
+        headers: init.headers,
+        signal: init.signal
       },
       (res) => {
         const chunks: Buffer[] = [];

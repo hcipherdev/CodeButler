@@ -1,4 +1,5 @@
 import { CORE_LAYER, matchesLayerFilter, parseLayer, layerLabel } from "./layer.js";
+import { assertOrdinaryProject } from "../rules/identity.js";
 import type {
   DurableMemory,
   MemoryCandidate,
@@ -13,7 +14,8 @@ export interface SuggestMemoryLayerPromotionsInput {
   includeCandidates?: boolean | undefined;
   minConfidence?: number | undefined;
   minScore?: number | undefined;
-  limit?: number | undefined;
+  /** `null` is internal-only (automatic promotion): score every item instead of the capped top list. */
+  limit?: number | null | undefined;
 }
 
 export interface MemoryLayerPromotionSuggestion {
@@ -66,6 +68,7 @@ export function suggestMemoryLayerPromotions(
   store: MemoryStore,
   input: SuggestMemoryLayerPromotionsInput = {}
 ): SuggestMemoryLayerPromotionsResult {
+  assertOrdinaryProject(store.paths.rootDir);
   const layer = input.layer ?? "all";
   const minConfidence = normalizeThreshold(input.minConfidence, 0.8, "minConfidence");
   const minScore = normalizeThreshold(input.minScore, 0.7, "minScore");
@@ -212,7 +215,8 @@ function normalizeThreshold(value: number | undefined, fallback: number, name: s
   return value;
 }
 
-function normalizeLimit(value: number | undefined): number {
+function normalizeLimit(value: number | null | undefined): number {
+  if (value === null) return Number.POSITIVE_INFINITY;
   if (value === undefined) return 20;
   if (!Number.isInteger(value) || value <= 0) throw new Error("limit must be a positive integer");
   return Math.min(value, 100);

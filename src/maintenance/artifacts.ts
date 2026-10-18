@@ -10,10 +10,11 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
+import { handleOwnerPid } from "../cloud/gate.js";
 import type { ArtifactRetentionConfig } from "../types.js";
 
 export type ArtifactMaintenanceAction = "remove" | "rotate";
-export type ArtifactMaintenanceCategory = "logs" | "projectSummaryBackups" | "recoveryBackups" | "cloudHandles";
+export type ArtifactMaintenanceCategory = "logs" | "projectSummaryBackups" | "handbookBackups" | "recoveryBackups" | "reconnectBackups" | "cloudHandles";
 
 export interface ArtifactMaintenanceItem {
   category: ArtifactMaintenanceCategory;
@@ -56,7 +57,9 @@ export function runArtifactMaintenance(
   const dataDir = join(rootDir, ".code-butler");
   inspectLogs(dataDir, config, result);
   inspectProjectSummaryBackups(dataDir, config, result);
+  inspectHandbookBackups(dataDir, config, result);
   inspectRecoveryBackups(dataDir, config, options.now ?? new Date(), result);
+  inspectReconnectBackups(dataDir, result);
   inspectCloudHandles(dataDir, config, result);
   if (options.apply) applyMaintenance(result, config);
   return result;
@@ -124,6 +127,17 @@ function inspectProjectSummaryBackups(
   }
 }
 
+function inspectHandbookBackups(dataDir: string, config: ArtifactRetentionConfig, result: ArtifactMaintenanceResult): void {
+  const backupsDir = join(dataDir, "backups"), directory = join(backupsDir, "handbook");
+  if ([dataDir, backupsDir, directory].some(path => existsSync(path) && lstatSync(path).isSymbolicLink())) return;
+  const backups = listFiles(directory, name => /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}\.md$/i.test(name));
+  result.scanned += backups.length;
+  for (const path of backups.slice(config.projectSummaryBackups.maxFiles)) {
+    result.items.push({ category: "handbookBackups", action: "remove", path,
+      reason: `retains newest ${config.projectSummaryBackups.maxFiles} handbook backup(s)`, bytes: statSync(path).size });
+  }
+}
+
 function inspectRecoveryBackups(
   dataDir: string,
   config: ArtifactRetentionConfig,
@@ -145,12 +159,30 @@ function inspectRecoveryBackups(
   }
 }
 
+/** Local and cloud snapshot pairs written when a reviewed memory choice is applied. */
+const RECONNECT_BACKUP_SETS = 5;
+function inspectReconnectBackups(dataDir: string, result: ArtifactMaintenanceResult): void {
+  const backupsDir = join(dataDir, "backups"), directory = join(backupsDir, "reconnect");
+  if ([dataDir, backupsDir, directory].some(path => existsSync(path) && lstatSync(path).isSymbolicLink())) return;
+  const backups = listFiles(directory, name => /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}-(?:local|cloud)\.snapshot\.gz$/i.test(name));
+  result.scanned += backups.length;
+  const kept = new Set<string>();
+  for (const path of backups) {
+    const set = basename(path).slice(0, 36);
+    if (kept.has(set) || kept.size < RECONNECT_BACKUP_SETS) { kept.add(set); continue; }
+    result.items.push({ category: "reconnectBackups", action: "remove", path,
+      reason: `retains newest ${RECONNECT_BACKUP_SETS} reviewed memory choice backup set(s)`, bytes: statSync(path).size });
+  }
+}
+
 function inspectCloudHandles(dataDir: string, config: ArtifactRetentionConfig, result: ArtifactMaintenanceResult): void {
   if (!config.cloudHandles.reapStale) return;
   const handleDir = join(dataDir, ".cloud-handles");
   for (const handle of listFiles(handleDir, () => true)) {
     result.scanned += 1;
-    if (!pidFileAlive(handle, result)) {
+    // The name records the owner even when a crash left the content empty or zero-filled.
+    const pid = handleOwnerPid(basename(handle));
+    if (pid !== undefined ? !alive(pid) : !pidFileAlive(handle, result)) {
       result.items.push({ category: "cloudHandles", action: "remove", path: handle, reason: "recorded PID is not alive" });
     }
   }

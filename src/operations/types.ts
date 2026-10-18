@@ -9,6 +9,7 @@ export const OPERATION_TYPES = [
   "automatic_promotion",
   "layer_retention",
   "cloud_merge",
+  "memory_review",
   "redaction",
   "deletion",
   "export",
@@ -18,7 +19,7 @@ export const OPERATION_TYPES = [
 ] as const;
 
 export const OPERATION_STATUSES = ["started", "completed", "failed"] as const;
-export const OPERATION_ACTORS = ["cli", "mcp", "system"] as const;
+export const OPERATION_ACTORS = ["cli", "mcp", "desktop", "system", "ai"] as const;
 
 export type OperationType = typeof OPERATION_TYPES[number];
 export type OperationStatus = typeof OPERATION_STATUSES[number];
@@ -26,6 +27,7 @@ export type OperationActor = typeof OPERATION_ACTORS[number];
 export type BranchTriageAction = "promote_to_core" | "discard" | "retain_branch";
 export type AutomaticPromotionDecisionKind = "promote" | "converge" | "defer" | "skip";
 export type LayerRetentionDecisionKind = "archive" | "skip";
+export type MemoryReviewAction = "verify" | "correct" | "discard" | "accept_wording";
 
 export interface IdentifierCountCategoryMetadata {
   identifier?: string | undefined;
@@ -61,6 +63,13 @@ export interface OperationMetadataByType {
     policyVersion?: number;
   };
   cloud_merge: IdentifierCountCategoryMetadata;
+  memory_review: {
+    memoryIdHash?: string;
+    replacementMemoryIdHash?: string;
+    reasonHash?: string;
+    category?: string;
+    action?: MemoryReviewAction;
+  };
   migration: { migrationVersion?: number | undefined };
   lifecycle_change: {
     memoryIdHash?: string | undefined;

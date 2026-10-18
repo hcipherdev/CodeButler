@@ -136,6 +136,22 @@ describe("artifact maintenance", () => {
     expect(existsSync(join(dataDir, ".cloud-owner-dead"))).toBe(false);
   });
 
+  it("reaps a crash-damaged cloud handle by the PID in its name", () => {
+    const { rootDir, dataDir } = createProject();
+    const handleDir = join(dataDir, ".cloud-handles");
+    mkdirSync(handleDir, { recursive: true });
+    const dead = join(handleDir, "99999999-dbd7dbca-9a02-48ba-a92e-751508bd8c00.json");
+    const live = join(handleDir, `${process.pid}-dbd7dbca-9a02-48ba-a92e-751508bd8c01.json`);
+    writeFileSync(dead, Buffer.alloc(13));
+    writeFileSync(live, Buffer.alloc(13));
+
+    const result = runArtifactMaintenance(rootDir, config, { apply: true });
+
+    expect(result.warnings).toEqual([]);
+    expect(existsSync(dead)).toBe(false);
+    expect(existsSync(live)).toBe(true);
+  });
+
   it("keeps cloud handles when reaping is disabled", () => {
     const { rootDir, dataDir } = createProject();
     const handleDir = join(dataDir, ".cloud-handles");

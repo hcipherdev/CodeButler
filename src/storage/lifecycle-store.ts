@@ -9,6 +9,8 @@ import type {
 } from "../types.js";
 import type { StorageContentPolicy } from "./content-policy.js";
 import { withTransaction } from "./transactions.js";
+import { recordMemoryEvent } from "../memory/events.js";
+import type { OperationActor } from "../types.js";
 
 interface MemoryRelationRow {
   id: string;
@@ -44,6 +46,8 @@ export function updateMemoryLifecycle(
     validUntil?: string | null;
     statusReason?: string | null;
     statusChangedAt?: string;
+    actor?: OperationActor | undefined;
+    replacementMemoryId?: string | undefined;
   }
 ): DurableMemory {
   return withTransaction(db, () => {
@@ -65,7 +69,18 @@ export function updateMemoryLifecycle(
       randomUUID(),
       canonicalId
     );
-    return readMemory(canonicalId) as DurableMemory;
+    const updated = readMemory(canonicalId) as DurableMemory;
+    if (existing.lifecycleStatus !== updated.lifecycleStatus) {
+      const replacement = lifecycle.replacementMemoryId ? readMemory(lifecycle.replacementMemoryId) : undefined;
+      recordMemoryEvent(db, contentPolicy, {
+        kind: updated.lifecycleStatus === "superseded" ? "replaced" : updated.lifecycleStatus === "retracted" ? "withdrawn" : "restored",
+        memoryId: canonicalId, category: "promoted", layer: updated.layer ?? "core",
+        from: existing.lifecycleStatus, to: updated.lifecycleStatus, reason: updated.statusReason,
+        actor: lifecycle.actor, at: updated.statusChangedAt,
+        relatedMemoryId: replacement?.id, relatedCategory: replacement ? "promoted" : undefined, relatedLayer: replacement?.layer
+      });
+    }
+    return updated;
   });
 }
 
@@ -98,7 +113,7 @@ export function addMemoryRelation(
       throw new Error(`Unknown durable memory: ${normalized.toMemoryId}`);
     }
     const id = `memory-relation-${randomUUID()}`;
-    db.prepare(
+    const inserted = db.prepare(
       `insert into memory_relations (id, from_memory_id, to_memory_id, relation_type, created_at, reason)
        values (?, ?, ?, ?, ?, ?)
        on conflict(from_memory_id, to_memory_id, relation_type) do nothing`
@@ -119,6 +134,14 @@ export function addMemoryRelation(
       normalized.toMemoryId,
       normalized.relationType
     ) as unknown as MemoryRelationRow;
+    if (inserted.changes && normalized.relationType === "supersedes") {
+      const original = readMemory(normalized.toMemoryId)!;
+      const replacement = readMemory(normalized.fromMemoryId)!;
+      const captured = db.prepare("select 1 from sqlite_master where type='table' and name='memory_events'").get()
+        ? db.prepare("select id from memory_events where kind='replaced' and memory_id=? and occurred_at=? order by id limit 1").get(original.id, original.statusChangedAt ?? row.created_at) as {id:string}|undefined : undefined;
+      if (captured) db.prepare("update memory_events set related_memory_id=?,related_category='promoted',related_layer=? where id=?").run(replacement.id,replacement.layer??"core",captured.id);
+      else recordMemoryEvent(db,contentPolicy,{kind:"replaced",memoryId:original.id,category:"promoted",layer:original.layer??"core",relatedMemoryId:replacement.id,relatedCategory:"promoted",relatedLayer:replacement.layer,reason:normalized.reason,at:row.created_at,key:"replacement:"+row.id});
+    }
     return memoryRelationFromRow(row);
   });
 }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { CURRENT_SCHEMA_VERSION } from "../src/storage/migrations.js";
 import { openMemoryStore } from "../src/storage/store.js";
 import type { BeginOperationInput, OperationType } from "../src/operations/types.js";
 import { withTransaction } from "../src/storage/transactions.js";
@@ -73,7 +74,7 @@ describe("privacy-safe operation log", () => {
         metadata: input.metadata as never
       })).toThrow(/metadata/i);
     }
-    expect(store.listOperations()).toHaveLength(10); // Schema migrations 9 through 18.
+    expect(store.listOperations()).toHaveLength(CURRENT_SCHEMA_VERSION - 8); // One per schema migration from 9 on.
     store.close();
   });
 

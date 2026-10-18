@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { isCliEntrypoint, runCli } from "../src/cli.js";
 import { withProjectGate } from "../src/cloud/gate.js";
+import { pendingAutomaticConnection } from "../src/cloud/auto-connect.js";
+import { ensureProjectIdentity } from "../src/cloud/project-identity.js";
 import { loadProjectConfig } from "../src/config.js";
 import { createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey } from "../src/embeddings/fingerprint.js";
 import type { ProjectSummaryGenerator } from "../src/project-summary/service.js";
@@ -35,14 +37,28 @@ describe("CLI", () => {
     await expect(runCli(["help"], { stdout: (line) => lines.push(line) })).resolves.toBe(0);
 
     expect(lines.join("\n").split("\n").filter((line) => line.startsWith("  code-butler "))).toEqual([
+      "  code-butler rules path|list|show <id>|match|conflicts|resolve <id>|attestations|attest <id>|revoke <id>|sync status|enable|disable|now",
       "  code-butler init",
       "  code-butler config init",
       "  code-butler config global init",
       "  code-butler config migrate-local <--dry-run|--apply> [--json]",
-      "  code-butler cloud connect --server <https-origin>",
+      "  code-butler cloud <register|login> --server <https-origin> --email <email>",
+      "  code-butler cloud logout",
+      "  code-butler cloud init --recovery-file <path> [--label <name>] [--recovery-code-file <path>]",
+      "  code-butler cloud device request [--label <name>]",
+      "  code-butler cloud device approve --fingerprint <sha256>",
+      "  code-butler cloud device complete  # check and finish pending enrollment",
+      "  code-butler cloud device cancel --request <uuid>",
+      "  code-butler cloud device list",
+      "  code-butler cloud device revoke --device <uuid>",
+      "  code-butler cloud recovery <export|verify|restore> --file <path>",
       "  code-butler cloud projects",
-      "  code-butler cloud enable [--project <uuid>] [--name <name>]",
+      "  code-butler cloud enable [--project <uuid> | --new] [--name <name>] [--continue-existing]",
+      "  code-butler cloud make-portable [--continue-existing]",
+      "  code-butler cloud separate-identity",
       "  code-butler cloud status",
+      "  code-butler cloud storage",
+      "  code-butler cloud local-size",
       "  code-butler cloud sync",
       "  code-butler cloud disable",
       "  code-butler cloud resolve --keep <local|cloud|merge>",
@@ -51,10 +67,21 @@ describe("CLI", () => {
       "  code-butler decision add --topic <topic> --decision <decision> --reason <reason> [--status <status>] [--evidence <type:id#locator>]",
       "  code-butler decision import <markdown-file>",
       "  code-butler memory audit [--fix] [--json]",
+      "  code-butler memory export [--dry-run] [--json] [--force]",
+      "  code-butler memory review --id <id> --category <candidate|promoted> --action <verify|correct|discard> [--reason <text>] [--review-token <token>] [--correction-json <json>] [--json]",
+      "  code-butler memory reconcile plan [--queue <actionable|legacy|all>] [--quality <quarantined|needs_review>] [--limit <n|all>] [--max-requests <n>] [--token-budget <n>] [--concurrency <1..4>] [--json]",
+      "  code-butler memory reconcile status --run <id> [--json]",
+      "  code-butler memory reconcile replan --run <id> [--stale-only] [--retry-failed] [--retry-uncertain] [--json]",
+      "  code-butler memory reconcile apply --run <id> [--apply-corrections] [--force-offline] [--json]",
+      "  code-butler memory reconcile revert --run <id> [--force-offline] [--json]",
       "  code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>] [--scope-json <json>] [--layer <layer>] [--json]",
       "  code-butler memory scope --id <id> --category <candidate|promoted|temporary> --scope-json <json> --reason <text> [--json]",
       "  code-butler memory layer --id <id> --category <candidate|promoted|temporary> --layer <layer> --reason <text> [--json]",
       "  code-butler memory promotions [--layer <core|device|branch|all>] [--min-score <0..1>] [--min-confidence <0..1>] [--limit <n>] [--promoted-only] [--json]",
+      "  code-butler memory promotions --plan [--json]              # preview automatic promotion; writes nothing",
+      "  code-butler memory promotions --apply [--min-score <0..1>] [--json]",
+      "  code-butler memory promotions --history [--id <id>] [--limit <n>] [--json]",
+      "  code-butler memory promotions --undo (--since <ISO time> | --id <candidate-id>) [--json]",
       "  code-butler memory retention [--apply] [--history] [--id <id>] [--limit <n>] [--json]",
       "  code-butler memory branch-triage [--branch <name>] [--include-active] [--stale-days <n>] [--include-reviewed] [--limit <n>] [--json]",
       "  code-butler memory branch-resolve --id <id> --category <candidate|promoted> --action <promote_to_core|discard|retain_branch> --reason <text> [--supersedes <memory-id>] [--json]",
@@ -74,13 +101,21 @@ describe("CLI", () => {
       "  code-butler sync [--source <git|codex|claude|all>]",
       "  code-butler sources status",
       "  code-butler sources failures [--json]",
+      "  code-butler extraction report [--since <date>] [--limit <n>] [--json]",
+      "  code-butler extraction dry-run [--since <date>] [--limit <n>] [--json]",
+      "  code-butler extraction requeue --since <date> [--json]",
       "  code-butler watch [--interval <seconds>] [--source <git|codex|claude|all>]",
+      "  code-butler runtime",
+      "  code-butler --version",
       "  code-butler watch status",
       "  code-butler watch uninstall",
+      "  code-butler watch --global [--interval <seconds>]",
+      "  code-butler watch <install|status|uninstall> --global",
+      "  code-butler watch <add|remove> --global --project-root <path>",
       "  code-butler project-summary refresh [--force] [--fallback]",
       "  code-butler project-summary status",
       "  code-butler hooks install",
-      "  code-butler mcp [--project-root <path>] [--init-here]",
+      "  code-butler mcp [--project-root <path>] [--init-here] [--no-auto-init]",
       "  code-butler serve"
     ]);
   });
@@ -225,11 +260,15 @@ describe("CLI", () => {
 
   function writeDoctorSummary(rootDir: string): void {
     mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, "AGENTS.md"), "Project instructions\n");
+    writeFileSync(join(rootDir, "CLAUDE.md"), "Project instructions\n");
     writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Summary\n");
     writeFileSync(
       join(rootDir, ".code-butler", "project-summary.meta.json"),
       JSON.stringify({
         version: 1,
+        // Format 2 is the sectioned summary; an older format counts as stale and is rebuilt.
+        format: 2,
         summaryPath: join(rootDir, ".code-butler", "project-summary.md"),
         fingerprint: "test",
         lastGeneratedAt: "2026-06-24T10:00:00.000Z",
@@ -313,8 +352,9 @@ describe("CLI", () => {
       })
     ).resolves.toBe(0);
 
+    // The fallback is the local generator: its text, fitted into the fixed summary sections.
     expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain(
-      "Fallback Project Summary"
+      "Check the project issue tracker and current work for open questions."
     );
     expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "project-summary.meta.json"), "utf8"))).toMatchObject({
       provider: "fallback"
@@ -489,6 +529,21 @@ describe("CLI", () => {
     expect(claudeDir).toBeTruthy();
   });
 
+  it("queues automatic encrypted sync for portable folders registered with watch add --global", async () => {
+    const rootDir = makeTempDir(), project = join(rootDir, "project");
+    tempDirs.push(rootDir);
+    mkdirSync(join(project, ".code-butler"), { recursive: true });
+    writeFileSync(join(project, ".code-butler", "config.json"), "{}\n");
+    process.env.CODE_BUTLER_HOME = join(rootDir, "global-code-butler");
+    ensureProjectIdentity(project);
+    const output: string[] = [];
+
+    await expect(runCli(["watch", "add", "--global", "--project-root", project], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
+
+    expect(output.join("\n")).toContain("Encrypted sync will connect automatically");
+    expect(pendingAutomaticConnection(project)).toBe(true);
+  });
+
   it("initializes global config without writing secrets", async () => {
     const rootDir = makeTempDir();
     const globalHome = join(rootDir, "global-code-butler");
@@ -541,7 +596,8 @@ describe("CLI", () => {
 
     await expect(runCli(["config", "migrate-local", "--dry-run", "--json"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
     expect(JSON.parse(output.join("\n")).moved).toContain("sources.git.hookInstall");
-    expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.local.json"), "utf8")).sources.git.hookInstall).toBe(false);
+    // New projects get no config.local.json, and a dry run must not create one.
+    expect(existsSync(join(rootDir, ".code-butler", "config.local.json"))).toBe(false);
 
     output.length = 0;
     await expect(runCli(["config", "migrate-local", "--apply", "--json"], { cwd: rootDir, stdout: (line) => output.push(line) })).resolves.toBe(0);
@@ -591,7 +647,8 @@ describe("CLI", () => {
     expect(applied.rotated).toBe(1);
     expect(existsSync(join(dataDir, "logs", "watch.out.log"))).toBe(false);
     expect(readdirSync(join(dataDir, "backups", "project-summary")).filter((name) => name.endsWith(".md"))).toHaveLength(5);
-    expect(readdirSync(dataDir).filter((name) => name.startsWith("memory.sqlite.recovery-"))).toHaveLength(5);
+    // The default keeps the newest two recovery backups older than two days.
+    expect(readdirSync(dataDir).filter((name) => name.startsWith("memory.sqlite.recovery-"))).toHaveLength(2);
     expect(existsSync(join(dataDir, ".cloud-owner-test"))).toBe(false);
   });
 
@@ -728,17 +785,12 @@ describe("CLI", () => {
       topReasons: Array<{ reason: string; count: number }>;
     };
     expect(audit.scanned).toBe(1);
-    expect(audit.changes).toEqual([
-      expect.objectContaining({
-        nextStatus: "quarantined",
-        reasons: expect.arrayContaining(["html_or_markup_content"])
-      })
-    ]);
+    expect(audit.changes).toEqual([]);
     expect(audit.topReasons).toEqual([{ reason: "html_or_markup_content", count: 1 }]);
 
     const after = openMemoryStore(rootDir);
     after.init();
-    expect(after.listMemoryCandidates({ qualityStatus: "all" })[0]?.qualityStatus).toBe("active");
+    expect(after.listMemoryCandidates({ qualityStatus: "all" })[0]?.qualityStatus).toBe("quarantined");
     after.close();
   });
 
@@ -798,6 +850,49 @@ describe("CLI", () => {
     ).resolves.toBe(1);
 
     expect(errors.join("\n")).toContain("Usage: code-butler memory remember --type");
+  });
+
+  it("resolves a memory review from the CLI and emits JSON", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    await runCli([
+      "memory", "remember", "--candidate", "--type", "constraint",
+      "--text", "Review this project constraint before reuse."
+    ], { cwd: rootDir });
+    let store = openMemoryStore(rootDir);
+    store.init();
+    const candidate = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: null })[0]!;
+    store.updateMemoryQuality("candidate", candidate.id, {
+      qualityStatus: "needs_review",
+      qualityReasons: ["curator_note"]
+    });
+    const reviewToken = store.readMemorySearchResultsByIds([candidate.id], { includeCandidates: true })[0]!.reviewToken!;
+    store.close();
+    const output: string[] = [];
+
+    await expect(runCli([
+      "memory", "review",
+      "--id", candidate.id,
+      "--category", "candidate",
+      "--action", "verify",
+      "--review-token", reviewToken,
+      "--json"
+    ], {
+      cwd: rootDir,
+      stdout: line => output.push(line),
+      now: () => new Date("2026-08-02T10:00:00.000Z")
+    })).resolves.toBe(0);
+
+    expect(JSON.parse(output.join("\n"))).toMatchObject({
+      memoryId: candidate.id,
+      category: "candidate",
+      action: "verify",
+      review: { actor: "cli", action: "verify" },
+      memory: { qualityStatus: "active", promotionState: "candidate" }
+    });
+    store = openMemoryStore(rootDir); store.init();
+    expect(store.listOperations({ operationType: "memory_review" })[0]?.actor).toBe("cli");
+    store.close();
   });
 
   it("supersedes an existing memory from memory remember", async () => {
@@ -1033,7 +1128,7 @@ describe("CLI", () => {
     ).resolves.toBe(0);
 
     expect(output.join("\n")).toContain("Memory Audit");
-    expect(output.join("\n")).toContain("updated=1");
+    expect(output.join("\n")).toContain("updated=0");
     const after = openMemoryStore(rootDir);
     after.init();
     expect(after.listMemoryCandidates({ qualityStatus: "all" })[0]).toMatchObject({
@@ -1381,6 +1476,14 @@ describe("CLI", () => {
     expect(errors.join("\n")).toContain("No Git repository found");
   });
 
+  it("passes the MCP automatic-setup opt-out to the server", async () => {
+    const rootDir = makeTempDir(); tempDirs.push(rootDir);
+    const startServer = vi.fn(async () => {});
+    await expect(runCli(["mcp", "--init-here", "--no-auto-init"], { cwd: rootDir, startServer, stderr: () => {} })).resolves.toBe(0);
+    expect(startServer).toHaveBeenCalledWith(expect.objectContaining({ rootDir, autoInit: false }));
+    expect(existsSync(join(rootDir, "AGENTS.md"))).toBe(false);
+  });
+
   it("starts mcp from cwd outside a git repository with --init-here", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -1429,7 +1532,8 @@ describe("CLI", () => {
       projectSummaryGenerator: {
         async generate() {
           summaryGenerations += 1;
-          return "# Watch Generated Brief\n";
+          // Generator text lands in the fixed summary sections; a title of its own is not kept.
+          return "## What this is\nWatch generated brief.\n";
         }
       },
       now: () => new Date("2026-06-16T10:00:00Z")
@@ -1437,7 +1541,7 @@ describe("CLI", () => {
 
     await vi.waitFor(() => expect(output.filter((line) => line.includes("Synced project memory"))).toHaveLength(1));
     expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain(
-      "Watch Generated Brief"
+      "Watch generated brief."
     );
     expect(summaryGenerations).toBe(1);
     writeFileSync(
@@ -1711,7 +1815,7 @@ describe("CLI", () => {
       })
     ).resolves.toBe(0);
 
-    expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain("Fallback Project Summary");
+    expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain("Check the project issue tracker and current work for open questions.");
     expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "project-summary.meta.json"), "utf8"))).toMatchObject({
       provider: "fallback"
     });

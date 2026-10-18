@@ -1,5 +1,4 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +12,7 @@ describe("doctor service", () => {
   let tempDirs: string[] = [];
   const originalCodeButlerHome = process.env.CODE_BUTLER_HOME;
   const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
 
   afterEach(() => {
     for (const dir of tempDirs) cleanupTempDir(dir);
@@ -27,6 +27,11 @@ describe("doctor service", () => {
       delete process.env.HOME;
     } else {
       process.env.HOME = originalHome;
+    }
+    if (originalUserProfile === undefined) {
+      delete process.env.USERPROFILE;
+    } else {
+      process.env.USERPROFILE = originalUserProfile;
     }
   });
 
@@ -79,12 +84,16 @@ describe("doctor service", () => {
 
   function writeFreshSummary(rootDir: string): void {
     mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, "AGENTS.md"), "Project instructions\n");
+    writeFileSync(join(rootDir, "CLAUDE.md"), "Project instructions\n");
     writeFileSync(join(rootDir, ".code-butler", "project-summary.md"), "# Summary\n");
     writeFileSync(
       join(rootDir, ".code-butler", "project-summary.meta.json"),
       JSON.stringify(
         {
           version: 1,
+          // Format 2 is the sectioned summary; an older format counts as stale and is rebuilt.
+          format: 2,
           summaryPath: join(rootDir, ".code-butler", "project-summary.md"),
           fingerprint: "test",
           lastGeneratedAt: "2026-06-24T10:00:00.000Z",
@@ -449,9 +458,10 @@ describe("doctor service", () => {
     const homeDir = makeTempDir();
     tempDirs.push(rootDir, homeDir);
     process.env.HOME = homeDir;
-    const codexSessions = join(homedir(), ".codex", "sessions");
-    const codexArchived = join(homedir(), ".codex", "archived_sessions");
-    const claudeProjects = join(homedir(), ".claude", "projects");
+    process.env.USERPROFILE = homeDir;
+    const codexSessions = join(homeDir, ".codex", "sessions");
+    const codexArchived = join(homeDir, ".codex", "archived_sessions");
+    const claudeProjects = join(homeDir, ".claude", "projects");
     process.env.TEST_CODE_BUTLER_API_KEY = "test-key";
     writeConfig(rootDir, {
       sources: {
@@ -670,7 +680,7 @@ describe("doctor service", () => {
       expect.arrayContaining([
         "code-butler sync",
         "code-butler project-summary refresh",
-        "code-butler memory audit --fix"
+        "code-butler memory reconcile plan --queue actionable --limit 20"
       ])
     );
   });

@@ -1,3 +1,4 @@
+import { createStatement } from "../memory/statement.js";
 import { inferScope } from "../memory/scope.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -87,6 +88,7 @@ function extractConversationDirectiveMemories(
       type: match.type,
       title: titleFromText(match.text),
       summary: match.text,
+      statement: createStatement(match.text, match.type, "deterministic", match.type === "constraint" ? { requirement: match.text } : match.type === "decision" ? { choice: match.text } : {}),
       reason: "Captured from explicit conversation directive.",
       confidence: match.typed ? 1 : 0.75,
       evidence: [
@@ -159,18 +161,8 @@ function extractGitChangedFileMemories(
       continue;
     }
 
-    if (triggers.packageAndConfigFacts && isPackageOrConfigFile(changedFile)) {
-      for (const memory of extractConfigFactMemories(commit, changedFile)) {
-        memories.push({ memory, promote: false });
-      }
-      continue;
-    }
-
-    if (triggers.docsFacts && isDocsFactFile(changedFile)) {
-      for (const memory of extractDocsFactMemories(commit, changedFile)) {
-        memories.push({ memory, promote: false });
-      }
-    }
+    // The legacy package/config and docs flags remain accepted for backwards
+    // compatibility, but those low-signal heuristics no longer create memory.
   }
   return memories;
 }
@@ -187,13 +179,14 @@ function readDecisionFileMemory(
   const title = parseMarkdownTitle(raw);
   const decision = parseField(raw, "Decision");
   const reason = parseField(raw, "Reason");
-  if (!title || !decision || !reason) return undefined;
+  if (!title || !decision) return undefined;
 
   return {
     type: "decision",
     title,
     summary: decision,
-    reason,
+    statement: createStatement(decision, "decision", "deterministic", { choice: decision, ...(reason ? { rationale: reason } : {}) }),
+    reason: reason ?? "Captured from decision file.",
     confidence: 1,
     evidence: [evidenceRef("commit", commit.hash, filePath)],
     relatedFiles: [filePath],
@@ -214,47 +207,12 @@ function extractTestExpectationMemories(commit: CommitRecord, filePath: string):
     type: "constraint",
     title: titleFromText(name),
     summary: `Test expectation: ${name}`,
+    statement: createStatement(`Test expectation: ${name}`, "constraint", "deterministic"),
     reason: "Captured from deterministic test expectation in a changed test file.",
     confidence: 0.7,
     evidence: [evidenceRef("commit", commit.hash, filePath)],
     relatedFiles: [filePath],
     dedupeKey: `deterministic:test:${filePath}:${slug(name)}`
-  }));
-}
-
-function extractConfigFactMemories(commit: CommitRecord, filePath: string): ExtractedMemory[] {
-  const fields = new Set<string>();
-  for (const line of addedLines(extractDiffForFile(commit.diffSummary, filePath))) {
-    const match = line.match(/"([^"]+)"\s*:/);
-    if (match?.[1]) fields.add(match[1]);
-  }
-  return [...fields].slice(0, 20).map((field) => ({
-    type: "constraint",
-    title: `Config defines ${field}`,
-    summary: `${filePath} defines ${field}.`,
-    reason: "Captured from deterministic package or config file change.",
-    confidence: 0.65,
-    evidence: [evidenceRef("commit", commit.hash, filePath)],
-    relatedFiles: [filePath],
-    dedupeKey: `deterministic:config:${filePath}:${slug(field)}`
-  }));
-}
-
-function extractDocsFactMemories(commit: CommitRecord, filePath: string): ExtractedMemory[] {
-  const headings = new Set<string>();
-  for (const line of addedLines(extractDiffForFile(commit.diffSummary, filePath))) {
-    const match = line.match(/^#{1,3}\s+(.+)$/);
-    if (match?.[1]) headings.add(cleanSentence(match[1]));
-  }
-  return [...headings].slice(0, 10).map((heading) => ({
-    type: "constraint",
-    title: titleFromText(heading),
-    summary: `Documentation includes ${heading}.`,
-    reason: "Captured from deterministic documentation change.",
-    confidence: 0.6,
-    evidence: [evidenceRef("commit", commit.hash, filePath)],
-    relatedFiles: [filePath],
-    dedupeKey: `deterministic:docs:${filePath}:${slug(heading)}`
   }));
 }
 
@@ -272,14 +230,6 @@ function isDecisionFile(filePath: string): boolean {
 
 function isTestFile(filePath: string): boolean {
   return /(^|\/)(tests?\/.+|.+\.(test|spec))\.[cm]?[jt]sx?$/i.test(filePath);
-}
-
-function isPackageOrConfigFile(filePath: string): boolean {
-  return filePath === "package.json" || filePath === "tsconfig.json" || filePath === ".code-butler/config.json";
-}
-
-function isDocsFactFile(filePath: string): boolean {
-  return (filePath === "README.md" || /^docs\/.+\.md$/i.test(filePath)) && !isDecisionFile(filePath);
 }
 
 function extractDiffForFile(diffSummary: string, filePath: string): string {

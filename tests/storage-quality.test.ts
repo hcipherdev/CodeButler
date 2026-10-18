@@ -65,7 +65,7 @@ describe("memory quality storage", () => {
     store.close();
   });
 
-  it("migrates old memory rows to active quality status", () => {
+  it("migrates old rows and recomputes missing local quality fail-closed", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const dataDir = join(rootDir, ".code-butler");
@@ -99,12 +99,13 @@ describe("memory quality storage", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(store.listMemoryCandidates()).toEqual([
+    expect(store.listMemoryCandidates()).toEqual([]);
+    expect(store.listMemoryCandidates({ qualityStatus: "all" })).toEqual([
       expect.objectContaining({
         id: "candidate-old",
-        qualityStatus: "active",
-        qualityReasons: [],
-        lastVerifiedAt: undefined
+        qualityStatus: "quarantined",
+        qualityReasons: expect.arrayContaining(["missing_evidence"]),
+        lastVerifiedAt: expect.any(String)
       })
     ]);
 

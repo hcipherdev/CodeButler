@@ -4,6 +4,7 @@ import {
   copyFileSync,
   existsSync,
   readdirSync,
+  renameSync,
   statSync,
   unlinkSync
 } from "node:fs";
@@ -53,6 +54,22 @@ export function restoreRecoveryBackup(databasePath: string, backupPath: string):
     if (existsSync(sidecar)) unlinkSync(sidecar);
   }
   verifyDatabaseFile(databasePath);
+}
+
+/** Pre-merge copies kept after unattended merges; each is a full database, so only a few are kept. */
+const MERGE_BACKUPS_KEPT = 3;
+/**
+ * Keeps a recovery backup taken before an automatic merge under a `recovery-merge-` name,
+ * which privacy purges and artifact maintenance still match, and drops all but the newest
+ * few: two active devices can merge many times before age-based maintenance would act.
+ */
+export function retainMergeBackup(databasePath: string, backupPath: string): string {
+  const kept = `${databasePath}.recovery-merge-${basename(backupPath).slice(`${basename(databasePath)}.recovery-`.length)}`;
+  // Sidecars move with the file: a WAL holding pages must stay next to the database it belongs to.
+  for (const suffix of ["", "-wal", "-shm"]) if (existsSync(`${backupPath}${suffix}`)) renameSync(`${backupPath}${suffix}`, `${kept}${suffix}`);
+  const prefix = `${basename(databasePath)}.recovery-merge-`;
+  for (const old of listDatabaseBackups(databasePath).filter(path => basename(path).startsWith(prefix)).slice(MERGE_BACKUPS_KEPT)) unlinkDatabaseFile(old);
+  return kept;
 }
 
 export function listDatabaseBackups(databasePath: string): string[] {
