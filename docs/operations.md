@@ -31,6 +31,46 @@ Source retention is disabled by default:
 
 Exact source overrides take precedence. `null` retains indefinitely. Preview first with `privacy prune --dry-run`; mutation requires `privacy prune --apply`.
 
+## Automatic promotion
+
+After every sync Butler promotes corroborated memories to durable `core` memory. Merged
+branch and device memories move to `core` through the layer score. Candidates already in
+`core` (findings on the default branch) are promoted in place when one of these holds:
+
+| Signal | Confidence bar |
+|---|---|
+| A person verified it (desktop or CLI) | none |
+| Its evidence spans two or more independent sources (commits or sessions) | `promotion.confidenceThreshold` (0.85) |
+| An AI review judged it current (not a replacement the AI review wrote itself) | `promotion.automatic.singleSourceMinConfidence` (0.90) |
+
+The candidate must also be `active` quality. Verification by an MCP agent never counts.
+An equivalent `core` fact is converged on instead of duplicated, and a contradicting one
+defers the candidate as `needs_review`. Confidence is the extractor's own rating, so the
+bars are coarse cuts rather than probabilities.
+
+```json
+{
+  "promotion": {
+    "confidenceThreshold": 0.85,
+    "automatic": { "enabled": true, "coreCandidates": true, "singleSourceMinConfidence": 0.9 }
+  }
+}
+```
+
+```bash
+code-butler memory promotions --plan                      # preview; writes nothing
+code-butler memory promotions --apply                     # run a pass now instead of waiting for sync
+code-butler memory promotions --history                   # decisions already taken on this device
+code-butler memory promotions --undo --since 2026-10-09T00:00:00Z
+code-butler memory promotions --undo --id <candidate-id>
+```
+
+Undo covers core-candidate promotions this device decided. It withdraws (retracts) the
+durable copy and returns the candidate to candidate state; nothing is deleted, and both
+changes sync to other devices. An undone candidate is not promoted again until a person
+verifies it, which restores the same durable row. Set
+`promotion.automatic.coreCandidates: false` to stop promoting `core` candidates.
+
 ## Layer retention
 
 Durable device- and branch-layer memories have no TTL of their own, so a separate
@@ -102,38 +142,37 @@ Preview with `code-butler maintenance status --json` or
 
 ## Portable config and local overrides
 
-Shared `.code-butler/config.json` carries project policy only: retention, privacy
-redaction rules, deterministic settings, promotion, retrieval mode, sync sharing
-policy, and per-source `enabled`, `projectOnly`, and max limits. Machine-specific
-settings belong in the ignored `.code-butler/config.local.json`, which uses the same
-schema and is created by `code-butler init` / `code-butler config init` with the
-current machine's project and agent-log paths. It is layered last: defaults and
-global provider profiles, then `config.json`, then
-`config.local.json`. Relative paths in either file resolve against the project root.
+`.code-butler/config.json` is a sparse, portable project override file. It can
+contain retention, privacy redaction rules, deterministic settings, promotion,
+retrieval mode, sync sharing policy, and per-source `enabled`, `projectOnly`, and
+limit overrides. Machine-wide settings belong in the per-user global
+`~/.config/code-butler/config.json`, which is created by `code-butler init` or
+`code-butler config global init`. Resolution is built-in defaults, then global
+config, then project config.
 
-Local-only keys are `sources.git.repoPath`, `sources.git.hookInstall`,
-`sources.*.roots`, `sources.codex.includeDefaultRoots`, and the `embeddings`,
-`extractor`, and `investigator` provider blocks. Existing configs that keep those keys
-in `config.json` still load; `doctor` raises a `config:portable` warning and points at
-the migration:
+Existing projects may still contain `.code-butler/config.local.json`. That file
+is read as a final compatibility layer and is never rewritten automatically.
+Project-specific Git paths remain derived from the project root; Codex and Claude
+roots and provider runtime settings belong in the global file.
+
+The legacy migration command remains available for older projects that still keep
+machine-specific keys in their shared config:
 
 ```bash
 code-butler config migrate-local --dry-run --json
 code-butler config migrate-local --apply
 ```
 
-Apply moves only local-only keys, preserves values already present in
-`config.local.json`, reports any differing value as a conflict instead of overwriting
-it, and is idempotent. Cloud sync excludes `config.local.json` from snapshots and
-rejects non-portable incoming shared config.
+It remains idempotent and does not affect the new global layout. Cloud sync excludes
+the global config and legacy `config.local.json` from snapshots and rejects
+non-portable incoming project config.
 
 ## Git sharing
 
 Code Butler project state lives under `.code-butler/`. Treat that directory as
 local runtime state by default. Only commit files that are intentionally useful
 to collaborators, such as `.code-butler/.gitignore`,
-`.code-butler/project-summary.md`, and a secret-free, portable
-`.code-butler/config.json`.
+`.code-butler/project-summary.md`.
 
 Never commit `.code-butler/memory.sqlite`, SQLite WAL/SHM sidecars,
 `.code-butler/config.local.json`, sync metadata, imports, logs, staging files, or

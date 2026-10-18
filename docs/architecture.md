@@ -39,3 +39,17 @@ Branch merge triage adds a reviewed path for branch layers:
 `suggest_branch_memory_triage` classifies branch memories as current, merged, stale,
 active, or unknown, and `resolve_branch_memory_triage` explicitly promotes,
 discards, or retains them. Sync does not auto-promote branch memories.
+
+## Memory review and trust
+
+Schema v19 stores append-only Verify, Correct, and Discard resolutions. Each review is
+bound to a fingerprint of memory content, evidence availability, conflicts, and the
+latest related-file commits, so changed context reopens review rather than silently
+reusing old human judgment. Human verification does not change extraction confidence
+or promote a candidate. Core review records travel with core sync; non-core records
+travel with their owning layer partition.
+
+Memory results distinguish human verification, evidence-backed status, review needs,
+and quarantine from numeric extraction confidence. Config-key and documentation-heading
+heuristics no longer emit durable memories. Existing rows from those heuristics remain
+auditable in quarantine and can be individually verified.

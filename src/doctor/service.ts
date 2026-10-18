@@ -5,12 +5,15 @@ import { DatabaseSync } from "node:sqlite";
 
 import { analyzeSharedConfigPortability, globalConfigDir, loadExistingProjectConfig } from "../config.js";
 import { getProjectSummaryStatus } from "../project-summary/service.js";
+import { inspectProjectSetupArtifacts } from "../project-setup.js";
 import { getClaudeSourceStatus, getCodexSourceStatus, type ConversationSourceStatus } from "../sources/codex.js";
 import { getMigrationStatus } from "../storage/migrations.js";
 import { isLoopbackEmbeddingEndpoint } from "../embeddings/provider.js";
 import { inspectArtifactMaintenance } from "../maintenance/artifacts.js";
 import { createEmbeddingContentHash, createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey } from "../embeddings/fingerprint.js";
-import type { MemoryStore } from "../storage/store.js";
+import { openMemoryStore, type MemoryStore } from "../storage/store.js";
+import { summarizeMemoryHealth } from "../memory/quality.js";
+import { CURRENT_SCHEMA_VERSION } from "../storage/migrations.js";
 import type {
   DoctorCheck,
   DoctorNextAction,
@@ -37,7 +40,6 @@ const KEY_TABLES = [
   "temporary_memories",
   "source_failures"
 ] as const;
-const REQUIRED_QUALITY_COLUMNS = ["quality_status", "quality_reasons_json", "last_verified_at"] as const;
 const SYNC_SOURCES: SyncSourceName[] = ["git", "codex", "claude"];
 
 export interface DoctorRunOptions {
@@ -48,9 +50,9 @@ export interface DoctorRunOptions {
 interface DoctorStorageState {
   databasePath: string;
   db?: DatabaseSync;
+  schemaVersion?: number;
   readable: boolean;
   readableTables: Set<string>;
-  qualityColumnsAvailable: boolean;
 }
 
 interface SyncStatusRow {
@@ -67,22 +69,6 @@ interface SyncCursorRow {
   cursor_key: string;
   cursor_value: string;
   updated_at: string;
-}
-
-interface MemoryQualityRow {
-  quality_status: "active" | "needs_review" | "quarantined";
-  quality_reasons_json: string;
-}
-
-interface MemoryHealthSummary {
-  scanned: number;
-  total: number;
-  complete: boolean;
-  active: number;
-  needsReview: number;
-  quarantined: number;
-  rejected: number;
-  topReasons: Array<{ reason: string; count: number }>;
 }
 
 export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): DoctorReport {
@@ -170,7 +156,7 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
       addEmbeddingChecks(config, storage, addCheck, addAction);
     }
     addSummaryCheck(projectRoot, now, config, addCheck, addAction);
-    addMemoryCheck(storage, addCheck, addAction);
+    addMemoryCheck(projectRoot, storage, addCheck, addAction);
     if (config !== undefined) addArtifactMaintenanceCheck(projectRoot, config, now, addCheck, addAction);
   } finally {
     storage.db?.close();
@@ -469,9 +455,9 @@ function addConfigPortabilityCheck(
     id: "config:portable",
     category: "project",
     status: issues.length > 0 ? "warning" : "ok",
-    title: issues.length > 0 ? "Shared config contains local-only settings" : "Shared config is portable",
+    title: issues.length > 0 ? "Project config contains legacy local-only settings" : "Project config is portable",
     detail: issues.length > 0
-      ? `${issues.length} local-only config setting(s) should move to .code-butler/config.local.json.`
+      ? `${issues.length} legacy local-only config setting(s) should move to the global config or remain in the legacy local config.`
       : ".code-butler/config.json contains only portable settings.",
     metadata: { issues }
   });
@@ -479,7 +465,7 @@ function addConfigPortabilityCheck(
     addAction({
       priority: "medium",
       command: "code-butler config migrate-local --dry-run",
-      reason: "Preview moving device-specific config into the ignored local config file."
+      reason: "Preview moving legacy device-specific config out of the portable project config."
     });
   }
 }
@@ -521,7 +507,6 @@ function inspectStorage(
       databasePath,
       readable: false,
       readableTables: new Set(),
-      qualityColumnsAvailable: false,
       check: {
         id: "storage:sqlite",
         category: "storage",
@@ -548,36 +533,33 @@ function inspectStorage(
       counts[table] = countRows(db, table);
     }
 
-    const missingQualityColumns = ["memory_candidates", "memories"].flatMap((table) => {
-      if (!readableTables.has(table)) return [];
-      const columns = tableColumns(db!, table);
-      return REQUIRED_QUALITY_COLUMNS.filter((column) => !columns.has(column)).map((column) => `${table}.${column}`);
-    });
-
-    if (missingTables.length > 0 || missingQualityColumns.length > 0) {
+    if (missingTables.length > 0) {
       return {
         databasePath,
         db,
         readable: false,
         readableTables,
-        qualityColumnsAvailable: false,
         check: {
           id: "storage:sqlite",
           category: "storage",
           status: "error",
           title: "SQLite store needs migration",
-          detail: [...missingTables.map((table) => `missing table ${table}`), ...missingQualityColumns].join(", "),
+          detail: missingTables.map((table) => `missing table ${table}`).join(", "),
           metadata: { databasePath, counts }
         }
       };
     }
 
+    const schemaVersion = tableExists(db, "schema_migrations")
+      ? Number((db.prepare("select max(version) as version from schema_migrations").get() as { version: number | null }).version ?? 0)
+      : 0;
+
     return {
       databasePath,
       db,
+      schemaVersion,
       readable: true,
       readableTables,
-      qualityColumnsAvailable: true,
       check: {
         id: "storage:sqlite",
         category: "storage",
@@ -593,7 +575,6 @@ function inspectStorage(
       databasePath,
       readable: false,
       readableTables: new Set(),
-      qualityColumnsAvailable: false,
       check: {
         id: "storage:sqlite",
         category: "storage",
@@ -880,6 +861,16 @@ function addSummaryCheck(
   addCheck: (check: DoctorCheck) => void,
   addAction: (action: DoctorNextAction) => void
 ): void {
+  try {
+    const missing = inspectProjectSetupArtifacts(rootDir);
+    addCheck({ id: "project:setup", category: "project", status: missing.length ? "warning" : "ok",
+      title: missing.length ? "Project setup is incomplete" : "Project setup artifacts are ready",
+      detail: missing.length ? `Missing: ${missing.join(", ")}` : "Config, memory database, summary, AGENTS.md and CLAUDE.md are present.",
+      metadata: { missing } });
+    if (missing.length) addAction({ priority: "medium", command: "code-butler init", reason: "Complete project setup, including agent instruction files." });
+  } catch (error) {
+    addCheck({ id: "project:setup", category: "project", status: "error", title: "Project setup artifacts are invalid", detail: messageFromError(error) });
+  }
   const status = getProjectSummaryStatus(rootDir, { now: () => now });
   const needsRefresh = !status.exists || status.stale || status.due;
   const missingSummaryCredentials = config !== undefined
@@ -965,37 +956,45 @@ function globalEnvPathForDisplay(): string {
 }
 
 function addMemoryCheck(
+  projectRoot: string,
   storage: DoctorStorageState,
   addCheck: (check: DoctorCheck) => void,
   addAction: (action: DoctorNextAction) => void
 ): void {
-  if (!storage.db || !storage.readable || !storage.qualityColumnsAvailable) {
+  if (!storage.db || !storage.readable || storage.schemaVersion !== CURRENT_SCHEMA_VERSION) {
     addCheck({
       id: "memory:quality",
       category: "memory",
       status: "warning",
       title: "Memory quality health is unavailable",
-      detail: "SQLite storage must be initialized and migrated before memory health can be read."
+      detail: "The shared store must be initialized and current before memory health can be assessed."
     });
     return;
   }
 
+  // All read-only diagnostics are complete. Release those handles before using the
+  // normal resolver, which may refresh only the device-local quality cache.
+  storage.db.close();
+  delete storage.db;
+  let store: MemoryStore | undefined;
   try {
-    const health = readMemoryHealth(storage.db);
+    store = openMemoryStore(projectRoot);
+    store.init();
+    const health = summarizeMemoryHealth(store);
     const needsAttention = health.needsReview > 0 || health.quarantined > 0;
     addCheck({
       id: "memory:quality",
       category: "memory",
       status: needsAttention ? "warning" : "ok",
       title: needsAttention ? "Memory quality needs review" : "Memory quality is clean",
-      detail: `active=${health.active} needs_review=${health.needsReview} quarantined=${health.quarantined}`,
+      detail: `active=${health.active} needs_review=${health.needsReview} quarantined=${health.quarantined} retired=${health.retired} replaced=${health.replaced}`,
       metadata: recordFrom(health)
     });
     if (needsAttention) {
       addAction({
         priority: "medium",
-        command: "code-butler memory audit --fix",
-        reason: "Mark noisy or stale memories before they affect search results."
+        command: "code-butler memory reconcile plan --queue actionable --limit 20",
+        reason: "Create an inspectable evidence-backed plan for memories that need attention."
       });
     }
   } catch (error) {
@@ -1006,6 +1005,8 @@ function addMemoryCheck(
       title: "Memory quality health failed",
       detail: messageFromError(error)
     });
+  } finally {
+    store?.close();
   }
 }
 
@@ -1054,35 +1055,6 @@ function readSyncStatuses(storage: DoctorStorageState): Partial<Record<SyncSourc
   return statuses;
 }
 
-function readMemoryHealth(db: DatabaseSync): MemoryHealthSummary {
-  const rows = [
-    ...(db
-      .prepare(
-        `select quality_status, quality_reasons_json
-         from memory_candidates
-         where promotion_state = 'candidate'`
-      )
-      .all() as unknown as MemoryQualityRow[]),
-    ...(db
-      .prepare(
-        `select quality_status, quality_reasons_json
-         from memories`
-      )
-      .all() as unknown as MemoryQualityRow[])
-  ];
-  const reasons = rows.flatMap((row) => parseStringArray(row.quality_reasons_json));
-  return {
-    scanned: rows.length,
-    total: rows.length,
-    complete: true,
-    active: rows.filter((row) => row.quality_status === "active").length,
-    needsReview: rows.filter((row) => row.quality_status === "needs_review").length,
-    quarantined: rows.filter((row) => row.quality_status === "quarantined").length,
-    rejected: rows.filter((row) => row.quality_status === "quarantined").length,
-    topReasons: topReasons(reasons)
-  };
-}
-
 function projectSummaryProviderConfig(config: ProjectConfig): ExtractorConfig | InvestigatorConfig {
   return config.investigator.enabled ? config.investigator : config.extractor;
 }
@@ -1129,23 +1101,6 @@ function parseJsonObject(raw: string): Record<string, unknown> {
   } catch {
     return {};
   }
-}
-
-function parseStringArray(raw: string): string[] {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-function topReasons(reasons: string[]): Array<{ reason: string; count: number }> {
-  const counts = new Map<string, number>();
-  for (const reason of reasons) counts.set(reason, (counts.get(reason) ?? 0) + 1);
-  return [...counts.entries()]
-    .map(([reason, count]) => ({ reason, count }))
-    .sort((left, right) => right.count - left.count || left.reason.localeCompare(right.reason));
 }
 
 function recordFrom(value: object): Record<string, unknown> {

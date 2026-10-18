@@ -1,4 +1,7 @@
-import { scopeLabel } from "../memory/scope.js";
+import { assembleHumanSummary, selectSummaryMemories } from "./memory-sections.js";
+import { GLOBAL_RULES_INSTRUCTIONS, LEGACY_GLOBAL_RULES_INSTRUCTIONS } from "../rules/match.js";
+import { atomicWrite } from "../cloud/state.js";
+import type { ProjectSetupStatus } from "../project-setup.js";
 import { runArtifactMaintenance } from "../maintenance/artifacts.js";
 import { createHash } from "node:crypto";
 import {
@@ -35,6 +38,7 @@ import type { MemoryStore, ProjectSummary } from "../storage/store.js";
 import type { CommitRecord, MemorySearchResult, ProjectConfig } from "../types.js";
 
 const SUMMARY_VERSION = 1;
+const SUMMARY_FORMAT = 2;
 const DAILY_REFRESH_MS = 24 * 60 * 60 * 1000;
 const MAX_INVENTORY_ENTRIES = 200;
 const MAX_MANIFEST_FILES = 100;
@@ -97,11 +101,12 @@ export interface ProjectSummaryGeneratorInput {
 
 export interface ProjectSummaryGenerator {
   name?: string;
-  generate(input: ProjectSummaryGeneratorInput): Promise<string>;
+  generate(input: ProjectSummaryGeneratorInput, signal?: AbortSignal): Promise<string>;
 }
 
 export interface ProjectSummaryMeta {
   version: 1;
+  format?: number;
   summaryPath: string;
   fingerprint: string;
   outputContentHash?: string;
@@ -115,6 +120,7 @@ export interface ProjectBrief {
   summaryPath: string;
   summary: string;
   meta?: ProjectSummaryMeta;
+  setup?: ProjectSetupStatus;
 }
 
 export interface ProjectSummaryStatus {
@@ -157,10 +163,13 @@ export interface ProjectSummaryOperationOptions {
   bootstrapApplyFile?: (stagedPath: string, destinationPath: string) => void;
   summaryApplyFile?: (stagedPath: string, destinationPath: string) => void;
   summaryBeforeCommit?: (destinationPath: string) => void;
+  /** Repair missing bootstrap files without replacing later user edits. */
+  preserveExistingAgentFiles?: boolean;
 }
 
 interface ProjectSummaryInputOptions {
   omitAgentHints?: boolean;
+  projectState?: ProjectSummary;
 }
 
 export interface ProjectSummaryInstalledResult extends ProjectSummaryRefreshResult {
@@ -185,18 +194,20 @@ export function readProjectBrief(rootDir: string): ProjectBrief {
 
 export function getProjectSummaryStatus(
   rootDir: string,
-  options: { store?: MemoryStore; config?: ProjectConfig; now?: () => Date } = {}
+  options: { store?: MemoryStore; config?: ProjectConfig; now?: () => Date; projectState?: ProjectSummary } = {}
 ): ProjectSummaryStatus {
   const paths = projectSummaryPaths(rootDir);
   const meta = readProjectSummaryMeta(rootDir);
   const now = (options.now ?? (() => new Date()))();
   let currentFingerprint: string | undefined;
   if (options.store && options.config) {
-    currentFingerprint = collectProjectSummaryInput(options.store, options.config).fingerprint;
+    currentFingerprint = collectProjectSummaryInputInternal(options.store, options.config, {
+      ...(options.projectState ? { projectState: options.projectState } : {})
+    }).fingerprint;
   }
   const stale =
     !existsSync(paths.summaryPath) ||
-    meta === undefined ||
+    meta === undefined || meta.format !== SUMMARY_FORMAT ||
     (currentFingerprint !== undefined && meta.fingerprint !== currentFingerprint);
   const outputHash = existsSync(paths.summaryPath) ? hashFile(paths.summaryPath) : undefined;
   const outputBaselineMissing = existsSync(paths.summaryPath) && meta?.outputContentHash === undefined;
@@ -256,14 +267,14 @@ export async function initializeProjectSummary(
 ): Promise<ProjectSummaryInstalledResult> {
   const rootDir = projectRoot(config, store);
   preflightProjectSummaryOutputs(rootDir);
-  const bootstrapPlan = planAgentBootstrapFiles(rootDir, nowDate(options));
+  const bootstrapPlan = planAgentBootstrapFiles(rootDir, nowDate(options), options.preserveExistingAgentFiles);
   const summarySnapshot = snapshotProjectSummaryFiles(rootDir);
   const existing = readProjectBrief(rootDir);
-  let refreshed: ProjectSummaryRefreshResult;
+  let refreshed: ProjectSummaryRefreshResult = { checked: false, generated: false, summaryPath: existing.summaryPath };
   let fallback = false;
   let bootstrap: ProjectSummaryBootstrapResult;
   try {
-    if (existing.exists) {
+    if (existing.exists && existing.summary.trim()) {
       refreshed = {
         checked: false,
         generated: false,
@@ -282,8 +293,7 @@ export async function initializeProjectSummary(
           config,
           {
             ...options,
-            generator: fallbackGenerator,
-            force: true
+            generator: fallbackGenerator
           },
           { omitAgentHints: true }
         );
@@ -293,7 +303,14 @@ export async function initializeProjectSummary(
     }
     bootstrap = applyAgentBootstrapPlan(bootstrapPlan, options);
   } catch (error) {
-    restoreProjectSummaryFiles(summarySnapshot);
+    // The summary writer already rolls back failed writes. Only undo our completed
+    // generation; a user may have edited a preserved summary while bootstrap failed.
+    if (refreshed.generated && refreshed.meta?.outputContentHash &&
+      existsSync(refreshed.summaryPath) && hashFile(refreshed.summaryPath) === refreshed.meta.outputContentHash &&
+      existsSync(projectSummaryPaths(rootDir).metaPath) &&
+      hashFile(projectSummaryPaths(rootDir).metaPath) === hashBytes(Buffer.from(serializeProjectSummaryMeta(refreshed.meta)))) {
+      restoreProjectSummaryFiles(summarySnapshot);
+    }
     throw error;
   }
   return {
@@ -327,10 +344,11 @@ async function refreshProjectSummaryInternal(
   const existing = readProjectBrief(rootDir);
   const existingOutputHash = existing.exists ? hashFile(paths.summaryPath) : undefined;
   const manualEditsDetected =
+    Boolean(existing.summary.trim()) &&
     existingOutputHash !== undefined &&
     existing.meta?.outputContentHash !== undefined &&
     existingOutputHash !== existing.meta.outputContentHash;
-  const outputBaselineMissing = existing.exists && existing.meta?.outputContentHash === undefined;
+  const outputBaselineMissing = Boolean(existing.summary.trim()) && existing.meta?.outputContentHash === undefined;
 
   if (!options.force && manualEditsDetected) {
     return {
@@ -359,7 +377,7 @@ async function refreshProjectSummaryInternal(
     };
   }
 
-  if (!options.force && existing.exists && existing.meta?.fingerprint === input.fingerprint) {
+  if (!options.force && existing.summary.trim() && existing.meta?.fingerprint === input.fingerprint && existing.meta.format === SUMMARY_FORMAT) {
     const meta = normalizeMeta({
       ...existing.meta,
       summaryPath: paths.summaryPath,
@@ -382,7 +400,8 @@ async function refreshProjectSummaryInternal(
   }
 
   const generator = options.generator ?? createConfiguredProjectSummaryGenerator(config);
-  const summary = (await generator.generate(input)).trim();
+  const generated = (await generator.generate(input)).trim();
+  const summary = generated ? store.contentPolicy.text(assembleHumanSummary(input.codeContext.memories, generated)).trim() : "";
   if (!summary) {
     throw new Error("Project summary generator returned empty content");
   }
@@ -412,6 +431,7 @@ async function refreshProjectSummaryInternal(
   const summaryContent = `${summary}\n`;
   const metaInput: ProjectSummaryMeta = {
     version: SUMMARY_VERSION,
+    format: SUMMARY_FORMAT,
     summaryPath: paths.summaryPath,
     fingerprint: input.fingerprint,
     outputContentHash: hashBytes(Buffer.from(summaryContent)),
@@ -499,18 +519,21 @@ function collectProjectSummaryInputInternal(
   const trackedPaths = readTrackedPaths(rootDir);
   const manifests = readTrackedManifestFiles(rootDir, discoverManifestPaths(trackedPaths), trackedPaths);
   const docs = readTrackedTextFiles(rootDir, DOC_PATHS, trackedPaths);
-  const memories = store.searchMemoryLayer({ status: "promoted", limit: 50 });
+  const memories = selectSummaryMemories(store);
+  // File selection can use other current memories without publishing their claims
+  // in the project-wide decision and constraint sections.
+  const codeMemories = store.listMemories({ lifecycleStatus: "current", layer: "all", owner: "self", qualityStatus: "all", limit: null });
   const commits = store.findCommits({ limit: 20 });
   const agentHints = options.omitAgentHints ? [] : readAgentHints(rootDir, trackedPaths);
   const notes = readProjectSummaryNotes(rootDir);
   const codeContext: ProjectSummaryCodeContext = {
     manifests,
     docs,
-    codeFiles: collectProjectSummaryCodeFiles(rootDir, { manifests, memories, commits }),
+    codeFiles: collectProjectSummaryCodeFiles(rootDir, { manifests, memories: codeMemories, commits }, trackedPaths),
     inventory: listProjectSummarySafeTrackedPaths(rootDir, trackedPaths, MAX_INVENTORY_ENTRIES),
     memories,
     commits,
-    projectState: store.getProjectSummary()
+    projectState: options.projectState ?? store.getProjectSummary()
   };
   const fingerprint = fingerprintProjectSummaryInputs({
     projectRoot: rootDir,
@@ -762,6 +785,7 @@ function normalizeMeta(input: Partial<ProjectSummaryMeta>): ProjectSummaryMeta {
     summaryPath: input.summaryPath,
     fingerprint: input.fingerprint
   };
+  if (typeof input.format === "number") meta.format = input.format;
   if (input.lastGeneratedAt !== undefined) meta.lastGeneratedAt = input.lastGeneratedAt;
   if (input.lastCheckedAt !== undefined) meta.lastCheckedAt = input.lastCheckedAt;
   if (input.provider !== undefined) meta.provider = input.provider;
@@ -772,7 +796,7 @@ function normalizeMeta(input: Partial<ProjectSummaryMeta>): ProjectSummaryMeta {
 }
 
 function isSummaryRefreshDue(meta: ProjectSummaryMeta | undefined, now: Date): boolean {
-  if (!meta?.lastCheckedAt) return true;
+  if (meta?.format !== SUMMARY_FORMAT || !meta.lastCheckedAt) return true;
   const lastCheckedAt = Date.parse(meta.lastCheckedAt);
   if (!Number.isFinite(lastCheckedAt)) return true;
   return now.getTime() - lastCheckedAt >= DAILY_REFRESH_MS;
@@ -808,7 +832,7 @@ interface ProjectSummaryFileSnapshot {
   content?: Buffer;
 }
 
-function planAgentBootstrapFiles(rootDir: string, now: Date): ProjectSummaryBootstrapPlan {
+function planAgentBootstrapFiles(rootDir: string, now: Date, preserveExisting = false): ProjectSummaryBootstrapPlan {
   const rootRealPath = realpathSync(rootDir);
   const timestamp = timestampForBackup(now);
   const files: ProjectSummaryBootstrapFilePlan[] = [];
@@ -831,6 +855,7 @@ function planAgentBootstrapFiles(rootDir: string, now: Date): ProjectSummaryBoot
     }
     const originalContent = readFileSync(path);
     const current = originalContent.toString("utf8");
+    if (preserveExisting && current.trim()) continue;
     if (current === content) continue;
     const file: ProjectSummaryBootstrapFilePlan = {
       fileName,
@@ -845,9 +870,7 @@ function planAgentBootstrapFiles(rootDir: string, now: Date): ProjectSummaryBoot
       originalHash: hashBytes(originalContent),
       mode: Number(stats.mode)
     };
-    if (!isGeneratedBootstrap(current)) {
-      file.backupBasePath = join(rootDir, `${fileName}.code-butler-backup-${timestamp}`);
-    }
+    file.backupBasePath = join(rootDir, `${fileName}.code-butler-backup-${timestamp}`);
     files.push(file);
   }
   return { rootDir, files };
@@ -987,52 +1010,61 @@ function isInsideRoot(rootRealPath: string, candidatePath: string): boolean {
   );
 }
 
-export function createFallbackProjectSummaryGenerator(error: unknown): ProjectSummaryGenerator {
+export function createFallbackProjectSummaryGenerator(_error: unknown): ProjectSummaryGenerator {
+  return { ...createLocalProjectSummaryGenerator(), name: "fallback" };
+}
+
+/** A readable initial summary, built from repository facts without a provider. */
+export function createLocalProjectSummaryGenerator(): ProjectSummaryGenerator {
   return {
-    name: "fallback",
-    async generate(input): Promise<string> {
-      const manifests = input.codeContext.manifests.map((file) => `- ${file.path}`).join("\n") || "- none indexed";
-      const docs = input.codeContext.docs.map((file) => `- ${file.path}`).join("\n") || "- none indexed";
-      const inventory = input.codeContext.inventory.slice(0, 30).map((entry) => `- ${entry}`).join("\n") || "- none indexed";
-      const memories = input.codeContext.memories
-        .slice(0, 10)
-        .map((memory) => `- [${scopeLabel(memory.scope)}] ${memory.type}: ${memory.title} - ${memory.summary}`)
-        .join("\n") || "- none indexed";
-      const commits = input.codeContext.commits
-        .slice(0, 10)
-        .map((commit) => `- ${commit.hash.slice(0, 12)} ${commit.message}`)
-        .join("\n") || "- none indexed";
+    name: "local",
+    async generate(input) {
+      const context = input.codeContext;
+      const manifests = context.manifests.filter(f => f.path.endsWith("package.json")).flatMap(f => {
+        try { return [{ path: f.path, value: JSON.parse(f.content) as Record<string, unknown> }]; } catch { return []; }
+      });
+      const rootManifest = manifests.find(m => m.path === "package.json")?.value;
+      const description = typeof rootManifest?.description === "string" ? rootManifest.description : undefined;
+      const readme = context.docs.find(f => f.path === "README.md")?.content;
+      const paragraph = readme?.split(/\r?\n\s*\r?\n/).find(p => p.trim() && !/^(?:#|!\[|\[!\[|<!--|\x60\x60\x60|[-*] )/.test(p.trim()));
+      const directories = [...new Set(context.inventory.filter(p => p.includes("/")).map(p => p.split("/")[0]!))]
+        .filter(p => !p.startsWith(".")).slice(0, 12);
+      const scripts = rootManifest?.scripts && typeof rootManifest.scripts === "object"
+        ? Object.keys(rootManifest.scripts).filter(k => /^(?:test|build|typecheck|lint)$/.test(k)) : [];
       return [
-        "# Fallback Project Summary",
-        "",
-        "This is a limited fallback summary created without an API-backed model.",
-        "Add the configured project-summary API key, then run `code-butler project-summary refresh --force` to regenerate a richer summary.",
-        "",
-        `Project root: ${input.projectRoot}`,
-        "",
-        "## Why This Fallback Was Used",
-        fallbackErrorMessage(error),
-        "",
-        "## Indexed Manifests",
-        manifests,
-        "",
-        "## Indexed Docs",
-        docs,
-        "",
-        "## Project Inventory",
-        inventory,
-        "",
-        "## Durable Memories",
-        memories,
-        "",
-        "## Recent Commits",
-        commits,
-        "",
-        "## Agent Usage",
-        "Use Code Butler MCP tools such as `sync_project_memory`, `summarize_project_brief`, `summarize_active_context`, `search_project_memory`, and `explain_code_change` for current project context."
+        "## What this is", description || paragraph?.trim() || "A project whose purpose has not been documented yet.", "",
+        "## How it's built",
+        context.manifests.length ? "Build and dependency definitions: " + context.manifests.filter(f => !/lock/.test(f.path)).map(f => "\x60" + f.path + "\x60").join(", ") + "." : "Build details have not been documented yet.",
+        directories.length ? "Repository areas: " + directories.map(p => "\x60" + p + "/\x60").join(", ") + "." : "", "",
+        "## Where things stand",
+        context.commits.length ? context.commits.slice(0, 5).map(c => "- " + c.message.split("\n")[0]).join("\n") : "No recent project changes have been recorded.", "",
+        "## Open risks and questions", "Check the project issue tracker and current work for open questions.", "",
+        "## How to verify changes",
+        scripts.length ? scripts.map(k => "- \x60npm run " + k + "\x60").join("\n") : "Use the verification commands documented in the repository."
       ].join("\n");
     }
   };
+}
+
+/** Commit already generated content while retaining concurrent-edit checks. */
+export function commitPreparedProjectSummary(
+  root: string, input: ProjectSummaryGeneratorInput, summary: string, provider: string,
+  expectedHash: string, options: ProjectSummaryOperationOptions = {}
+): void {
+  preflightProjectSummaryOutputs(root);
+  if (!summary.trim()) throw new Error("Project summary generator returned empty content");
+  const paths = projectSummaryPaths(root);
+  const content = `${assembleHumanSummary(input.codeContext.memories, summary).trim()}\n`;
+  const now = nowDate(options).toISOString();
+  const meta: ProjectSummaryMeta = {
+    version: 1, format: SUMMARY_FORMAT, summaryPath: paths.summaryPath, fingerprint: input.fingerprint,
+    outputContentHash: hashBytes(Buffer.from(content)), lastGeneratedAt: now,
+    lastCheckedAt: now, provider
+  };
+  writeProjectSummaryOutputsAtomically(root, [
+    { path: paths.summaryPath, content },
+    { path: paths.metaPath, content: serializeProjectSummaryMeta(meta) }
+  ], options, { exists: true, contentHash: expectedHash });
 }
 
 function fallbackSummaryWarning(error: unknown): string {
@@ -1142,9 +1174,11 @@ function discoverManifestPaths(trackedPaths: ReadonlySet<string>): string[] {
 }
 
 function fingerprintProjectSummaryInputs(input: Omit<ProjectSummaryGeneratorInput, "fingerprint">): string {
+  // Operational counters and temporary expiry do not change narrative content.
   return createHash("sha256")
     .update(
       JSON.stringify({
+        format: SUMMARY_FORMAT,
         projectRoot: input.projectRoot,
         agentHints: input.agentHints,
         notes: input.notes,
@@ -1160,6 +1194,8 @@ function fingerprintProjectSummaryInputs(input: Omit<ProjectSummaryGeneratorInpu
           scope: memory.scope,
           applicability: memory.applicability,
           summary: memory.summary,
+          statement: memory.statement,
+          layer: memory.layer,
           reason: memory.reason,
           relatedFiles: memory.relatedFiles
         })),
@@ -1169,14 +1205,13 @@ function fingerprintProjectSummaryInputs(input: Omit<ProjectSummaryGeneratorInpu
           message: commit.message,
           changedFiles: commit.changedFiles,
           diffSummary: commit.diffSummary
-        })),
-        projectState: input.codeContext.projectState
+        }))
       })
     )
     .digest("hex");
 }
 
-function agentBootstrapText(fileName: "AGENTS.md" | "CLAUDE.md"): string {
+export function legacyAgentBootstrapText(fileName: "AGENTS.md" | "CLAUDE.md"): string {
   const agentName = fileName === "AGENTS.md" ? "Codex" : "Claude";
   return [
     `# ${fileName}`,
@@ -1188,7 +1223,7 @@ function agentBootstrapText(fileName: "AGENTS.md" | "CLAUDE.md"): string {
     "- The global server resolves this repository and uses its project-local `.code-butler/` memory; call `current_project` when you need to confirm which project is active.",
     "- If Code Butler MCP tools are not visible, use the client's tool discovery for `code-butler` or `current_project` before falling back to files or git.",
     "- When the user asks to remember, save, or note a project memory, call `current_project`, then `remember_project_memory`, then verify with `find_memories`; do not inspect or write SQLite directly.",
-    "- Before coding or answering project-history questions, call `sync_project_memory` when the MCP server is available.",
+    "- Read the available completed memory index first. Use `sync_project_memory` explicitly when you need to wait for ingestion and index publication; ordinary retrieval refreshes in the background.",
     "- Start by calling `summarize_project_brief` for the current narrative summary and freshness metadata.",
     "- For continuation questions like \"where were we?\", \"continue\", or after compaction, call `summarize_active_context` first; use `search_temporary_memory` for targeted working context.",
     "- For questions like \"what changed recently and why\", call `summarize_project_state`, then `summarize_recent_activity`; by default this covers the last 3 days. Use git only as secondary corroboration for commits or current uncommitted changes.",
@@ -1198,6 +1233,38 @@ function agentBootstrapText(fileName: "AGENTS.md" | "CLAUDE.md"): string {
     "- The narrative summary lives at `.code-butler/project-summary.md`.",
     "- Refresh the narrative with `code-butler project-summary refresh`."
   ].join("\n") + "\n";
+}
+
+export const BOOTSTRAP_TEMPLATE_VERSION = 3;
+export interface AgentFileBaseline { templateVersion: number; contentHash: string; managedContentHash?: string }
+export function agentBootstrapText(fileName: "AGENTS.md" | "CLAUDE.md"): string {
+  const content = legacyAgentBootstrapText(fileName) + "\n## Global Rules\n- " + GLOBAL_RULES_INSTRUCTIONS + "\n";
+  const hash = hashBytes(Buffer.from(content));
+  return `<!-- code-butler:begin v=${BOOTSTRAP_TEMPLATE_VERSION} sha256=${hash} -->\n${content}<!-- code-butler:end -->\n`;
+}
+/** Upgrade only verified generated bytes. Markers alone never establish ownership. */
+export function upgradeAgentBootstraps(root: string, baselines: Record<string, AgentFileBaseline> = {}) {
+  const agentFiles: Record<string, AgentFileBaseline> = {}, customized: string[] = [], backupFiles: string[] = [];
+  for (const name of ["AGENTS.md", "CLAUDE.md"] as const) {
+    const path = join(root, name); if (!existsSync(path)) continue;
+    if (lstatSync(path).isSymbolicLink() || !lstatSync(path).isFile()) throw new Error("Bootstrap must be a regular file");
+    const current = readFileSync(path, "utf8"), desired = agentBootstrapText(name);
+    let next: string | undefined;
+    const block = /<!-- code-butler:begin v=(\d+) sha256=([a-f0-9]{64}) -->\n([\s\S]*?)<!-- code-butler:end -->\n?/.exec(current);
+    const desiredBlockHash = /sha256=([a-f0-9]{64})/.exec(desired)![1]!;
+    const previousBlockHash = hashBytes(Buffer.from(legacyAgentBootstrapText(name) + "\n## Global Rules\n- " + LEGACY_GLOBAL_RULES_INSTRUCTIONS + "\n"));
+    if (block && current.split("<!-- code-butler:begin").length === 2 && hashBytes(Buffer.from(block[3]!)) === block[2] && (block[2] === desiredBlockHash || block[2] === previousBlockHash || block[2] === baselines[name]?.managedContentHash)) next = current.replace(block[0], desired);
+    else if (current === legacyAgentBootstrapText(name) || current === legacyAgentBootstrapText(name).replace(/\n/g, "\r\n") || baselines[name]?.contentHash === hashBytes(Buffer.from(current))) next = desired;
+    if (next === undefined) { customized.push(name); continue; }
+    if (next !== current) {
+      const backup = join(root, ".code-butler", "backups", "bootstrap", `${name}.${Date.now()}.${hashBytes(Buffer.from(current)).slice(0, 12)}.md`);
+      atomicWrite(backup, current);
+      if (readFileSync(path, "utf8") !== current) throw new Error("Bootstrap changed during upgrade; retry");
+      atomicWrite(path, next); backupFiles.push(backup);
+    }
+    agentFiles[name] = { templateVersion: BOOTSTRAP_TEMPLATE_VERSION, contentHash: hashBytes(Buffer.from(next)), managedContentHash: desiredBlockHash };
+  }
+  return { agentFiles, customized, backupFiles };
 }
 
 function nowDate(options: { now?: () => Date }): Date {

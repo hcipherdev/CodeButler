@@ -1,3 +1,4 @@
+// Tests storage migrations, backup integrity, and memory schema upgrades.
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -31,7 +32,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(18);
+    expect(CURRENT_SCHEMA_VERSION).toBe(24);
     expect(store.db.prepare("pragma table_info(source_failures)").all()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "adapter" }),
@@ -102,9 +103,31 @@ describe("ordered storage migrations", () => {
         expect.objectContaining({ name: "imported_at" })
       ])
     );
+    expect(store.db.prepare("pragma table_info(memory_review_resolutions)").all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "memory_id" }),
+        expect.objectContaining({ name: "category" }),
+        expect.objectContaining({ name: "memory_version" }),
+        expect.objectContaining({ name: "context_fingerprint" }),
+        expect.objectContaining({ name: "action" }),
+        expect.objectContaining({ name: "actor" })
+      ])
+    );
     const migrationOperations = store.listOperations({ operationType: "migration" });
-    expect(migrationOperations).toHaveLength(10);
+    expect(migrationOperations).toHaveLength(16);
     expect(migrationOperations).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 20 }
+      }),
+      expect.objectContaining({
+        operationType: "migration",
+        status: "completed",
+        actor: "system",
+        metadata: { migrationVersion: 19 }
+      }),
       expect.objectContaining({
         operationType: "migration",
         status: "completed",
@@ -148,7 +171,62 @@ describe("ordered storage migrations", () => {
         metadata: { migrationVersion: 9 }
       })
     ]));
+    for (const table of ["memory_candidates", "memories"]) {
+      const columns = (store.db.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>).map(row => row.name);
+      expect(columns).not.toContain("quality_status");
+      expect(columns).not.toContain("quality_reasons_json");
+      expect(columns).not.toContain("last_verified_at");
+    }
+    expect(store.localDb.prepare("select name from sqlite_master where type = 'table'").all()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "memory_quality_cache" }),
+      expect.objectContaining({ name: "memory_reconciliation_runs" }),
+      expect.objectContaining({ name: "memory_reconciliation_items" })
+    ]));
     store.close();
+  });
+
+  it("quarantines legacy low-signal memories during the version-19 migration without deleting them", () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = openMemoryStore(rootDir);
+    initializeSchema(store.db, store.paths.databasePath, { migrations: SCHEMA_MIGRATIONS.slice(0, 18) });
+    // The current fixture writer needs nullable statement columns; legacy rows still contain NULL.
+    store.db.exec("alter table memories add column statement_json text; alter table memory_candidates add column statement_json text;");
+    const config = store.upsertMemoryCandidate({
+      type: "constraint",
+      title: "Config defines retries",
+      summary: "package.json defines retries.",
+      reason: "Legacy deterministic config extraction.",
+      confidence: 0.65,
+      evidence: [],
+      relatedFiles: ["package.json"],
+      dedupeKey: "deterministic:config:package.json:retries"
+    }, { qualityStatus: "active", qualityReasons: [] });
+    const docsCandidate = store.upsertMemoryCandidate({
+      type: "constraint",
+      title: "Deployment",
+      summary: "Documentation includes Deployment.",
+      reason: "Legacy deterministic documentation extraction.",
+      confidence: 0.6,
+      evidence: [],
+      relatedFiles: ["README.md"],
+      dedupeKey: "deterministic:docs:README.md:deployment"
+    }, { qualityStatus: "active", qualityReasons: ["curator_note"] });
+    const docs = store.promoteMemoryCandidate(docsCandidate.id);
+    store.close();
+
+    const migrated = openMemoryStore(rootDir);
+    migrated.init();
+    expect(migrated.listMemoryCandidates({ qualityStatus: "all", limit: null }).find(memory => memory.id === config.id)).toMatchObject({
+      qualityStatus: "quarantined",
+      qualityReasons: ["legacy_low_signal_heuristic", "missing_evidence"]
+    });
+    expect(migrated.readMemory(docs.id)).toMatchObject({
+      qualityStatus: "quarantined",
+      qualityReasons: ["legacy_low_signal_heuristic", "missing_claim", "missing_evidence"]
+    });
+    expect(migrated.readMemory(docs.id)).toBeDefined();
+    migrated.close();
   });
 
   it("upgrades a legacy database in place, records ordered versions, and creates a backup", () => {
@@ -176,7 +254,7 @@ describe("ordered storage migrations", () => {
     store.init();
 
     expect(store.listMemoryCandidates({ qualityStatus: "all" })).toEqual([
-      expect.objectContaining({ id: "legacy-id", qualityStatus: "active" })
+      expect.objectContaining({ id: "legacy-id", qualityStatus: "quarantined", qualityReasons: ["missing_evidence"] })
     ]);
     expect(getMigrationStatus(store.db, store.paths.databasePath)).toMatchObject({
       currentVersion: CURRENT_SCHEMA_VERSION,
@@ -388,7 +466,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(18);
+    expect(CURRENT_SCHEMA_VERSION).toBe(24);
     expect(store.db.prepare("select count(*) as count from sources").get()).toEqual(before.sources);
     expect(store.db.prepare("select count(*) as count from chunks").get()).toEqual(before.chunks);
     expect(store.db.prepare("select count(*) as count from memories").get()).toEqual(before.memories);
@@ -576,7 +654,8 @@ describe("ordered storage migrations", () => {
     const barrierDir = join(rootDir, "barrier");
     mkdirSync(barrierDir);
     const script = `
-      import { existsSync, writeFileSync } from 'node:fs';
+      // Tests storage migrations, backup integrity, and memory schema upgrades.
+import { existsSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       import { DatabaseSync } from 'node:sqlite';
       import { initializeSchema, SCHEMA_MIGRATIONS, CURRENT_SCHEMA_VERSION } from './src/storage/migrations.ts';

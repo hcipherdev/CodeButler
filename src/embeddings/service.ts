@@ -1,4 +1,5 @@
 import { redactSensitiveText } from "../privacy/redaction.js";
+import { OperationDeferredError } from "../cloud/outcome.js";
 import type { MemoryStore } from "../storage/store.js";
 import type {
   EmbeddingConfig,
@@ -49,6 +50,8 @@ export interface EmbeddingBuildResult extends EmbeddingStatus {
 export interface EmbeddingServiceOptions {
   provider?: EmbeddingProvider | undefined;
   providerFactory?: ((config: EmbeddingConfig, privacy: PrivacyConfig) => EmbeddingProvider) | undefined;
+  shouldYield?: (() => boolean) | undefined;
+  runExternalModel?: (<T>(work: () => Promise<T>) => Promise<T>) | undefined;
 }
 
 export async function buildEmbeddings(
@@ -56,6 +59,7 @@ export async function buildEmbeddings(
   config: EmbeddingServiceConfig,
   options: EmbeddingServiceOptions = {}
 ): Promise<EmbeddingBuildResult> {
+  if (options.shouldYield?.()) throw new OperationDeferredError("Watcher embeddings deferred for foreground review");
   const eligible = store.listEmbeddingOwners().length;
   if (!config.embeddings.enabled) {
     return emptyBuildStatus(false, eligible, ["Embeddings are disabled"]);
@@ -138,6 +142,7 @@ export async function buildEmbeddings(
     store.listEmbeddingJobs({ providerKey: provider.providerKey }).map((job) => job.indexGeneration)
   );
   while (true) {
+    if (options.shouldYield?.()) throw new OperationDeferredError("Watcher embeddings deferred for foreground review");
     const jobs = store.listEmbeddingJobs({ providerKey: provider.providerKey })
       .filter((job) => job.state === "pending" || job.state === "failed")
       .filter((job) => allowedIndexGenerations.has(job.indexGeneration))
@@ -168,7 +173,10 @@ export async function buildEmbeddings(
       continue;
     }
     try {
-      const embedded = await provider.embed(providerInputs);
+      const embedded = await (options.runExternalModel
+        ? options.runExternalModel(() => provider.embed(providerInputs))
+        : provider.embed(providerInputs));
+      if (options.shouldYield?.()) throw new OperationDeferredError("Watcher embeddings deferred for foreground review");
       validateBatchResult(embedded, batch.length, provider, config.embeddings.model);
       const batchTargets = unique(batch.flatMap((job) => job.targetFingerprint ? [job.targetFingerprint] : []));
       const pendingRebuildTokens = unique(batch.flatMap((job) =>
@@ -267,6 +275,7 @@ export async function buildEmbeddings(
         }
       }
     } catch (error) {
+      if (error instanceof OperationDeferredError) throw error;
       failBatch(store, batch, error, warnings, inputs);
     }
   }

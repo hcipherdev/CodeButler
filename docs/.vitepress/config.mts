@@ -22,9 +22,18 @@ export default defineConfig({
           { text: "Quick Start", link: "/quickstart" },
           { text: "MCP Setup", link: "/mcp-setup" },
           { text: "Retrieval", link: "/retrieval" },
+          { text: "Published Retrieval", link: "/retrieval-qualification" },
+          { text: "Global Rules", link: "/global-rules" },
           { text: "Operations", link: "/operations" },
           { text: "Privacy", link: "/privacy" },
           { text: "Architecture", link: "/architecture.html" },
+        ],
+      },
+      {
+        text: "Encrypted Sync",
+        items: [
+          { text: "Protocol", link: "/encrypted-sync-protocol" },
+          { text: "Secrets Folder Sync", link: "/secrets-sync" },
         ],
       },
     ],

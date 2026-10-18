@@ -1,4 +1,6 @@
 import { existsSync, realpathSync, statSync } from "node:fs";
+import { measured } from "../retrieval/metrics.js";
+import { withReadCache, cachedRead } from "../retrieval/read-cache.js";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import type { MemoryStore } from "../storage/store.js";
@@ -19,9 +21,20 @@ export function resolveEvidenceCitations(
   store: MemoryStore,
   input: ResolveEvidenceInput
 ): EvidenceCitation[] {
-  const citations = input.evidence.map((evidence) => resolveEvidenceCitation(store, evidence));
-  for (const filePath of input.relatedFiles ?? []) {
-    citations.push(resolveFileCitation(store, filePath));
+  return measured("citations",()=>withReadCache(()=>{
+    store.prefetchCitationReads(input.evidence);
+    return resolveCitations(store,input);
+  }));
+}
+function resolveCitations(store:MemoryStore,input:ResolveEvidenceInput):EvidenceCitation[] {
+  const seen = new Set<string>();
+  const citations = input.evidence.filter(evidence => {
+    const key = JSON.stringify([evidence.sourceType, evidence.sourceId, evidence.locator]);
+    if (seen.has(key)) return false;
+    seen.add(key); return true;
+  }).map((evidence) => resolveEvidenceCitation(store, evidence));
+  for (const filePath of new Set(input.relatedFiles ?? [])) {
+    citations.push(cachedRead(store,`file:${filePath}`,()=>resolveFileCitation(store.paths.rootDir, filePath)));
   }
   if (input.includeProjectSummary) {
     const summaryPath = join(store.paths.dataDir, "project-summary.md");
@@ -111,7 +124,7 @@ function resolveEvidenceCitation(store: MemoryStore, evidence: EvidenceRef): Evi
     };
   }
 
-  const source = store.readSource(evidence.sourceId);
+  const source = store.readSourceMetadata(evidence.sourceId);
   if (!source) return missingCitation(evidence);
   if (evidence.sourceType === "conversation") {
     const chunk = readLocatedChunk(store, evidence);
@@ -134,7 +147,7 @@ function resolveEvidenceCitation(store: MemoryStore, evidence: EvidenceRef): Evi
       sourceId: evidence.sourceId,
       locator: evidence.locator,
       label,
-      summary: summarizeText(chunk?.text ?? source.rawContent),
+      summary: summarizeText(chunk.text),
       resolved: true,
       metadata: source.metadata
     };
@@ -145,14 +158,14 @@ function resolveEvidenceCitation(store: MemoryStore, evidence: EvidenceRef): Evi
     sourceId: evidence.sourceId,
     locator: evidence.locator,
     label: `decision: ${source.title}`,
-    summary: summarizeText(source.rawContent),
+    summary: summarizeText(store.readSource(evidence.sourceId)?.rawContent ?? ""),
     resolved: true,
     metadata: source.metadata
   };
 }
 
-function resolveFileCitation(store: MemoryStore, filePath: string): EvidenceCitation {
-  const rootPath = realpathSync(store.paths.rootDir);
+export function resolveFileCitation(root: string, filePath: string): EvidenceCitation {
+  const rootPath = realpathSync(root);
   const candidatePath = resolve(rootPath, filePath);
   const lexicalRelative = normalizePath(relative(rootPath, candidatePath));
   const displayPath = isContainedRelativePath(lexicalRelative)

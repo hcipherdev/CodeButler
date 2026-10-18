@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { runCli } from "../src/cli.js";
+import { rememberProjectMemory } from "../src/memory/remember.js";
+import { resolveMemoryReview } from "../src/memory/review.js";
 import { auditPrivacy, exportPrivacy, importPrivacy } from "../src/privacy/service.js";
 import { PRIVACY_EXPORT_TABLES } from "../src/privacy/export-format.js";
 import { openConfiguredMemoryStore } from "../src/storage/open-configured-store.js";
@@ -51,7 +53,7 @@ describe("privacy audit and export", () => {
     expect(result.redacted).toBe(true);
     expect(document).toMatchObject({
       format: "code-butler-privacy-export",
-      version: 1,
+      version: 2,
       redacted: true
     });
     expect(content).not.toContain("sk-proj-abcdefghijklmnopqrstuvwxyz123456");
@@ -119,6 +121,61 @@ describe("privacy audit and export", () => {
     expect(() => importPrivacy(target, { inputPath: outputPath })).toThrow(
       "Import into non-empty storage requires --confirm-nonempty"
     );
+    target.close();
+  });
+
+  it("round-trips and redacts append-only memory review records", () => {
+    const localSentinel = "DEVICE_LOCAL_RECONCILIATION_SENTINEL";
+    const sourceRoot = makeTempDir();
+    const targetRoot = makeTempDir();
+    tempDirs.push(sourceRoot, targetRoot);
+    const source = openConfiguredMemoryStore(sourceRoot);
+    source.init();
+    const remembered = rememberProjectMemory(source, {
+      type: "constraint",
+      text: "Review privacy exports before sharing them.",
+      promote: false
+    }, { actor: "cli" });
+    source.updateMemoryQuality("candidate", remembered.candidate.id, {
+      qualityStatus: "needs_review",
+      qualityReasons: ["curator_note"]
+    });
+    const reviewToken = source.readMemorySearchResultsByIds([remembered.candidate.id], { includeCandidates: true })[0]!.reviewToken!;
+    resolveMemoryReview(source, {
+      memoryId: remembered.candidate.id,
+      category: "candidate",
+      action: "verify",
+      reason: "Confirmed without exposing sk-proj-abcdefghijklmnopqrstuvwxyz123456.",
+      reviewToken,
+      now: "2026-09-20T10:00:00.000Z"
+    }, "cli");
+    source.updateMemoryQuality("candidate", remembered.candidate.id, {
+      qualityStatus: "needs_review",
+      qualityReasons: [localSentinel]
+    });
+    const outputPath = join(sourceRoot, "review-export.json");
+    exportPrivacy(source, { outputPath });
+    source.close();
+
+    const content = readFileSync(outputPath, "utf8");
+    const document = JSON.parse(content) as { tables: Record<string, Array<Record<string, unknown>>> };
+    expect(document.tables.memory_review_resolutions).toHaveLength(1);
+    expect(document.tables).not.toHaveProperty("memory_quality_cache");
+    expect(document.tables).not.toHaveProperty("memory_reconciliation_runs");
+    expect(document.tables).not.toHaveProperty("memory_reconciliation_items");
+    expect(content).not.toContain(localSentinel);
+    expect(content).not.toContain("sk-proj-abcdefghijklmnopqrstuvwxyz123456");
+    expect(content).toContain("[REDACTED:API_KEY]");
+
+    const target = openConfiguredMemoryStore(targetRoot);
+    target.init();
+    importPrivacy(target, { inputPath: outputPath });
+    expect(target.db.prepare("select action, actor from memory_review_resolutions where memory_id = ?").get(remembered.candidate.id))
+      .toEqual({ action: "verify", actor: "cli" });
+    expect(target.readMemorySearchResultsByIds([remembered.candidate.id], { includeCandidates: true })[0]).toMatchObject({
+      review: { action: "verify", current: true },
+      trust: { displayStatus: "human_verified" }
+    });
     target.close();
   });
 

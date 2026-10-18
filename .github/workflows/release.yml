@@ -1,0 +1,116 @@
+name: Release
+
+# Builds the native crypto helper on each supported platform, publishes the npm
+# package with every platform's verified helper, and opens a draft GitHub
+# release. Desktop installers are attached to the draft by hand, then the draft
+# is published.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native helper (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-15
+            platform: darwin-arm64
+          - os: macos-15-intel
+            platform: darwin-x64
+          - os: windows-latest
+            platform: win32-x64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and package the native helper
+        run: npm run package:crypto
+
+      - name: Build package
+        run: npm run build
+
+      - name: Smoke-test the packaged helper
+        run: npm run test:native-package
+
+      - name: Upload helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: dist/native/${{ matrix.platform }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: native
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Check tag matches package version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          test "v${version}" = "${GITHUB_REF_NAME}" || { echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}"; exit 1; }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download native helpers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-artifacts
+
+      - name: Place native helpers
+        run: |
+          for platform in darwin-arm64 darwin-x64 win32-x64; do
+            mkdir -p "dist/native/${platform}"
+            cp -R "native-artifacts/native-${platform}/." "dist/native/${platform}/"
+          done
+          chmod +x dist/native/darwin-*/butler-crypto
+
+      - name: Verify native helpers
+        run: npm run check:native-package
+
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create draft GitHub release
+        run: gh release create "${GITHUB_REF_NAME}" --draft --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+        env:
+          GH_TOKEN: ${{ github.token }}

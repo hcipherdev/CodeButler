@@ -11,7 +11,7 @@ import type {
   ProjectConfig
 } from "../types.js";
 import type { MemoryStore } from "../storage/store.js";
-import { withTransaction } from "../storage/transactions.js";
+import { afterCommit, withTransaction } from "../storage/transactions.js";
 import { CORE_LAYER, layerLabel, parseLayer } from "./layer.js";
 import {
   classifyBranch,
@@ -22,6 +22,7 @@ import {
 } from "./branch-state.js";
 import { updateMemoryStatus } from "./lifecycle-service.js";
 import { peerLayers } from "./peer-layer.js";
+import { recordMemoryEvent } from "./events.js";
 
 /**
  * Bumping this re-opens every stored decision, the same contract as
@@ -421,11 +422,14 @@ function archive(
     .listMemoryCandidates({ qualityStatus: "all", limit: null })
     .find((item) => item.id === decision.memoryId);
   if (!current) return;
-  store.updateMemoryQuality("candidate", decision.memoryId, {
+  afterCommit(store.db, () => store.updateMemoryQuality("candidate", decision.memoryId, {
     qualityStatus: "quarantined",
     qualityReasons: [...new Set([...current.qualityReasons, ARCHIVE_QUALITY_REASON])].sort(),
     lastVerifiedAt: now
-  });
+  }));
+  recordMemoryEvent(store.db, store.contentPolicy, { kind: "withdrawn", memoryId: decision.memoryId,
+    category: "candidate", layer: decision.layer, reason: archiveReason(decision), actor, at: now,
+    key: `retention:${decision.category}:${decision.memoryId}:${decision.memoryVersion}:${decision.policyVersion}` });
 }
 
 function archiveReason(decision: LayerRetentionDecision): string {

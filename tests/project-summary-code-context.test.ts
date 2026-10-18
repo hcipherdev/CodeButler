@@ -1,3 +1,4 @@
+// Tests bounded, tracked and privacy-filtered code context for project summaries.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
@@ -558,7 +559,7 @@ describe("project summary code context", () => {
     );
   });
 
-  it("rejects unsafe tracked paths, deleted files, symlinks, and binary content", () => {
+  it.runIf(sep === "/")("rejects unsafe tracked paths, deleted files, symlinks, and binary content", () => {
     const rootDir = createRepo({
       ".gitignore": "ignored/\n",
       "src/safe.ts": "export const safe = true;\n",

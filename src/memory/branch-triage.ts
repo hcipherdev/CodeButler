@@ -3,11 +3,12 @@ import { randomUUID } from "node:crypto";
 import { hashOperationIdentifier, recordCompletedOperation } from "../operations/log.js";
 import type { BranchTriageAction, DurableMemory, MemoryCandidate, MemoryType, OperationActor } from "../types.js";
 import type { MemoryStore } from "../storage/store.js";
-import { withTransaction } from "../storage/transactions.js";
+import { afterCommit, withTransaction } from "../storage/transactions.js";
 import { CORE_LAYER, layerLabel, parseLayer, sanitizeLayer } from "./layer.js";
 import { classifyBranch, readGitBranchFacts, type BranchState } from "./branch-state.js";
 import { updateMemoryStatus } from "./lifecycle-service.js";
 import { updateMemoryLayer } from "./layer-service.js";
+import { recordMemoryEvent } from "./events.js";
 import { assertWritableLayer } from "./peer-layer.js";
 
 export type BranchTriageCategory = "candidate" | "promoted";
@@ -20,7 +21,8 @@ export interface SuggestBranchMemoryTriageInput {
   includeActive?: boolean | undefined;
   staleDays?: number | undefined;
   includeReviewed?: boolean | undefined;
-  limit?: number | undefined;
+  /** `null` is internal-only (automatic promotion): return every item instead of the capped top list. */
+  limit?: number | null | undefined;
   now?: string | undefined;
 }
 
@@ -200,7 +202,7 @@ export function resolveBranchMemoryTriage(
 
     if (input.action === "promote_to_core") {
       if (input.category === "candidate") {
-        memory = store.promoteMemoryCandidate(item.memory.id, "manual", { layer: CORE_LAYER });
+        memory = store.promoteMemoryCandidate(item.memory.id, "manual", { layer: CORE_LAYER, actor });
         promotedMemoryId = memory.id;
       } else {
         const moved = updateMemoryLayer(store, {
@@ -225,12 +227,14 @@ export function resolveBranchMemoryTriage(
     } else if (input.action === "discard") {
       if (input.category === "candidate") {
         const existingReasons = "qualityReasons" in item.memory ? item.memory.qualityReasons : [];
-        store.updateMemoryQuality("candidate", item.memory.id, {
-          qualityStatus: "quarantined",
+        const quality = {
+          qualityStatus: "quarantined" as const,
           qualityReasons: [...new Set([...existingReasons, DISCARD_REASON])].sort(),
           lastVerifiedAt: reviewedAt
-        });
-        candidate = readAnyCandidate(store, item.memory.id);
+        };
+        afterCommit(store.db, () => store.updateMemoryQuality("candidate", item.memory.id, quality));
+        candidate = { ...item.memory as MemoryCandidate, ...quality };
+        recordMemoryEvent(store.db,store.contentPolicy,{kind:"withdrawn",memoryId:item.memory.id,category:"candidate",layer:item.layer,reason,actor,at:reviewedAt,key:`branch-discard:${item.memory.id}:${item.memoryVersion}`});
       } else {
         memory = updateMemoryStatus(store, {
           memoryId: item.memory.id,
@@ -350,12 +354,6 @@ function readTriageItem(store: MemoryStore, rawId: string, category: BranchTriag
 function readCandidate(store: MemoryStore, id: string): MemoryCandidate | undefined {
   return store
     .listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: null })
-    .find((candidate) => candidate.id === id);
-}
-
-function readAnyCandidate(store: MemoryStore, id: string): MemoryCandidate | undefined {
-  return store
-    .listMemoryCandidates({ qualityStatus: "all", limit: null })
     .find((candidate) => candidate.id === id);
 }
 
@@ -582,7 +580,8 @@ function normalizeStaleDays(value: number | undefined): number {
   return value;
 }
 
-function normalizeLimit(value: number | undefined): number {
+function normalizeLimit(value: number | null | undefined): number {
+  if (value === null) return Number.POSITIVE_INFINITY;
   if (value === undefined) return DEFAULT_LIMIT;
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error("limit must be a positive integer");
   return Math.min(value, MAX_LIMIT);

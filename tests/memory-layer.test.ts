@@ -239,9 +239,19 @@ it("suggests high-signal non-core durable memories for reviewed promotion to cor
     text: "This laptop keeps the staging token in Keychain.",
     layer: `device:${DEVICE}`
   });
+  s.addCommit({
+    hash: "branch-review-evidence",
+    authorName: "Test User",
+    authorEmail: "test@example.com",
+    authoredAt: "2026-09-22T00:00:00.000Z",
+    message: "Document branch memory",
+    changedFiles: ["README.md"],
+    diffSummary: "Document the branch-specific file-watching decision."
+  });
   const branchCandidate = s.upsertMemoryCandidate({
     ...mem("branch:feature-layered-memory", "branch-review"),
-    scope: { kind: "project" }
+    scope: { kind: "project" },
+    evidence: [{ sourceType: "commit", sourceId: "branch-review-evidence" }]
   });
 
   const result = suggestMemoryLayerPromotions(s, { limit: 10 });
@@ -271,7 +281,7 @@ it("backfills existing rows to core when upgrading schema 12", () => {
   const s = openMemoryStore(root()); stores.push(s);
   initializeSchema(s.db, s.paths.databasePath, { migrations: SCHEMA_MIGRATIONS.slice(0, 12) });
   s.db.exec(`insert into temporary_memories (base_id,id,project_id,kind,title,summary,details,related_files_json,evidence_json,confidence,created_at,updated_at,expires_at) values ('legacy','legacy','project','task_state','old','old','old','[]','[]',1,'2026-01-01','2026-01-01','2030-01-01')`);
-  s.db.exec(`insert into memories (id,type,title,summary,reason,confidence,evidence_json,related_files_json,dedupe_key,evidence_signature,source,quality_status,quality_reasons_json,subject_key,lifecycle_status,valid_from,status_changed_at,created_at,promoted_at) values ('legacy-memory','decision','t','s','r',1,'[]','[]','dk','sig','manual','active','[]','decision:t','current','2026-01-01','2026-01-01','2026-01-01','2026-01-01')`);
+  s.db.exec(`insert into memories (id,type,title,summary,reason,confidence,evidence_json,related_files_json,dedupe_key,evidence_signature,source,subject_key,lifecycle_status,valid_from,status_changed_at,created_at,promoted_at) values ('legacy-memory','decision','t','s','r',1,'[]','[]','dk','sig','manual','decision:t','current','2026-01-01','2026-01-01','2026-01-01','2026-01-01')`);
   const before = s.db.prepare("select count(*) as n from temporary_memories").get();
   s.init();
   expect(s.db.prepare("pragma foreign_key_check").all()).toEqual([]);

@@ -1,4 +1,5 @@
-import { normalizeScope, SCOPE_EXTRACTION_GUIDANCE } from "../memory/scope.js";
+import { createStatement, parseStatement } from "../memory/statement.js";
+import { normalizeScope } from "../memory/scope.js";
 import {
   anthropicAwsRequestConfig,
   readAnthropicAwsText,
@@ -6,6 +7,8 @@ import {
   type AnthropicAwsHttpClient
 } from "../providers/anthropic-aws.js";
 import { parseJsonFromModelText } from "../json.js";
+import { DEFAULT_EXTRACTION_OUTPUT_TOKENS, extractionBatches, extractionOutputGuidance, memoryRecordProblem } from "./context.js";
+import { EXTRACTOR_SYSTEM_PROMPT, withInferredEvidenceTypes } from "./prompt.js";
 import type {
   EvidenceRef,
   ExtractedMemory,
@@ -18,36 +21,31 @@ import type {
 
 const VALID_MEMORY_TYPES: MemoryType[] = ["decision", "bug_fix", "constraint", "rejected_approach"];
 
-const EXTRACTOR_SYSTEM_PROMPT =
-  "Extract durable project memories. Respond with strict JSON shaped as {\"memories\": [...]}. " +
-  "Conversation evidence must include the exact supplied source ID and exact supplied chunk ID as locator." + SCOPE_EXTRACTION_GUIDANCE;
-
 export function createAnthropicAwsExtractor(
   config: ExtractorConfig,
   httpClient?: AnthropicAwsHttpClient
 ): ExtractorProvider {
   return {
     async extract(context: ExtractorContext): Promise<ExtractorResult> {
-      const requestConfig = anthropicAwsRequestConfig(config);
-      const payload = await runAnthropicAwsMessage(
-        {
-          ...requestConfig,
-          maxTokens: requestConfig.maxTokens,
-          system: EXTRACTOR_SYSTEM_PROMPT,
-          messages: [
-            {
-              role: "user",
-              content: JSON.stringify({
-                conversations: sanitizeConversations(context.conversations),
-                commits: context.commits
-              })
-            }
-          ]
-        },
-        httpClient
-      );
-      const parsed = parseJsonFromModelText(readAnthropicAwsText(payload));
-      return readMemories(parsed, context);
+      const requestConfig = anthropicAwsRequestConfig({ ...config, maxTokens: config.maxTokens ?? DEFAULT_EXTRACTION_OUTPUT_TOKENS });
+      const result: ExtractorResult = { memories: [], rejected: [] };
+      for (const batch of extractionBatches(context)) {
+        const payload = await runAnthropicAwsMessage(
+          {
+            ...requestConfig,
+            maxTokens: requestConfig.maxTokens,
+            system: EXTRACTOR_SYSTEM_PROMPT + extractionOutputGuidance(requestConfig.maxTokens),
+            messages: [{ role: "user", content: JSON.stringify(batch) }]
+          },
+          httpClient
+        );
+        const parsed = parseJsonFromModelText(readAnthropicAwsText(payload));
+        const extracted = readMemories(parsed, batch);
+        const offset = result.memories.length + result.rejected.length;
+        result.memories.push(...extracted.memories);
+        result.rejected.push(...extracted.rejected.map(item => ({ ...item, index: item.index + offset })));
+      }
+      return result;
     }
   };
 }
@@ -60,7 +58,8 @@ function readMemories(payload: unknown, context: ExtractorContext): ExtractorRes
   }
   const extracted: ExtractedMemory[] = [];
   const rejected: ExtractorResult["rejected"] = [];
-  for (const [index, value] of memories.entries()) {
+  for (const [index, raw] of memories.entries()) {
+    const value = withInferredEvidenceTypes(raw, context);
     const evidenceReason = invalidConversationEvidenceReason(value, context);
     if (evidenceReason) {
       rejected.push({ index, reason: evidenceReason });
@@ -69,7 +68,7 @@ function readMemories(payload: unknown, context: ExtractorContext): ExtractorRes
     let memory: ExtractedMemory | undefined;
     try { memory = parseMemory(value); } catch { memory = undefined; }
     if (!memory) {
-      rejected.push({ index, reason: "invalid_memory_record" });
+      rejected.push({ index, reason: "invalid_memory_record", detail: memoryRecordProblem(asRecord(value), VALID_MEMORY_TYPES) });
       continue;
     }
     extracted.push(memory);
@@ -105,11 +104,13 @@ function parseMemory(value: unknown): ExtractedMemory | undefined {
     return undefined;
   }
 
+  const statement = parseStatement(record?.statement, type, "extracted") ?? createStatement(summary, type, "extracted");
   return {
     scope: normalizeScope(record?.scope),
     type,
     title,
-    summary,
+    summary: statement.text,
+    statement,
     reason,
     confidence,
     evidence,
@@ -152,33 +153,4 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
-}
-
-function sanitizeConversations(context: ExtractorContext["conversations"]): ExtractorContext["conversations"] {
-  return context.map((conversation) => {
-    const chunks = conversation.chunks
-      ?.filter((chunk) => !isLowSignalText(chunk.text))
-      .map((chunk, index) => ({
-        ...chunk,
-        id: chunk.id ?? `${conversation.sourceId}:chunk:${chunk.chunkIndex ?? index}`,
-        sourceId: conversation.sourceId
-      }));
-    const sanitized: ExtractorContext["conversations"][number] = {
-      ...conversation,
-      rawContent: isLowSignalText(conversation.rawContent) ? "" : conversation.rawContent
-    };
-    if (chunks !== undefined) sanitized.chunks = chunks;
-    return sanitized;
-  });
-}
-
-function isLowSignalText(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed) return true;
-  const tagMatches = trimmed.match(/<\/?[a-z][^>]*>/gi) ?? [];
-  if (tagMatches.length >= 4) return true;
-  if (/^```/.test(trimmed)) return true;
-  if (/^\{[\s\S]*"[^"]+"\s*:/.test(trimmed)) return true;
-  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  return lines.filter((line) => /^[+-]\s*\S/.test(line)).length >= 4;
 }

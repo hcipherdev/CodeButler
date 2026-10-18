@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { closeRetrievalReaders, publishRetrieval, RetrievalUnavailableError } from "../src/retrieval/index.js";
+import { findPublishedMemories } from "../src/retrieval/search.js";
+import { purgeRetrieval } from "../src/retrieval/privacy.js";
 
 import { createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey, encodeFloat32Vector } from "../src/embeddings/fingerprint.js";
 import {
@@ -47,6 +52,24 @@ describe("hybrid ranking", () => {
 });
 
 describe("hybrid search service", () => {
+  it("preserves published hybrid hydration and fallback, and rejects results after privacy revocation", async () => {
+    const root=makeTempDir();const store=openMemoryStore(root);store.init();
+    try {
+      const cfg=config("hybrid",true);
+      writeFileSync(join(root,".code-butler","config.json"),JSON.stringify({retrieval:cfg.retrieval,embeddings:cfg.embeddings,privacy:cfg.privacy}));
+      promote(store,"decision","semantic","semantic concept","active");
+      promote(store,"decision","lexical","needle lexical","active");
+      const p=provider([1,0]);seedVectors(store,p);
+      const input={query:"needle",qualityStatus:"all" as const,limit:5};
+      const expected=await findProjectMemories(store,cfg,input,{provider:p});
+      publishRetrieval(store,root,"fixture");
+      expect((await findPublishedMemories(root,input,{provider:p})).results).toEqual(expected);
+      const failing=provider([1,0],()=>{throw new Error("offline");});
+      expect((await findPublishedMemories(root,input,{provider:failing})).results).toEqual(store.searchMemoryLayer(input));
+      const revoked=provider([1,0],()=>purgeRetrieval(root));
+      await expect(findPublishedMemories(root,input,{provider:revoked})).rejects.toThrow(RetrievalUnavailableError);
+    } finally {closeRetrievalReaders();store.close();cleanupTempDir(root);}
+  });
   it("returns the exact lexical result without calling a provider in FTS mode", async () => {
     const root = makeTempDir();
     const store = openMemoryStore(root);
@@ -205,11 +228,11 @@ describe("hybrid search service", () => {
     const candidate = store.upsertMemoryCandidate({
       type: "decision", title: "Lexical candidate", summary: "needle candidate", reason: "test", confidence: 0.9,
       evidence: [], relatedFiles: [], dedupeKey: "candidate"
-    });
+    }, { qualityStatus: "active", qualityReasons: [] });
     const promotedCandidate = store.upsertMemoryCandidate({
       type: "decision", title: "Semantic memory", summary: "semantic promoted", reason: "test", confidence: 0.9,
       evidence: [], relatedFiles: [], dedupeKey: "promoted"
-    });
+    }, { qualityStatus: "active", qualityReasons: [] });
     const promoted = store.promoteMemoryCandidate(promotedCandidate.id);
     const p = provider([1, 0]);
     const owners = store.listEmbeddingOwners();
@@ -309,7 +332,7 @@ function config(mode: "fts" | "hybrid", enabled: boolean): ProjectConfig {
   return {
     configPath: "test", sources: {} as ProjectConfig["sources"], extractor: {} as ProjectConfig["extractor"],
     investigator: {} as ProjectConfig["investigator"], promotion: {} as ProjectConfig["promotion"],
-    sync: { autoSyncOnServerStart: false, shareLocalLayers: "durable" }, retrieval: { mode, rrfK: 60 },
+    sync: { autoSyncOnServerStart: false, shareLocalLayers: "durable", conflictPolicy: "merge" }, retrieval: { mode, rrfK: 60 },
     embeddings: { enabled, provider: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", model: "model", batchSize: 16 },
     privacy: { allowRemoteEmbeddings: false }, deterministic: {} as ProjectConfig["deterministic"]
   };

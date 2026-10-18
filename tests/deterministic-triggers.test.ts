@@ -256,4 +256,30 @@ describe("deterministic memory triggers", () => {
       "deterministic:decision-file:docs/adr/001-memory.md:deterministic-memory-triggers"
     ]);
   });
+
+  it("does not create durable memories from legacy config keys or documentation headings", () => {
+    const result = extractDeterministicMemories(
+      {
+        conversations: [],
+        commits: [{
+          hash: "legacy-signals",
+          authorName: "Test User",
+          authorEmail: "test@example.com",
+          authoredAt: "2026-06-01T10:00:00Z",
+          message: "change config and docs",
+          changedFiles: ["package.json", "README.md"],
+          diffSummary: [
+            "diff --git a/package.json b/package.json",
+            '+  "newSetting": true,',
+            "diff --git a/README.md b/README.md",
+            "+## New documentation heading"
+          ].join("\n")
+        }]
+      },
+      { deterministic: baseConfig }
+    );
+
+    expect(result.memories).toEqual([]);
+    expect(result.promoteDedupeKeys).toEqual([]);
+  });
 });

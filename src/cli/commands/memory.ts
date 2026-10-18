@@ -3,7 +3,7 @@ import { defaultBranchMemoryLayer } from "../../memory/branch.js";
 import { layerLabel, normalizeLayer, normalizeLayerInput } from "../../memory/layer.js";
 import { updateMemoryLayer } from "../../memory/layer-service.js";
 import { suggestMemoryLayerPromotions } from "../../memory/layer-promotion.js";
-import { listPromotionDecisions, runAutomaticPromotions } from "../../memory/automatic-promotion.js";
+import { listPromotionDecisions, planAutomaticPromotions, runAutomaticPromotions, undoAutomaticPromotions } from "../../memory/automatic-promotion.js";
 import {
   listLayerRetentionDecisions,
   planLayerRetention,
@@ -15,10 +15,15 @@ import { formatMemoryOrigin } from "../../memory/origin.js";
 import { auditMemoryConflicts } from "../../memory/conflicts.js";
 import { updateMemoryStatus } from "../../memory/lifecycle-service.js";
 import { auditMemoryQuality } from "../../memory/quality.js";
+import { memoryStatementSchema, memoryStatementInputSchema } from "../../memory/statement.js";
 import { rememberProjectMemory } from "../../memory/remember.js";
+import { resolveMemoryReview, type MemoryCorrectionInput } from "../../memory/review.js";
 import { loadProjectConfig } from "../../config.js";
 import { openConfiguredMemoryStore } from "../../storage/open-configured-store.js";
 import type { MemoryLayerFilter, MemoryLifecycleStatus, MemoryType } from "../../types.js";
+import { runMemoryReconcileCommand } from "./memory-reconcile.js";
+import { exportMemoryHandbook } from "../../memory/export.js";
+import { projectOperation } from "../../cloud/client.js";
 
 export async function runMemoryCommand(
   args: string[],
@@ -27,8 +32,60 @@ export async function runMemoryCommand(
   options: { now?: (() => Date) | undefined } = {}
 ): Promise<number> {
   const [subcommand, ...rest] = args;
-  if (subcommand !== "audit" && subcommand !== "remember" && subcommand !== "status" && subcommand !== "conflicts" && subcommand !== "scope" && subcommand !== "layer" && subcommand !== "promotions" && subcommand !== "retention" && subcommand !== "branch-triage" && subcommand !== "branch-resolve") {
-    throw new Error("Usage: code-butler memory <audit|remember|scope|layer|promotions|retention|branch-triage|branch-resolve|status|conflicts> ...");
+  if(subcommand==="export") {
+    if(rest.some(a=>!["--dry-run","--json","--force"].includes(a)))throw new Error("Usage: code-butler memory export [--dry-run] [--json] [--force]");
+    return projectOperation(cwd,()=>{const store=openConfiguredMemoryStore(cwd);store.init();try{
+      const result=exportMemoryHandbook(store,{dryRun:rest.includes("--dry-run"),force:rest.includes("--force")});
+      stdout(rest.includes("--json")?JSON.stringify(result,null,2):`${result.dryRun?"Preview":"Exported"} ${result.memories} memories to ${result.directory}. ${result.changed.length} changed, ${result.removed.length} removed, ${result.blocked.length} protected; ${result.excludedMemories} memories excluded.`);
+      return result.blocked.length?1:0;
+    }finally{store.close();}},{name:"Export handbook",waitMs:0});
+  }
+  if (subcommand !== "audit" && subcommand !== "review" && subcommand !== "reconcile" && subcommand !== "remember" && subcommand !== "status" && subcommand !== "conflicts" && subcommand !== "scope" && subcommand !== "layer" && subcommand !== "promotions" && subcommand !== "retention" && subcommand !== "branch-triage" && subcommand !== "branch-resolve") {
+    throw new Error("Usage: code-butler memory <export|audit|review|reconcile|remember|scope|layer|promotions|retention|branch-triage|branch-resolve|status|conflicts> ...");
+  }
+  if (subcommand === "reconcile") return runMemoryReconcileCommand(rest, cwd, stdout, options);
+  if (subcommand === "review") {
+    const allowed = new Set(["--id", "--category", "--action", "--reason", "--review-token", "--correction-json"]);
+    const unknownFlag = rest.find(arg => arg.startsWith("--") && !allowed.has(arg) && arg !== "--json");
+    if (unknownFlag) throw new Error(`Unknown memory review option: ${unknownFlag}`);
+    validateFlagArguments(rest, { command: "memory review", valueFlags: allowed, booleanFlags: new Set(["--json"]) });
+    const memoryId = parseStringFlag(rest, "--id");
+    const category = parseBranchTriageCategoryFlag(rest, "--category");
+    const action = parseMemoryReviewActionFlag(rest, "--action");
+    const reason = parseStringFlag(rest, "--reason");
+    const reviewToken = parseStringFlag(rest, "--review-token");
+    const correctionJson = parseStringFlag(rest, "--correction-json");
+    if (!memoryId || !category || !action) {
+      throw new Error("Usage: code-butler memory review --id <id> --category <candidate|promoted> --action <verify|correct|discard> [--reason <text>] [--review-token <token>] [--correction-json <json>] [--json]");
+    }
+    if ((action === "correct" || action === "discard") && !reason?.trim()) {
+      throw new Error(`${action === "correct" ? "Correction" : "Discard"} reason is required`);
+    }
+    if (action === "correct" && correctionJson === undefined) {
+      throw new Error("--correction-json is required for the correct action");
+    }
+    if (action !== "correct" && correctionJson !== undefined) {
+      throw new Error("--correction-json is only allowed with the correct action");
+    }
+    const correction = correctionJson === undefined ? undefined : parseMemoryCorrectionJson(correctionJson);
+    const store = openConfiguredMemoryStore(cwd); store.init();
+    try {
+      const result = resolveMemoryReview(store, {
+        memoryId,
+        category,
+        action,
+        ...(reason === undefined ? {} : { reason }),
+        ...(reviewToken === undefined ? {} : { reviewToken }),
+        ...(correction === undefined ? {} : { correction }),
+        ...(options.now === undefined ? {} : { now: options.now().toISOString() })
+      }, "cli");
+      if (rest.includes("--json")) stdout(JSON.stringify(result, null, 2));
+      else {
+        stdout(`Reviewed ${category} memory ${memoryId}: ${action}`);
+        if (result.replacement) stdout(`Replacement: ${result.replacement.id}`);
+      }
+      return 0;
+    } finally { store.close(); }
   }
   if (subcommand === "scope") {
     const allowed = new Set(["--id", "--category", "--scope-json", "--reason"]);
@@ -69,16 +126,17 @@ export async function runMemoryCommand(
     } finally { store.close(); }
   }
   if (subcommand === "promotions") {
-    const allowed = new Set(["--layer", "--min-score", "--min-confidence", "--limit", "--id"]);
-    const booleanFlags = new Set(["--json", "--promoted-only", "--apply", "--history"]);
+    const allowed = new Set(["--layer", "--min-score", "--min-confidence", "--limit", "--id", "--since"]);
+    const booleanFlags = new Set(["--json", "--promoted-only", "--apply", "--history", "--plan", "--undo"]);
     const unknownFlag = rest.find(arg => arg.startsWith("--") && !allowed.has(arg) && !booleanFlags.has(arg));
     if (unknownFlag) throw new Error(`Unknown memory promotions option: ${unknownFlag}`);
     validateFlagArguments(rest, { command: "memory promotions", valueFlags: allowed, booleanFlags });
-    if (rest.includes("--apply") && rest.includes("--history")) {
-      throw new Error("Use either --apply or --history, not both");
-    }
+    const modes = ["--apply", "--history", "--plan", "--undo"].filter(flag => rest.includes(flag));
+    if (modes.length > 1) throw new Error(`Use only one of ${modes.join(", ")}`);
     if (rest.includes("--history")) return promotionHistory(cwd, rest, stdout);
     if (rest.includes("--apply")) return applyPromotions(cwd, rest, stdout, options);
+    if (rest.includes("--plan")) return planPromotions(cwd, rest, stdout, options);
+    if (rest.includes("--undo")) return undoPromotions(cwd, rest, stdout, options);
     const layer = parseLayerFilterFlag(rest, "--layer");
     const minScore = parseUnitIntervalFlag(rest, "--min-score");
     const minConfidence = parseUnitIntervalFlag(rest, "--min-confidence");
@@ -201,6 +259,8 @@ export async function runMemoryCommand(
   if (subcommand === "remember") {
     const rawScope = parseStringFlag(rest, "--scope-json");
     const scope = rawScope === undefined ? undefined : normalizeScope(JSON.parse(rawScope));
+    const rawStatement = parseStringFlag(rest, "--statement-json");
+    const statement = rawStatement ? memoryStatementInputSchema.parse(JSON.parse(rawStatement)) : undefined;
     const type = parseMemoryTypeFlag(rest, "--type");
     const text = parseStringFlag(rest, "--text");
     const title = parseStringFlag(rest, "--title");
@@ -209,17 +269,17 @@ export async function runMemoryCommand(
     const supersedesMemoryId = parseStringFlag(rest, "--supersedes");
     const layer = parseStringFlag(rest, "--layer");
     const promote = !rest.includes("--candidate");
-    const allowedFlags = new Set(["--type", "--text", "--title", "--reason", "--related-file", "--candidate", "--supersedes", "--json", "--scope-json", "--layer"]);
+    const allowedFlags = new Set(["--type", "--text", "--title", "--reason", "--related-file", "--candidate", "--supersedes", "--json", "--scope-json", "--layer", "--statement-json"]);
     const unknownFlag = rest.find((arg) => arg.startsWith("--") && !allowedFlags.has(arg));
     if (unknownFlag) throw new Error(`Unknown memory remember option: ${unknownFlag}`);
     validateFlagArguments(rest, {
       command: "memory remember",
-      valueFlags: new Set(["--type", "--text", "--title", "--reason", "--related-file", "--supersedes", "--scope-json", "--layer"]),
+      valueFlags: new Set(["--type", "--text", "--title", "--reason", "--related-file", "--supersedes", "--scope-json", "--layer", "--statement-json"]),
       booleanFlags: new Set(["--candidate", "--json"])
     });
     if (!type || !text) {
       throw new Error(
-        "Usage: code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>] [--scope-json <json>] [--layer <core|device:<id>|branch:<name>>] [--json]"
+        "Usage: code-butler memory remember --type <decision|constraint|bug_fix|rejected_approach> --text <text> [--title <title>] [--reason <reason>] [--related-file <path>] [--candidate] [--supersedes <memory-id>] [--scope-json <json>] [--layer <core|device:<id>|branch:<name>>] [--statement-json <json>] [--json]"
       );
     }
     if (!promote && supersedesMemoryId !== undefined) {
@@ -235,6 +295,7 @@ export async function runMemoryCommand(
         ...(scope === undefined ? {} : { scope }),
         ...(layer === undefined ? {} : { layer: normalizeLayer(layer) }),
         text,
+        ...(statement ? { statement } : {}),
         ...(title === undefined ? {} : { title }),
         ...(reason === undefined ? {} : { reason }),
         relatedFiles,
@@ -343,7 +404,7 @@ export async function runMemoryCommand(
     if (json) stdout(JSON.stringify(result, null, 2));
     else {
       stdout("Memory Audit");
-      stdout(`scanned=${result.scanned} active=${result.active} needs_review=${result.needsReview} quarantined=${result.quarantined} updated=${result.updated}`);
+      stdout(`scanned=${result.scanned} active=${result.active} needs_review=${result.needsReview} quarantined=${result.quarantined} retired=${result.retired} replaced=${result.replaced} updated=${result.updated}`);
       for (const item of result.topReasons) stdout(`reason ${item.reason}=${item.count}`);
     }
     return 0;
@@ -395,6 +456,52 @@ function parseBranchTriageActionFlag(args: string[], flag: string): "promote_to_
   throw new Error(`${flag} must be one of promote_to_core, discard, retain_branch`);
 }
 
+function parseMemoryReviewActionFlag(args: string[], flag: string): "verify" | "correct" | "discard" | undefined {
+  const value = parseStringFlag(args, flag);
+  if (value === undefined) return undefined;
+  if (value === "verify" || value === "correct" || value === "discard") return value;
+  throw new Error(`${flag} must be one of verify, correct, discard`);
+}
+
+function parseMemoryCorrectionJson(raw: string): MemoryCorrectionInput {
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("--correction-json must be a JSON object");
+  }
+  const value = parsed as Record<string, unknown>;
+  const allowed = new Set(["type", "title", "text", "summary", "reason", "relatedFiles", "scope", "statement"]);
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown) throw new Error(`Unknown correction field: ${unknown}`);
+  const type = value.type;
+  if (type !== undefined && type !== "decision" && type !== "constraint" && type !== "bug_fix" && type !== "rejected_approach") {
+    throw new Error("Correction type must be one of decision, constraint, bug_fix, rejected_approach");
+  }
+  for (const field of ["title", "text", "summary", "reason"] as const) {
+    if (value[field] !== undefined && (typeof value[field] !== "string" || !value[field].trim())) {
+      throw new Error(`Correction ${field} must be a non-empty string`);
+    }
+  }
+  if (value.relatedFiles !== undefined && (!Array.isArray(value.relatedFiles) || value.relatedFiles.some((item) => typeof item !== "string" || !item.trim()))) {
+    throw new Error("Correction relatedFiles must be an array of non-empty strings");
+  }
+  if (value.scope !== undefined && (!value.scope || typeof value.scope !== "object" || Array.isArray(value.scope))) {
+    throw new Error("Correction scope must be an object");
+  }
+  if (value.text !== undefined && value.summary !== undefined && value.text !== value.summary) {
+    throw new Error("Correction text and summary must match when both are provided");
+  }
+  const correctedText = value.text ?? value.summary;
+  return {
+    ...(type === undefined ? {} : { type }),
+    ...(typeof value.title === "string" ? { title: value.title } : {}),
+    ...(typeof correctedText === "string" ? { text: correctedText } : {}),
+    ...(typeof value.reason === "string" ? { reason: value.reason } : {}),
+    ...(Array.isArray(value.relatedFiles) ? { relatedFiles: value.relatedFiles as string[] } : {}),
+    ...(value.scope === undefined ? {} : { scope: normalizeScope(value.scope) }),
+    ...(value.statement === undefined ? {} : { statement: memoryStatementSchema.parse(value.statement) })
+  };
+}
+
 function parseLayerFilterFlag(args: string[], flag: string): MemoryLayerFilter | undefined {
   const value = parseStringFlag(args, flag);
   if (value === undefined) return undefined;
@@ -425,6 +532,66 @@ function applyPromotions(
         `deferred=${summary.deferred} skipped=${summary.skipped}`
       );
       for (const warning of summary.warnings) stdout(`  warning: ${warning}`);
+    }
+    return 0;
+  } finally { store.close(); }
+}
+
+/** Read-only preview of what the next automatic promotion pass would decide. */
+function planPromotions(
+  cwd: string,
+  rest: string[],
+  stdout: (line: string) => void,
+  options: { now?: (() => Date) | undefined }
+): number {
+  const config = loadProjectConfig(cwd);
+  const store = openConfiguredMemoryStore(cwd); store.init();
+  try {
+    const plan = planAutomaticPromotions(store, config, {
+      repoPath: config.sources.git.repoPath,
+      ...(options.now === undefined ? {} : { now: options.now().toISOString() })
+    });
+    const counts = { promote: 0, converge: 0, defer: 0, skip: 0 };
+    for (const decision of plan.decisions) counts[decision.decision] += 1;
+    const actionable = plan.decisions.filter(decision => decision.decision !== "skip");
+    if (rest.includes("--json")) {
+      stdout(JSON.stringify({ enabled: plan.enabled, policyVersion: plan.policyVersion, scanned: plan.scanned, counts, decisions: actionable }, null, 2));
+      return 0;
+    }
+    stdout("Automatic Memory Promotion Plan (preview, nothing written)");
+    stdout(`enabled=${plan.enabled} policy=v${plan.policyVersion} scanned=${plan.scanned} ` +
+      `promote=${counts.promote} converge=${counts.converge} defer=${counts.defer} skip=${counts.skip}`);
+    for (const decision of actionable) {
+      stdout(`${decision.decision} ${decision.category} ${decision.memoryId} [${decision.currentLayerLabel}]: ${decision.title}`);
+      stdout(`  reasons: ${decision.reasonCodes.join(", ")}`);
+    }
+    return 0;
+  } finally { store.close(); }
+}
+
+function undoPromotions(
+  cwd: string,
+  rest: string[],
+  stdout: (line: string) => void,
+  options: { now?: (() => Date) | undefined }
+): number {
+  const since = parseStringFlag(rest, "--since");
+  const memoryId = parseStringFlag(rest, "--id");
+  if ((since === undefined) === (memoryId === undefined)) {
+    throw new Error("Usage: code-butler memory promotions --undo (--since <ISO time> | --id <candidate-id>) [--json]");
+  }
+  const store = openConfiguredMemoryStore(cwd); store.init();
+  try {
+    const result = undoAutomaticPromotions(store, {
+      ...(since === undefined ? {} : { since }),
+      ...(memoryId === undefined ? {} : { memoryId }),
+      ...(options.now === undefined ? {} : { now: options.now().toISOString() })
+    }, "cli");
+    if (rest.includes("--json")) stdout(JSON.stringify(result, null, 2));
+    else {
+      stdout("Undo Automatic Memory Promotion");
+      stdout(`undone=${result.undone} skipped=${result.skipped}`);
+      for (const item of result.items) stdout(`${item.outcome} ${item.memoryId} (durable ${item.durableMemoryId})`);
     }
     return 0;
   } finally { store.close(); }

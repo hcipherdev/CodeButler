@@ -4,8 +4,9 @@ import { stdin, stdout as terminal } from "node:process";
 import { z } from "zod";
 import { openConfiguredMemoryStore } from "../storage/open-configured-store.js";
 import { captureSnapshot } from "./snapshot.js";
-import { cloudSync, projectOperation, request } from "./client.js";
+import { legacyCloudSync as cloudSync, projectOperation, request } from "./client.js";
 import { atomicJson, binding, connection, connectionPath, saveBinding, serverUrl, UUID, type Connection } from "./state.js";
+import { runSecureCloudCommand } from "./secure-cli.js";
 
 async function readSecret(): Promise<string> {
   if (!stdin.isTTY) {
@@ -13,7 +14,7 @@ async function readSecret(): Promise<string> {
     for await (const chunk of stdin) { value += chunk.toString(); if (value.length > 256) throw new Error("Invalid beta code"); }
     return value.trim();
   }
-  terminal.write("Beta code (hidden): "); stdin.setRawMode(true); stdin.resume();
+  terminal.write("Code (hidden): "); stdin.setRawMode(true); stdin.resume();
   return new Promise((resolve, reject) => {
     let value = "";
     const finish = () => { stdin.setRawMode(false); stdin.pause(); stdin.off("data", read); terminal.write("\n"); };
@@ -29,6 +30,10 @@ async function readSecret(): Promise<string> {
   });
 }
 export async function runCloudCommand(args: string[], root: string, output: (line: string) => void, secretReader = readSecret): Promise<number> {
+  return runSecureCloudCommand(args, root, output, secretReader);
+}
+/** Retained temporarily for the legacy sync regression fixtures; no CLI entry routes here. */
+export async function runLegacyCloudCommand(args: string[], root: string, output: (line: string) => void, secretReader = readSecret): Promise<number> {
   const [command, ...rest] = args;
   const allowed: Record<string, string[]> = { connect: ["--server"], projects: [], enable: ["--project", "--name"], status: [], sync: [], disable: [], resolve: ["--keep"] };
   if (!command || !allowed[command]) throw new Error("Usage: code-butler cloud <connect|projects|enable|status|sync|disable|resolve>");

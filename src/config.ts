@@ -4,8 +4,10 @@ import { isAbsolute, join, resolve } from "node:path";
 
 import type { ArtifactRetentionConfig, ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, LayerRetentionConfig, ProjectConfig, RedactionPatternConfig } from "./types.js";
 import { validateRedactionPattern } from "./privacy/policy.js";
+import { assertProjectNotRemoved } from "./cloud/removal-state.js";
 
 interface ProjectConfigFile {
+  globalRules?: { enabled?: boolean; exclude?: string[] };
   sources?: {
     git?: Partial<ProjectConfig["sources"]["git"]>;
     codex?: Partial<ProjectConfig["sources"]["codex"]>;
@@ -43,11 +45,19 @@ interface ProjectConfigFile {
 type ProviderProfileConfig = Partial<ExtractorConfig>;
 
 interface GlobalConfigFile {
+  globalRules?: { enabled?: boolean; exclude?: string[] };
   defaults?: {
     extractorProfile?: string | undefined;
     investigatorProfile?: string | undefined;
   };
   profiles?: Record<string, ProviderProfileConfig>;
+  sources?: {
+    codex?: Partial<ProjectConfig["sources"]["codex"]>;
+    claude?: Partial<ProjectConfig["sources"]["claude"]>;
+  };
+  extractor?: ExtractorConfigInput;
+  investigator?: InvestigatorConfigInput;
+  embeddings?: Partial<ProjectConfig["embeddings"]>;
 }
 
 type ProviderKind = "extractor" | "investigator";
@@ -64,7 +74,6 @@ const PROVIDER_KEYS = [
 const PROJECT_CODE_BUTLER_IGNORE = [
   "/*",
   "!/.gitignore",
-  "!/config.json",
   "!/project-summary.md",
   ""
 ].join("\n");
@@ -87,14 +96,14 @@ export interface ConfigLocalMigrationResult {
 }
 
 export function ensureProjectConfig(rootDir: string): string {
+  if (existsSync(rootDir)) assertProjectNotRemoved(rootDir);
   const configPath = join(rootDir, ".code-butler", "config.json");
   mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
   ensureProjectGitignore(rootDir);
   ensureProjectEnvExample(rootDir);
-  ensureProjectLocalConfig(rootDir);
-  ensureProjectConfigExamples(rootDir);
   if (existsSync(configPath)) return configPath;
-  writeFileSync(configPath, JSON.stringify(defaultConfigFile(), null, 2));
+  ensureGlobalConfig();
+  writeFileSync(configPath, "{}\n");
   return configPath;
 }
 
@@ -118,6 +127,14 @@ export function loadProjectConfig(rootDir: string): ProjectConfig {
   return readProjectConfig(rootDir, configPath);
 }
 
+/** Resolve the reviewer without loading a project or creating configuration files. */
+export function loadGlobalReviewerConfig(): InvestigatorConfig {
+  loadGlobalEnv();
+  const global = loadGlobalConfig();
+  const defaults = defaultConfig(globalConfigDir(), join(globalConfigDir(), "config.json")).investigator;
+  return resolveProviderConfig("investigator", defaults, global, global.investigator);
+}
+
 export function loadExistingProjectConfig(rootDir: string): ProjectConfig {
   const configPath = join(rootDir, ".code-butler", "config.json");
   if (!existsSync(configPath)) {
@@ -132,7 +149,7 @@ export function projectLocalConfigPath(rootDir: string): string {
 
 export function portableProjectConfig(config: ConfigObject): ConfigObject {
   const result: ConfigObject = {};
-  for (const key of ["promotion", "deterministic", "privacy", "retention", "sync"]) {
+  for (const key of ["promotion", "deterministic", "privacy", "retention", "sync", "globalRules"]) {
     if (config[key] !== undefined) result[key] = config[key];
   }
   if (config.retrieval) result.retrieval = config.retrieval;
@@ -218,8 +235,12 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
     ? JSON.parse(readFileSync(localConfigPath, "utf8").trim() || "{}")
     : {};
   validateProjectConfigFile(localValue);
-  const parsed = mergeConfigFiles(parsedValue as ProjectConfigFile, localValue as ProjectConfigFile);
   const globalConfig = loadGlobalConfig();
+  const globalSettings = globalProjectConfig(globalConfig);
+  const parsed = mergeConfigFiles(
+    mergeConfigFiles(globalSettings, parsedValue as ProjectConfigFile),
+    localValue as ProjectConfigFile
+  );
   const defaults = defaultConfig(rootDir, configPath);
 
   const git = parsed.sources?.git ?? {};
@@ -229,6 +250,7 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
 
   return {
     configPath,
+    globalRules: { enabled: parsed.globalRules?.enabled ?? true, exclude: parsed.globalRules?.exclude ?? [] },
     sources: {
       git: {
         ...defaults.sources.git,
@@ -336,6 +358,7 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
   const codexRoots = defaultCodexRoots(home);
   return {
     configPath,
+    globalRules: { enabled: true, exclude: [] },
     sources: {
       git: {
         enabled: true,
@@ -385,12 +408,15 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
         mode: "conservative",
         minScore: 0.85,
         mergedBranches: true,
-        deviceMemories: true
+        deviceMemories: true,
+        coreCandidates: true,
+        singleSourceMinConfidence: 0.9
       }
     },
     sync: {
       autoSyncOnServerStart: true,
-      shareLocalLayers: "durable"
+      shareLocalLayers: "durable",
+      conflictPolicy: "merge"
     },
     retrieval: {
       mode: "fts",
@@ -427,7 +453,7 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
       artifacts: {
         logs: { maxBytes: 5 * 1024 * 1024, maxFiles: 3 },
         projectSummaryBackups: { maxFiles: 5 },
-        recoveryBackups: { maxFiles: 5, minAgeDays: 7 },
+        recoveryBackups: { maxFiles: 2, minAgeDays: 2 },
         cloudHandles: { reapStale: true }
       }
     },
@@ -446,8 +472,14 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
   };
 }
 
-function validateProjectConfigFile(value: unknown): void {
+export function validateProjectConfigFile(value: unknown): void {
   if (!isConfigRecord(value)) throw new Error("Project config must be an object");
+  const rules = optionalConfigSection(value, "globalRules");
+  if (rules) {
+    assertKnownKeys(rules, new Set(["enabled", "exclude"]), "globalRules");
+    if (rules.enabled !== undefined && typeof rules.enabled !== "boolean") throw new Error("globalRules.enabled must be boolean");
+    if (rules.exclude !== undefined && (!Array.isArray(rules.exclude) || rules.exclude.length > 1000 || rules.exclude.some(id => typeof id !== "string" || id.length > 96))) throw new Error("globalRules.exclude must be rule ids");
+  }
   const retrieval = optionalConfigSection(value, "retrieval");
   if (retrieval) {
     if (retrieval.mode !== undefined && retrieval.mode !== "fts" && retrieval.mode !== "hybrid") {
@@ -502,16 +534,83 @@ function validateProjectConfigFile(value: unknown): void {
   const sync = value.sync;
   if (sync !== undefined) {
     if (!isConfigRecord(sync)) throw new Error("sync must be an object");
-    assertKnownKeys(sync, new Set(["autoSyncOnServerStart", "shareLocalLayers"]), "sync");
+    assertKnownKeys(sync, new Set(["autoSyncOnServerStart", "shareLocalLayers", "conflictPolicy"]), "sync");
     if (sync.autoSyncOnServerStart !== undefined && typeof sync.autoSyncOnServerStart !== "boolean") {
       throw new Error("sync.autoSyncOnServerStart must be a boolean");
     }
     if (sync.shareLocalLayers !== undefined && !["durable", "all", "none"].includes(String(sync.shareLocalLayers))) {
       throw new Error("sync.shareLocalLayers must be durable, all, or none");
     }
+    if (sync.conflictPolicy !== undefined && !["merge", "ask"].includes(String(sync.conflictPolicy))) {
+      throw new Error("sync.conflictPolicy must be merge or ask");
+    }
   }
   const retention = optionalConfigSection(value, "retention");
   if (retention) validateRetentionConfig(retention);
+}
+
+function validateGlobalConfigFile(value: unknown): void {
+  if (!isConfigRecord(value)) throw new Error("Global config must be an object");
+  assertKnownKeys(
+    value,
+    new Set(["defaults", "profiles", "sources", "extractor", "investigator", "embeddings", "globalRules"]),
+    "global config"
+  );
+  if (value.globalRules !== undefined) validateProjectConfigFile({ globalRules: value.globalRules });
+
+  if (value.defaults !== undefined) {
+    if (!isConfigRecord(value.defaults)) throw new Error("global.defaults must be an object");
+    assertKnownKeys(value.defaults, new Set(["extractorProfile", "investigatorProfile"]), "global.defaults");
+    for (const key of ["extractorProfile", "investigatorProfile"] as const) {
+      if (value.defaults[key] !== undefined && !isNonemptyString(value.defaults[key])) {
+        throw new Error(`global.defaults.${key} must be a nonempty string`);
+      }
+    }
+  }
+
+  if (value.profiles !== undefined) {
+    if (!isConfigRecord(value.profiles)) throw new Error("global.profiles must be an object");
+    for (const [name, profile] of Object.entries(value.profiles)) {
+      if (!isConfigRecord(profile)) throw new Error(`global.profiles.${name} must be an object`);
+    }
+  }
+
+  if (value.sources !== undefined) {
+    if (!isConfigRecord(value.sources)) throw new Error("global.sources must be an object");
+    assertKnownKeys(value.sources, new Set(["codex", "claude"]), "global.sources");
+    for (const adapter of ["codex", "claude"] as const) {
+      const source = value.sources[adapter];
+      if (source === undefined) continue;
+      if (!isConfigRecord(source)) throw new Error(`global.sources.${adapter} must be an object`);
+      assertKnownKeys(
+        source,
+        adapter === "codex"
+          ? new Set(["enabled", "roots", "includeDefaultRoots", "projectOnly"])
+          : new Set(["enabled", "roots", "projectOnly"]),
+        `global.sources.${adapter}`
+      );
+      if (source.enabled !== undefined && typeof source.enabled !== "boolean") {
+        throw new Error(`global.sources.${adapter}.enabled must be a boolean`);
+      }
+      if (source.projectOnly !== undefined && typeof source.projectOnly !== "boolean") {
+        throw new Error(`global.sources.${adapter}.projectOnly must be a boolean`);
+      }
+      if (adapter === "codex" && source.includeDefaultRoots !== undefined && typeof source.includeDefaultRoots !== "boolean") {
+        throw new Error("global.sources.codex.includeDefaultRoots must be a boolean");
+      }
+      if (source.roots !== undefined) {
+        if (!Array.isArray(source.roots) || source.roots.some(root => !isNonemptyString(root))) {
+          throw new Error(`global.sources.${adapter}.roots must be an array of nonempty strings`);
+        }
+      }
+    }
+  }
+
+  validateProjectConfigFile({
+    ...(value.extractor !== undefined ? { extractor: value.extractor } : {}),
+    ...(value.investigator !== undefined ? { investigator: value.investigator } : {}),
+    ...(value.embeddings !== undefined ? { embeddings: value.embeddings } : {})
+  });
 }
 
 function validatePromotionConfig(promotion: Record<string, unknown>): void {
@@ -534,10 +633,10 @@ function validatePromotionConfig(promotion: Record<string, unknown>): void {
   const automatic = promotion.automatic;
   assertKnownKeys(
     automatic,
-    new Set(["enabled", "mode", "minScore", "mergedBranches", "deviceMemories"]),
+    new Set(["enabled", "mode", "minScore", "mergedBranches", "deviceMemories", "coreCandidates", "singleSourceMinConfidence"]),
     "promotion.automatic"
   );
-  for (const flag of ["enabled", "mergedBranches", "deviceMemories"] as const) {
+  for (const flag of ["enabled", "mergedBranches", "deviceMemories", "coreCandidates"] as const) {
     if (automatic[flag] !== undefined && typeof automatic[flag] !== "boolean") {
       throw new Error(`promotion.automatic.${flag} must be a boolean`);
     }
@@ -548,6 +647,9 @@ function validatePromotionConfig(promotion: Record<string, unknown>): void {
   if (automatic.minScore !== undefined && !isUnitInterval(automatic.minScore)) {
     throw new Error("promotion.automatic.minScore must be a number between 0 and 1");
   }
+  if (automatic.singleSourceMinConfidence !== undefined && !isUnitInterval(automatic.singleSourceMinConfidence)) {
+    throw new Error("promotion.automatic.singleSourceMinConfidence must be a number between 0 and 1");
+  }
 }
 
 function isUnitInterval(value: unknown): value is number {
@@ -556,7 +658,7 @@ function isUnitInterval(value: unknown): value is number {
 
 function optionalConfigSection(
   config: Record<string, unknown>,
-  name: "retrieval" | "embeddings" | "privacy" | "retention" | "promotion"
+  name: "retrieval" | "embeddings" | "privacy" | "retention" | "promotion" | "globalRules"
 ): Record<string, unknown> | undefined {
   const value = config[name];
   if (value === undefined) return undefined;
@@ -763,86 +865,6 @@ function readProviderProfile(
   return profile;
 }
 
-function defaultConfigFile(): ProjectConfigFile {
-  return {
-    sources: {
-      git: {
-        enabled: true,
-        maxCommits: 200,
-        maxDiffChars: 12_000
-      },
-      codex: {
-        enabled: true,
-        projectOnly: true
-      },
-      claude: {
-        enabled: true,
-        projectOnly: true
-      }
-    },
-    promotion: {
-      confidenceThreshold: 0.85,
-      requireCommitAndConversation: true,
-      minSourceCategories: 2,
-      automatic: {
-        enabled: true,
-        mode: "conservative",
-        minScore: 0.85,
-        mergedBranches: true,
-        deviceMemories: true
-      }
-    },
-    sync: {
-      autoSyncOnServerStart: true,
-      shareLocalLayers: "durable"
-    },
-    retrieval: {
-      mode: "fts",
-      rrfK: 60
-    },
-    privacy: {
-      allowRemoteEmbeddings: false,
-      redactionPatterns: []
-    },
-    retention: {
-      migrationBackups: 2,
-      sources: {
-        git: { maxAgeDays: null },
-        codex: { maxAgeDays: null },
-        claude: { maxAgeDays: null },
-        manual: { maxAgeDays: null }
-      },
-      overrides: [],
-      // Conservative by default: only a branch that no longer exists locally ages out,
-      // and only after the grace period. Idle age-out is available but off.
-      layers: {
-        enabled: true,
-        graceDays: 30,
-        branch: { onDeleted: "archive", onMerged: "keep", maxIdleDays: null },
-        device: { maxIdleDays: null }
-      },
-      artifacts: {
-        logs: { maxBytes: 5 * 1024 * 1024, maxFiles: 3 },
-        projectSummaryBackups: { maxFiles: 5 },
-        recoveryBackups: { maxFiles: 5, minAgeDays: 7 },
-        cloudHandles: { reapStale: true }
-      }
-    },
-    deterministic: {
-      enabled: true,
-      promoteStrongSignals: true,
-      triggers: {
-        conversationDirectives: true,
-        gitChangedFiles: true,
-        decisionFiles: true,
-        testExpectations: true,
-        packageAndConfigFacts: true,
-        docsFacts: true
-      }
-    }
-  };
-}
-
 function mergeConfigFiles(shared: ProjectConfigFile, local: ProjectConfigFile): ProjectConfigFile {
   return deepMerge(shared, local) as ProjectConfigFile;
 }
@@ -957,7 +979,19 @@ function loadGlobalConfig(): GlobalConfigFile {
   const configPath = join(globalConfigDir(), "config.json");
   if (!existsSync(configPath)) return {};
   const raw = readFileSync(configPath, "utf8");
-  return raw.trim().length > 0 ? (JSON.parse(raw) as GlobalConfigFile) : {};
+  const parsed: unknown = raw.trim().length > 0 ? JSON.parse(raw) : {};
+  validateGlobalConfigFile(parsed);
+  return parsed as GlobalConfigFile;
+}
+
+function globalProjectConfig(config: GlobalConfigFile): ProjectConfigFile {
+  return {
+    ...(config.globalRules ? { globalRules: config.globalRules } : {}),
+    ...(config.sources ? { sources: config.sources } : {}),
+    ...(config.extractor ? { extractor: config.extractor } : {}),
+    ...(config.investigator ? { investigator: config.investigator } : {}),
+    ...(config.embeddings ? { embeddings: config.embeddings } : {})
+  };
 }
 
 function loadGlobalEnv(): void {
@@ -1067,10 +1101,20 @@ function ensureGlobalEnvExample(globalDir: string): void {
 }
 
 function defaultGlobalConfigFile(): GlobalConfigFile {
+  const home = homedir();
   return {
     defaults: {
       extractorProfile: "cheap",
       investigatorProfile: "smart"
+    },
+    sources: {
+      codex: {
+        roots: defaultCodexRoots(home),
+        includeDefaultRoots: true
+      },
+      claude: {
+        roots: [join(home, ".claude", "projects")]
+      }
     },
     profiles: {
       cheap: {

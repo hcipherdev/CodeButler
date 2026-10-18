@@ -163,10 +163,10 @@ describe("durable memory conflict audit", () => {
     ]);
     expect(fixed.changes).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "remove_relation" }),
-      expect.objectContaining({ kind: "add_relation" }),
-      expect.objectContaining({ kind: "update_quality", memoryId: first.id }),
-      expect.objectContaining({ kind: "update_quality", memoryId: second.id })
+      expect.objectContaining({ kind: "add_relation" })
     ]));
+    expect(store.readMemory(first.id)).toMatchObject({ qualityStatus: "needs_review" });
+    expect(store.readMemory(second.id)).toMatchObject({ qualityStatus: "needs_review" });
     store.close();
   });
 

@@ -4,15 +4,20 @@ import { join } from "node:path";
 import { installationDeviceId } from "../memory/origin.js";
 import { loadProjectConfig } from "../config.js";
 import { openConfiguredMemoryStore } from "../storage/open-configured-store.js";
+import { CURRENT_SCHEMA_VERSION, initializeSchema } from "../storage/migrations.js";
 import { partitionCheckout, type ShareLocalLayers } from "./partition.js";
-import { flagMergeConflicts, mergeCore, type MergeCoreResult } from "./merge.js";
-import { createRecoveryBackup, removeRecoveryBackup } from "../privacy/backup.js";
+import { flagMergeConflicts, mergeCore, memoryChanges, MASKED_PROJECT, MergeHeldError, sharedMemoryCount, type MergeCoreResult, type MergeDeletionSummary, type MergeHoldReason } from "./merge.js";
+import { createRecoveryBackup, removeRecoveryBackup, retainMergeBackup } from "../privacy/backup.js";
+import { enforceSourceTombstones } from "../privacy/service.js";
+import { purgeRetrieval } from "../retrieval/privacy.js";
+import { invalidateHandbookExport } from "../memory/export.js";
 import { assertPrivacyDatabaseIntegrity, rebuildPrivacyDerivedIndexes } from "../storage/privacy-maintenance.js";
 import { auditMemoryConflicts } from "../memory/conflicts.js";
 import { auditMemoryQuality } from "../memory/quality.js";
 import { recordCompletedOperation } from "../operations/log.js";
 import { withTransaction } from "../storage/transactions.js";
 import { withProjectGate } from "./gate.js";
+import { assertCheckoutReady } from "./checkout-path.js";
 import { DatabaseSync } from "node:sqlite";
 import { rmSync, writeFileSync } from "node:fs";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -31,12 +36,18 @@ import {
   missingBlocks,
   partitionSegments,
   recoverApply,
+  verifyAndMigrateSnapshotDatabase,
   type CaptureResult,
   type Snapshot,
   type SnapshotBundle,
   type SnapshotSegment
 } from "./snapshot.js";
 import { atomicJson, atomicWrite, binding, connection, ensureCheckoutId, saveBinding, sha256, stateDirectory, type Binding, type Connection } from "./state.js";
+import { EncryptionError } from "./crypto-helper.js";
+import { AutomaticSyncOwner, requestAutomaticSync } from "./sync-owner.js";
+import { errorOutcome, type OperationOutcome } from "./outcome.js";
+import { recordCloudSyncError } from "./condition.js";
+import type { RuntimeRecord } from "../runtime.js";
 
 const API_REQUEST_TIMEOUT_MS = 30000;
 /** One download batch: 8 MiB of 64 KiB blocks. */
@@ -112,14 +123,14 @@ async function readErrorBody(response: Response): Promise<string> {
     return "";
   }
 }
-export async function responseBytes(response: Response): Promise<Buffer> {
+export async function responseBytes(response: Response, limit = MAX_COMPRESSED): Promise<Buffer> {
   const chunks: Buffer[] = []; let size = 0;
   if (!response.body) throw new Error("Missing snapshot response");
-  for await (const chunk of response.body) { size += chunk.length; if (size > MAX_COMPRESSED) throw new Error("Cloud snapshot too large"); chunks.push(Buffer.from(chunk)); }
+  for await (const chunk of response.body) { size += chunk.length; if (size > limit) throw new Error("Cloud snapshot too large"); chunks.push(Buffer.from(chunk)); }
   return Buffer.concat(chunks);
 }
-export async function projectOperation<T>(root: string, work: () => T | Promise<T>): Promise<T> {
-  return withProjectGate(root, async () => { recoverApply(root); return work(); });
+export async function projectOperation<T>(root: string, work: () => T | Promise<T>, options: { waitMs?: number; name?: string } = {}): Promise<T> {
+  return withProjectGate(root, async () => { recoverApply(root); return work(); }, { name: "Project database operation", ...options });
 }
 function ensureDatabase(root: string): void { const store = openConfiguredMemoryStore(root); try { store.init(); } finally { store.close(); } }
 /** Reading config must never break sync: an unreadable file falls back to the default. */
@@ -132,6 +143,10 @@ function matchingConnection(state: Binding): Connection {
   return conn;
 }
 function saveSyncState(root: string, state: Binding): void {
+  if (state.status === "synced") {
+    state.syncCondition = "synced";
+    delete state.syncError;
+  }
   const current = binding(root);
   // A concurrent disable/rebind must not be undone by an in-flight request.
   if (current?.enabled && current.projectId === state.projectId && current.vaultId === state.vaultId && current.server === state.server) saveBinding(root, state);
@@ -288,6 +303,16 @@ async function mergeWithCloud(
 }
 
 export async function cloudSync(root: string, keep?: "local" | "cloud" | "merge"): Promise<Binding | undefined> {
+  assertCheckoutReady(root);
+  await (await import("./project-connections.js")).retryCatalogMaintenance(root);
+  const initial = binding(root); if (!initial?.enabled) return initial;
+  (await import("../rules/identity.js")).assertRulesBinding(root, initial);
+  if (initial.encryptionVersion === 2) return (await import("./encrypted-coordinator.js")).encryptedCloudSync(root, keep);
+  throw new EncryptionError("incompatible-format");
+}
+/** Legacy coordinator retained solely for explicit snapshot/merge regression fixtures. */
+export async function legacyCloudSync(root: string, keep?: "local" | "cloud" | "merge"): Promise<Binding | undefined> {
+  assertCheckoutReady(root);
   const initial = binding(root); if (!initial?.enabled) return initial;
   if (initial.status === "conflict" && !keep) return initial;
   const conn = matchingConnection(initial);
@@ -298,7 +323,8 @@ export async function cloudSync(root: string, keep?: "local" | "cloud" | "merge"
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const state = ensureCheckoutId(root, binding(root)!);
         const head = await readHead(conn, state.projectId);
-        const local = await projectOperation(root, async () => { ensureDatabase(root); return captureSnapshot(root, state.projectId, state.revision, state.checkoutId, share); });
+        await projectOperation(root, () => ensureDatabase(root), { name: "Prepare cloud snapshot" });
+        const local = await captureSnapshot(root, state.projectId, state.revision, state.checkoutId, share);
         const localChanged = state.fingerprint !== local.snapshot.fingerprint;
         const remoteChanged = head.revision !== state.revision;
         // Shared content and this device's own partitions move independently: a
@@ -345,9 +371,14 @@ export async function cloudSync(root: string, keep?: "local" | "cloud" | "merge"
             applySnapshot(root, materialized);
             ensureDatabase(root);
             const restored = await captureSnapshot(root, state.projectId, head.revision, state.checkoutId, share);
-            state.revision = head.revision; state.fingerprint = restored.snapshot.fingerprint; state.status = "synced";
+            state.revision = head.revision;
+            state.fingerprint = snapshot.schemaVersion < CURRENT_SCHEMA_VERSION
+              ? head.fingerprint
+              : restored.snapshot.fingerprint;
+            state.status = snapshot.schemaVersion < CURRENT_SCHEMA_VERSION ? "ready" : "synced";
             saveSyncState(root, state);
-          });
+          }, { name: "Cloud restore" });
+          if (snapshot.schemaVersion < CURRENT_SCHEMA_VERSION) continue;
           // A pull that also left this device's own partition unpublished retries in the
           // same run, so one `cloud sync` is enough to both receive and share.
           if (partitionsChanged) continue;
@@ -369,7 +400,7 @@ export async function cloudSync(root: string, keep?: "local" | "cloud" | "merge"
             uploadId = state.pending.uploadId; manifest = resumed.manifest; blocks = resumed.blocks;
             bytes = gzipSync(Buffer.from(JSON.stringify(manifest)));
           } else {
-            const fresh = await projectOperation(root, () => captureSnapshot(root, state.projectId, parentRevision, state.checkoutId, share));
+            const fresh = await captureSnapshot(root, state.projectId, parentRevision, state.checkoutId, share);
             uploadId = randomUUID(); manifest = fresh.snapshot; blocks = fresh.blocks; bytes = fresh.bytes;
             state.pending = { uploadId, fingerprint: fresh.snapshot.fingerprint, parentRevision };
             atomicWrite(pendingPath, encodeBundle({ manifest, blocks })); saveSyncState(root, state);
@@ -398,8 +429,8 @@ export async function cloudSync(root: string, keep?: "local" | "cloud" | "merge"
     });
   } catch (error) {
     const current = binding(root)!;
-    current.status = error instanceof RequestError && error.status === 409 ? "conflict" : error instanceof RequestError && (error.status === 401 || error.status === 403) ? "access-unavailable" : "offline-or-deferred";
-    saveSyncState(root, current); throw error;
+    recordCloudSyncError(root, current, error);
+    throw error;
   }
 }
 // Reuse the gate implementation in the private checkout-state directory.
@@ -408,27 +439,55 @@ export async function cloudSync(root: string, keep?: "local" | "cloud" | "merge"
  * are untouched by construction; derived indexes are rebuilt and the audits that
  * privacy operations already run keep the result self-consistent.
  */
-function applyCoreMerge(root: string, remote: SnapshotBundle, ancestor: SnapshotBundle): MergeCoreResult {
+/**
+ * Three-way merge of the cloud core into local memory. Without an ancestor (a first
+ * connection: both devices built memory before ever sharing a revision) the ancestor is
+ * an empty database, so every row is an addition on its own side and rows both sides
+ * hold under one key are settled, or flagged, by the usual conflict rules.
+ */
+export interface CoreMergeOptions {
+  /** Decides, before anything is written, whether the merge must wait for a person. */
+  hold?: (summary: MergeDeletionSummary) => MergeHoldReason | undefined;
+  /** Keep the pre-merge recovery backup after success, so an unattended merge can be undone. */
+  keepBackup?: boolean;
+}
+export function applyCoreMerge(root: string, remote: SnapshotBundle, ancestor?: SnapshotBundle, options: CoreMergeOptions = {}): MergeCoreResult & { backup?: string } {
   const state = stateDirectory(root);
   const remotePath = join(state, `merge-remote-${randomUUID()}.sqlite`);
   const ancestorPath = join(state, `merge-ancestor-${randomUUID()}.sqlite`);
   writeFileSync(remotePath, materializeSnapshot(remote.manifest, bundleResolver(remote.blocks)).files.find(file => file.path === "memory.sqlite")!.data);
-  writeFileSync(ancestorPath, materializeSnapshot(ancestor.manifest, bundleResolver(ancestor.blocks)).files.find(file => file.path === "memory.sqlite")!.data);
+  verifyAndMigrateSnapshotDatabase(remote.manifest, remotePath);
+  if (ancestor) {
+    writeFileSync(ancestorPath, materializeSnapshot(ancestor.manifest, bundleResolver(ancestor.blocks)).files.find(file => file.path === "memory.sqlite")!.data);
+    verifyAndMigrateSnapshotDatabase(ancestor.manifest, ancestorPath);
+  } else {
+    const empty = new DatabaseSync(ancestorPath);
+    try { initializeSchema(empty, ancestorPath, { backupRetention: 0, createBackup: false }); } finally { empty.close(); }
+  }
   const store = openConfiguredMemoryStore(root);
   const remoteDb = new DatabaseSync(remotePath, { readOnly: true });
   const ancestorDb = new DatabaseSync(ancestorPath, { readOnly: true });
   const backup = createRecoveryBackup(store.paths.databasePath, new Date());
+  let forgotten = 0;
   try {
     store.init();
     const now = new Date().toISOString();
+    const shared = options.hold ? sharedMemoryCount(store.db) : 0;
     const result = withTransaction(store.db, () => {
       const merged = mergeCore(store.db, remoteDb, ancestorDb);
+      // Adopted temporary memories carry the masked path; they belong to this checkout now.
+      store.db.prepare("update temporary_memories set project_id = ? where project_id = ?").run(root, MASKED_PROJECT);
+      if (options.hold) {
+        const summary = { shared, deleted: memoryChanges(merged).deleted }, reason = options.hold(summary);
+        if (reason) throw new MergeHeldError(reason, summary);
+      }
+      forgotten = enforceSourceTombstones(store, remoteDb);
       rebuildPrivacyDerivedIndexes(store.db);
       auditMemoryConflicts(store, { fix: true, now });
       auditMemoryQuality(store, { fix: true, now });
       // Flagged last: the quality audit recomputes status from evidence, so marking a
       // merge conflict before it runs would have the audit quietly clear the mark.
-      flagMergeConflicts(store.db, merged.reviewMemoryIds, now);
+      flagMergeConflicts(store, merged.reviewMemoryIds, now);
       assertPrivacyDatabaseIntegrity(store.db);
       recordCompletedOperation(store.db, {
         operationType: "cloud_merge",
@@ -438,9 +497,13 @@ function applyCoreMerge(root: string, remote: SnapshotBundle, ancestor: Snapshot
       }, now);
       return merged;
     });
-    removeRecoveryBackup(backup);
-    return result;
+    if (forgotten) { purgeRetrieval(root); invalidateHandbookExport(root); }
+    if (!options.keepBackup) { removeRecoveryBackup(backup); return result; }
+    // The merge is committed; failing to rename or prune its backup only leaves the plain recovery copy.
+    try { return { ...result, backup: retainMergeBackup(store.paths.databasePath, backup) }; } catch { return { ...result, backup }; }
   } catch (error) {
+    // A held merge rolled back before writing; there is nothing to recover.
+    if (error instanceof MergeHeldError) { removeRecoveryBackup(backup); throw error; }
     // The backup is the only way back from a half-applied merge, so it is retained.
     throw new Error(`Cloud merge failed; recovery backup retained at ${backup}: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
@@ -452,12 +515,18 @@ function applyCoreMerge(root: string, remote: SnapshotBundle, ancestor: Snapshot
 function stateDirectoryRoot(root: string): string {
   const path = stateDirectory(root); atomicJson(join(path, "coordinator.json"), { version: 1 }); return path;
 }
+export function conflictMessage(state: Binding): string {
+  const resolve = "Review it in the desktop app or run code-butler cloud resolve --keep local|cloud|merge.";
+  if (state.conflictReason === "large-deletion") return `Cloud sync paused: an automatic merge would delete a large share of this device's memories. ${resolve}`;
+  if (state.conflictReason === "policy") return `Cloud sync paused: this project asks before merging (sync.conflictPolicy). ${resolve}`;
+  return "Cloud sync paused: conflicting snapshots. Run code-butler cloud resolve --keep local|cloud|merge.";
+}
 export async function syncQuietly(root: string, warn: (line: string) => void = console.error): Promise<void> {
   if (!binding(root)?.enabled) return;
-  try { const state = await cloudSync(root); if (state?.status === "conflict") warn("Cloud sync paused: conflicting snapshots. Run code-butler cloud resolve --keep local|cloud."); }
+  try { const state = await cloudSync(root); if (state?.status === "conflict") warn(conflictMessage(state)); }
   catch (error) { warn(error instanceof Error ? error.message : "Cloud sync deferred"); }
 }
-function fileStamp(root: string): string {
+export function localCloudChangeStamp(root: string): string {
   const base = join(root, ".code-butler");
   function scan(dir: string, prefix = ""): string[] {
     if (!existsSync(dir)) return [];
@@ -467,32 +536,75 @@ function fileStamp(root: string): string {
       if (excluded(path) && path !== "memory.sqlite-wal") return [];
       const stat = lstatSync(join(dir, name));
       if (stat.isSymbolicLink()) throw new Error("Cloud sync does not follow project symlinks");
+      // Closing a read-only store can truncate and recreate an empty WAL. Its
+      // mtime is noise; only a WAL with frames represents unsnapshotted writes.
+      if (path === "memory.sqlite-wal" && stat.size === 0) return [];
       return stat.isDirectory() ? scan(join(dir, name), path) : [`${path}:${stat.size}:${stat.mtimeMs}`];
     });
   }
   return sha256(scan(base).join("\n"));
 }
-export function startCloudScheduler(root: string, warn: (line: string) => void = console.error, timing: { pollMs?: number; settleMs?: number; tickMs?: number } = {}): () => void {
+export interface CloudScheduler {
+  (): Promise<void>;
+  run(): Promise<OperationOutcome>;
+  request(): void;
+}
+export function startCloudScheduler(root: string, warn: (line: string) => void = console.error, timing: { pollMs?: number; settleMs?: number; tickMs?: number; sync?: typeof cloudSync; role?: RuntimeRecord["role"]; automatic?: boolean } = {}): CloudScheduler {
   const pollMs = timing.pollMs ?? 60000, settleMs = timing.settleMs ?? 10000;
-  let lastStamp = ""; let changedAt = 0; let nextPoll = Date.now() + pollMs; let failures = 0; let busy = false; let stopped = false;
-  const timer = setInterval(() => {
-    if (busy || stopped || !binding(root)?.enabled || binding(root)?.status === "conflict") return;
-    void (async () => {
-      busy = true;
+  const owner = new AutomaticSyncOwner(root, timing.role ?? "mcp");
+  let lastStamp = ""; let changedAt = 0; let nextPoll = 0; let failures = 0; let stopped = false;
+  let active: Promise<OperationOutcome> | undefined;
+  const run = (): Promise<OperationOutcome> => {
+    if (active) return active;
+    if (stopped) return Promise.resolve({ outcome: "deferred", stage: "cloud", reason: "Scheduler stopped" });
+    active = (async (): Promise<OperationOutcome> => {
       try {
+        if (!binding(root)?.enabled) { owner.release(); return { outcome: "success", stage: "cloud" }; }
+        if (!owner.acquire()) return { outcome: "deferred", stage: "cloud", reason: "Waiting for the automatic sync owner" };
+        const stored=binding(root);
+        if(stored?.status==="storage-full" && (stored.retryAfter??0)>Date.now()) return {outcome:"failed",stage:"cloud",reason:"Cloud storage full; waiting before retrying upload."};
+        const localStamp = localCloudChangeStamp(root);
+        const pending = owner.beginRun();
+        try {
+          const state = await (timing.sync ?? cloudSync)(root);
+          if (state?.status === "conflict") return { outcome: "failed", stage: "cloud", reason: conflictMessage(state) };
+          owner.completeRun(pending, localStamp);
+          return { outcome: "success", stage: "cloud" };
+        } finally { owner.endRun(); }
+      } catch (error) { return errorOutcome(error, "cloud"); }
+    })().then(result => {
+      if (result.outcome === "success") { failures = 0; changedAt = 0; nextPoll = Date.now() + pollMs; }
+      else {
+        failures++;
+        const base = result.outcome === "deferred" ? 2000 : 10000;
+        nextPoll = Date.now() + Math.min(300000, base * 2 ** Math.min(failures - 1, 5)) + Math.floor(Math.random() * 1000);
+        if (result.reason) warn(result.reason);
+      }
+      return result;
+    }).finally(() => {
+      active = undefined;
+      // Only hand back after the complete cloud operation has drained.
+      if (stopped || !binding(root)?.enabled) owner.release();
+      else owner.acquire();
+    });
+    return active;
+  };
+  const timer = setInterval(() => {
+    if (active || stopped || timing.automatic === false) return;
+    try {
+        if (!binding(root)?.enabled) { owner.release(); return; }
+        if (!owner.acquire()) { nextPoll = 0; failures = 0; return; }
+        // A conflict with a reason waits for a person; one recorded before merging became automatic is retried and merged.
+        const current = binding(root);
+        if (current?.status === "conflict" && (current.conflictReason || current.encryptionVersion !== 2)) return;
         if (failures > 0 && Date.now() < nextPoll) return;
-        const stamp = fileStamp(root);
+        const stamp = localCloudChangeStamp(root);
         if (stamp !== lastStamp) { lastStamp = stamp; changedAt = Date.now(); }
-        if (Date.now() < nextPoll && (!changedAt || Date.now() - changedAt < settleMs)) return;
-        const result = await cloudSync(root);
-        if (result?.status === "conflict") warn("Cloud sync paused: conflicting snapshots. Run code-butler cloud resolve --keep local|cloud.");
-        failures = 0; changedAt = 0; nextPoll = Date.now() + pollMs;
-      } catch (error) {
-        failures++; changedAt = 0; nextPoll = Date.now() + Math.min(300000, 10000 * 2 ** Math.min(failures, 5));
-        warn(error instanceof Error ? error.message : "Cloud sync deferred");
-      } finally { busy = false; }
-    })();
+        if (!owner.requested() && Date.now() < nextPoll && (!changedAt || Date.now() - changedAt < settleMs)) return;
+        void run().catch(error => warn(error instanceof Error ? error.message : String(error)));
+    } catch (error) { warn(error instanceof Error ? error.message : String(error)); }
   }, timing.tickMs ?? 2000);
   timer.unref();
-  return () => { stopped = true; clearInterval(timer); };
+  const stop = async (): Promise<void> => { stopped = true; clearInterval(timer); try { await active; } finally { owner.release(); } };
+  return Object.assign(stop, { run, request: () => { if (!stopped) requestAutomaticSync(root); } });
 }

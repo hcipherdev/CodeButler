@@ -1,5 +1,7 @@
 # Retrieval
 
+The opt-in published retrieval engine separates interactive reads from ingestion and quality evaluation. See [how it works and measured results](./retrieval-qualification.md) before enabling it with `CODE_BUTLER_RETRIEVAL_ENGINE=published`.
+
 Full-text search is the default and always works offline:
 
 ```json

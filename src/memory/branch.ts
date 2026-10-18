@@ -1,3 +1,4 @@
+import { gitExecutable } from "../git-executable.js";
 import { execFileSync } from "node:child_process";
 
 import type { MemoryLayer } from "../types.js";
@@ -70,7 +71,7 @@ function currentDefaultBranch(repoPath: string | undefined): string | undefined 
 function runGit(repoPath: string | undefined, args: string[]): string | undefined {
   if (!repoPath?.trim()) return undefined;
   try {
-    const output = execFileSync("git", ["-C", repoPath, ...args], {
+    const output = execFileSync(gitExecutable(), ["-C", repoPath, ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"]
     }).trim();

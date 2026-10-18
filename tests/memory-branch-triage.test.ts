@@ -34,6 +34,16 @@ function root(): string {
 function store(rootDir = root()): MemoryStore {
   const opened = openMemoryStore(rootDir);
   opened.init();
+  opened.addSourceWithChunks({
+    source: {
+      id: "branch-triage-evidence",
+      type: "conversation",
+      title: "Branch triage evidence",
+      origin: "test",
+      rawContent: "The branch triage fixtures are current project memories."
+    },
+    chunks: [{ text: "The branch triage fixtures are current project memories." }]
+  });
   stores.push(opened);
   return opened;
 }
@@ -83,7 +93,11 @@ function memory(branch: string, title: string, dedupeKey: string, confidence = 1
     reason: `${title} reason.`,
     confidence,
     dedupeKey,
-    evidence: [],
+    evidence: [{
+      sourceType: "conversation",
+      sourceId: "branch-triage-evidence",
+      locator: "branch-triage-evidence:chunk:0"
+    }],
     relatedFiles: []
   };
 }
@@ -192,7 +206,10 @@ it("resolves branch triage actions for candidates and promoted memories", () => 
     now: NOW
   }, "mcp");
   expect(s.listMemoryCandidates({ qualityStatus: "all", limit: null }).find((candidate) => candidate.id === discardCandidate.id))
-    .toMatchObject({ qualityStatus: "quarantined", qualityReasons: ["branch_triage_discarded"] });
+    .toMatchObject({
+      qualityStatus: "quarantined",
+      qualityReasons: expect.arrayContaining(["branch_triage_discarded"])
+    });
 
   const discardPromoted = rememberProjectMemory(s, {
     type: "decision",

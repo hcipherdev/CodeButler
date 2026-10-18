@@ -1,6 +1,14 @@
+import { readAgentContext } from "../project-summary/agent-guidance.js";
+import { gitExecutable } from "../git-executable.js";
+import { buildRulesCatalog, getApplicableRules } from "../rules/match.js";
+import { recordAttestation, type RecordAttestationInput } from "../rules/attestations.js";
+import { assertOrdinaryProject } from "../rules/identity.js";
 import { withApplicability } from "../memory/scope.js";
 import { defaultBranchMemoryLayer } from "../memory/branch.js";
 import { updateMemoryLayer, type UpdateMemoryLayerInput } from "../memory/layer-service.js";
+import { readMemoryKnowledge } from "../memory/knowledge.js";
+import { memoryHistory, memoryMovement, type KnowledgeFilter } from "../memory/events.js";
+import { readHandbook, readHandbookTopic } from "../memory/topics.js";
 import { suggestMemoryLayerPromotions, type SuggestMemoryLayerPromotionsInput } from "../memory/layer-promotion.js";
 import {
   listLayerRetentionDecisions,
@@ -10,6 +18,7 @@ import {
 } from "../memory/layer-retention.js";
 import {
   listPromotionDecisions,
+  collapseCoreCandidateSkips,
   planAutomaticPromotions,
   type AutomaticPromotionDecisionRecord,
   type AutomaticPromotionPlan
@@ -27,6 +36,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import { loadProjectConfig } from "../config.js";
+import { join } from "node:path";
+import { readProjectSetupStatus, type ProjectSetupStatus } from "../project-setup.js";
 import { findDecisions } from "../decisions/store.js";
 import { runDoctor } from "../doctor/service.js";
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
@@ -34,6 +45,7 @@ import { explainCodeChange, investigateProjectHistory } from "../investigate/his
 import { updateMemoryStatus } from "../memory/lifecycle-service.js";
 import { summarizeMemoryHealth } from "../memory/quality.js";
 import { rememberProjectMemory } from "../memory/remember.js";
+import { resolveMemoryReview, type ResolveMemoryReviewInput } from "../memory/review.js";
 import { findProjectMemories, searchProjectMemory, type SearchServiceOptions } from "../search/service.js";
 import {
   readProjectBrief,
@@ -145,9 +157,19 @@ export interface CurrentProjectInfo {
   databasePath: string;
   configCreated: boolean;
   databaseCreated: boolean;
+  setup: ProjectSetupStatus;
+}
+
+/** File-only identity/status reads must not queue behind ingestion or cloud work. */
+export function readCurrentProjectInfo(rootDir: string, startup: ProjectStartupMetadata = { configCreated: false, databaseCreated: false }): CurrentProjectInfo {
+  const dataDir = join(rootDir, ".code-butler");
+  return { rootDir, dataDir, configPath: join(dataDir, "config.json"), databasePath: join(dataDir, "memory.sqlite"),
+    ...startup, setup: readProjectSetupStatus(rootDir) };
 }
 
 export interface ProjectMemoryToolHandlers {
+  get_applicable_rules(input: import("../rules/match.js").RuleQuery): import("../rules/match.js").RulePage;
+  record_rule_attestation(input: RecordAttestationInput): ReturnType<typeof recordAttestation>;
   current_project(): CurrentProjectInfo;
   search_project_memory(input: {
     targetEnvironment?: TargetEnvironment;
@@ -172,11 +194,15 @@ export interface ProjectMemoryToolHandlers {
   }): Promise<{
     results: ReturnType<MemoryStore["searchMemoryLayer"]>;
   }>;
+  get_memory_history(input:{id:string;category:"candidate"|"promoted";offset?:number;limit?:number}):ReturnType<typeof memoryHistory>;
+  read_project_handbook(input?:KnowledgeFilter & {topicId?:string;offset?:number;limit?:number}):ReturnType<typeof readHandbook>|ReturnType<typeof readHandbookTopic>;
+  summarize_memory_movement(input?:KnowledgeFilter):ReturnType<typeof memoryMovement>;
   update_memory_scope(input: UpdateMemoryScopeInput): ReturnType<typeof updateMemoryScope>;
   update_memory_layer(input: UpdateMemoryLayerInput): ReturnType<typeof updateMemoryLayer>;
   suggest_memory_layer_promotions(input?: SuggestMemoryLayerPromotionsInput): ReturnType<typeof suggestMemoryLayerPromotions>;
   suggest_branch_memory_triage(input?: Omit<SuggestBranchMemoryTriageInput, "repoPath" | "now">): ReturnType<typeof suggestBranchMemoryTriage>;
   resolve_branch_memory_triage(input: Omit<ResolveBranchMemoryTriageInput, "now">): ReturnType<typeof resolveBranchMemoryTriage>;
+  resolve_memory_review(input: Omit<ResolveMemoryReviewInput, "now">): ReturnType<typeof resolveMemoryReview>;
   explain_memory_promotions(input?: { memoryId?: string; limit?: number }): {
     plan: AutomaticPromotionPlan;
     history: AutomaticPromotionDecisionRecord[];
@@ -195,6 +221,7 @@ export interface ProjectMemoryToolHandlers {
     relatedFiles?: string[];
     promote?: boolean;
     supersedesMemoryId?: string;
+    statement?: import("../memory/remember.js").RememberProjectMemoryInput["statement"];
   }): {
     sourceId: string;
     memory: MemorySearchResult;
@@ -263,7 +290,7 @@ export interface ProjectMemoryToolHandlers {
   summarize_project_state(): ProjectSummary;
   summarize_memory_health(): ReturnType<typeof summarizeMemoryHealth>;
   run_doctor(): DoctorReport;
-  summarize_project_brief(): ProjectBrief;
+  summarize_project_brief(): ProjectBrief & ReturnType<typeof readAgentContext> & { globalRules?: ReturnType<typeof buildRulesCatalog> };
   refresh_project_summary(input: { force?: boolean }): Promise<ProjectSummaryRefreshResult>;
 }
 
@@ -287,9 +314,12 @@ export function createProjectMemoryToolHandlers(
   } = {}
 ): ProjectMemoryToolHandlers {
   const rootDir = options.rootDir ?? store.paths.rootDir;
+  assertOrdinaryProject(rootDir);
   const config = loadProjectConfig(rootDir);
   const startupMetadata = options.startupMetadata ?? { configCreated: false, databaseCreated: false };
   return {
+    get_applicable_rules(input) { return getApplicableRules(rootDir, input); },
+    record_rule_attestation(input) { return recordAttestation(input, { by: "agent", projectRoot: rootDir }); },
     current_project() {
       return {
         rootDir,
@@ -297,7 +327,8 @@ export function createProjectMemoryToolHandlers(
         configPath: config.configPath,
         databasePath: store.paths.databasePath,
         configCreated: startupMetadata.configCreated,
-        databaseCreated: startupMetadata.databaseCreated
+        databaseCreated: startupMetadata.databaseCreated,
+        setup: readProjectSetupStatus(rootDir)
       };
     },
     async search_project_memory(input) {
@@ -310,6 +341,9 @@ export function createProjectMemoryToolHandlers(
     read_memory_source(input) {
       return store.readSource(input.sourceId);
     },
+    get_memory_history(input){return memoryHistory(readMemoryKnowledge(store),input.id,input.category,input);},
+    read_project_handbook(input={}){const data=readMemoryKnowledge(store),filter={...input,reach:input.reach??"project"};return input.topicId?readHandbookTopic(data,input.topicId,filter,input.offset,input.limit):readHandbook(data,filter);},
+    summarize_memory_movement(input={}){return memoryMovement(readMemoryKnowledge(store),input);},
     async find_memories(input) {
       // The layer filter now travels into storage retrieval, so the result limit
       // applies to matching rows instead of hiding them behind newer core memories.
@@ -332,12 +366,18 @@ export function createProjectMemoryToolHandlers(
         now: nowIso(options.now)
       }, "mcp");
     },
+    resolve_memory_review(input) {
+      return resolveMemoryReview(store, {
+        ...input,
+        now: nowIso(options.now)
+      }, "mcp");
+    },
     explain_memory_promotions(input = {}) {
       return {
-        plan: planAutomaticPromotions(store, config, {
+        plan: collapseCoreCandidateSkips(planAutomaticPromotions(store, config, {
           repoPath: config.sources.git.repoPath,
           now: nowIso(options.now)
-        }),
+        })),
         history: listPromotionDecisions(store, input)
       };
     },
@@ -451,7 +491,7 @@ export function createProjectMemoryToolHandlers(
       return runDoctor(rootDir, options.now === undefined ? {} : { now: options.now });
     },
     summarize_project_brief() {
-      return readProjectBrief(rootDir);
+      return { ...readProjectBrief(rootDir), ...readAgentContext(rootDir,store), setup: readProjectSetupStatus(rootDir), globalRules: buildRulesCatalog(rootDir) };
     },
     refresh_project_summary(input) {
       const refreshOptions: ProjectSummaryOperationOptions = {};
@@ -584,6 +624,7 @@ function normalizeRememberMemoryInput(input: {
     relatedFiles?: string[];
     promote?: boolean;
     supersedesMemoryId?: string;
+    statement?: import("../memory/remember.js").RememberProjectMemoryInput["statement"];
   } = {
     type: input.type,
     text: input.text
@@ -970,7 +1011,7 @@ function readWorkingTree(rootDir: string): RecentActivitySummary["workingTree"] 
 }
 
 function execGit(rootDir: string, args: string[]): string {
-  return execFileSync("git", ["-C", rootDir, ...args], {
+  return execFileSync(gitExecutable(), ["-C", rootDir, ...args], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"]
   }).trim();

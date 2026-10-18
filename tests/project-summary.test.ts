@@ -1,3 +1,4 @@
+// Tests summary generation, refresh ownership, and safe repository context.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
@@ -16,6 +17,7 @@ import {
   type ProjectSummaryGeneratorInput
 } from "../src/project-summary/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
+import { syncProjectMemory } from "../src/sync/service.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("project narrative summary", () => {
@@ -50,12 +52,11 @@ describe("project narrative summary", () => {
         inputs.push(input);
         outputs.push(input.fingerprint);
         return [
-          "# Project Brief",
+          "## What this is",
           "",
-          `Project root: ${input.projectRoot}`,
-          `Hints: ${input.agentHints.length}`,
+          "A repository summary.",
           "Purpose: Generated from verified code context.",
-          "Use Butler tools for detailed memories."
+          "## How it's built", "Built from recorded repository facts."
         ].join("\n");
       }
     };
@@ -76,7 +77,7 @@ describe("project narrative summary", () => {
 
     expect(result.generated).toBe(true);
     expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(true);
-    expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain("# Project Brief");
+    expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toContain("# Project summary");
     expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toContain("summarize_project_brief");
     expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toContain("summarize_active_context");
     expect(readFileSync(join(rootDir, "AGENTS.md"), "utf8")).toContain("search_temporary_memory");
@@ -541,6 +542,64 @@ describe("project narrative summary", () => {
     store.close();
   });
 
+  it("does not regenerate the next day after a sync with no new evidence", async () => {
+    const { rootDir, generator, outputs } = createProject();
+    git(rootDir, ["-c", "user.name=Summary Test", "-c", "user.email=summary@example.test", "commit", "-qm", "Initial project"]);
+    const store = openMemoryStore(rootDir);
+    store.init();
+    try {
+      const config = loadProjectConfig(rootDir);
+      const syncOptions = { source: "git" as const, extractorProvider: { async extract() { return { memories: [], rejected: [] }; } } };
+      const initial = await syncProjectMemory(store, config, syncOptions);
+      expect(initial.sources.git.error).toBeUndefined();
+      expect(initial.sources.git.imported).toBe(1);
+      store.recordSyncStatus({ source: "git", enabled: true, lastSyncAt: "2026-06-15T00:00:00Z", lastSuccessAt: "2026-06-15T00:00:00Z", metadata: { imported: 1 } });
+      await refreshProjectSummary(store, config, { generator, now: () => new Date("2026-06-15T00:00:00Z") });
+      const before = readProjectBrief(rootDir);
+      const beforeInput = collectProjectSummaryInput(store, config);
+      const summaryMtime = statSync(before.summaryPath).mtimeMs;
+
+      const empty = await syncProjectMemory(store, config, syncOptions);
+      expect(empty.sources.git.error).toBeUndefined();
+      expect(empty.sources.git.imported).toBe(0);
+      const afterInput = collectProjectSummaryInput(store, config);
+      expect(afterInput.codeContext.projectState).not.toEqual(beforeInput.codeContext.projectState);
+      const quiet = await refreshProjectSummaryIfDue(store, config, { generator, now: () => new Date("2026-06-16T00:00:00Z") });
+      expect(quiet.generated).toBe(false);
+      expect(outputs).toHaveLength(1);
+      expect(afterInput.fingerprint).toBe(beforeInput.fingerprint);
+      expect(readProjectBrief(rootDir).summary).toBe(before.summary);
+      expect(statSync(before.summaryPath).mtimeMs).toBe(summaryMtime);
+      expect(readProjectBrief(rootDir).meta?.lastCheckedAt).toBe("2026-06-16T00:00:00.000Z");
+
+      // A real commit must still invalidate the fingerprint on the next check.
+      writeFileSync(join(rootDir, "README.md"), "# Example Project\nNew project behavior.\n");
+      git(rootDir, ["add", "README.md"]);
+      git(rootDir, ["-c", "user.name=Summary Test", "-c", "user.email=summary@example.test", "commit", "-qm", "Document new behavior"]);
+      const changedSync = await syncProjectMemory(store, config, syncOptions);
+      expect(changedSync.sources.git.imported).toBe(1);
+      const changed = await refreshProjectSummaryIfDue(store, config, { generator, now: () => new Date("2026-06-17T00:00:00Z") });
+      expect(changed.generated).toBe(true);
+      expect(outputs).toHaveLength(2);
+    } finally { store.close(); }
+  }, 120_000);
+
+  it("ignores transient sync failures and recovery when fingerprinting summary content", () => {
+    const { rootDir } = createProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    try {
+      const config = loadProjectConfig(rootDir);
+      const before = collectProjectSummaryInput(store, config).fingerprint;
+      store.recordSyncStatus({ source: "git", enabled: true, lastSyncAt: "2026-06-15T00:00:00Z", lastError: "Git unavailable" });
+      const failed = collectProjectSummaryInput(store, config);
+      expect(failed.codeContext.projectState.syncSources.git?.lastError).toBe("Git unavailable");
+      expect(failed.fingerprint).toBe(before);
+      store.recordSyncStatus({ source: "git", enabled: true, lastSyncAt: "2026-06-16T00:00:00Z", lastSuccessAt: "2026-06-16T00:00:00Z", metadata: { imported: 0 } });
+      expect(collectProjectSummaryInput(store, config).fingerprint).toBe(before);
+    } finally { store.close(); }
+  });
+
   it("does not treat installed bootstrap files as a meaningful summary input change", async () => {
     const { rootDir, generator, outputs, inputs } = createProject();
     const store = openMemoryStore(rootDir);
@@ -591,7 +650,7 @@ describe("project narrative summary", () => {
     store.close();
   });
 
-  it("builds every file-derived generator field from validated tracked safe files", async () => {
+  it.runIf(sep === "/")("builds every file-derived generator field from validated tracked safe files", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     mkdirSync(join(rootDir, "src"), { recursive: true });

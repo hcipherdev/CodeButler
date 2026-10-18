@@ -1,3 +1,4 @@
+// Tests project-memory MCP handlers, registration, and retrieval contracts.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -74,7 +75,7 @@ describe("MCP tool handlers", () => {
       }
     });
 
-    expect(handlers.current_project()).toEqual({
+    expect(handlers.current_project()).toMatchObject({
       rootDir,
       dataDir: join(rootDir, ".code-butler"),
       configPath: join(rootDir, ".code-butler", "config.json"),
@@ -442,7 +443,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("registers and invokes 28 MCP tools with lifecycle validation and wiring", async () => {
+  it("registers and invokes 34 MCP tools with lifecycle and review validation", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const store = openMemoryStore(rootDir);
@@ -453,6 +454,17 @@ describe("MCP tool handlers", () => {
     });
     const original = handlers.remember_project_memory({ type: "decision", text: "Use lifecycle policy A." });
     const replacement = handlers.remember_project_memory({ type: "decision", text: "Use lifecycle policy B." });
+    const reviewCandidate = store.upsertMemoryCandidate({
+      type: "constraint",
+      title: "Review MCP memory",
+      summary: "Review this MCP memory before relying on it.",
+      reason: "The extraction confidence is low.",
+      confidence: 0.55,
+      evidence: original.memory.evidence,
+      relatedFiles: [],
+      dedupeKey: "mcp-review-candidate"
+    }, { qualityStatus: "needs_review", qualityReasons: ["low_confidence"] });
+    const reviewToken = store.readMemorySearchResultsByIds([reviewCandidate.id], { includeCandidates: true })[0]!.reviewToken!;
     type Registration = {
       name: string;
       inputSchema: z.ZodRawShape;
@@ -474,12 +486,13 @@ describe("MCP tool handlers", () => {
       now: () => new Date("2026-07-12T16:05:00.000Z")
     });
 
-    expect(registrations).toHaveLength(28);
+    expect(registrations).toHaveLength(34);
     expect(registrations.map((registration) => registration.name)).toContain("update_memory_status");
     expect(registrations.map((registration) => registration.name)).toContain("update_memory_layer");
     expect(registrations.map((registration) => registration.name)).toContain("suggest_memory_layer_promotions");
     expect(registrations.map((registration) => registration.name)).toContain("suggest_branch_memory_triage");
     expect(registrations.map((registration) => registration.name)).toContain("resolve_branch_memory_triage");
+    expect(registrations.map((registration) => registration.name)).toContain("resolve_memory_review");
     expect(registrations.map((registration) => registration.name)).toContain("explain_memory_promotions");
     expect(registrations.map((registration) => registration.name)).toContain("explain_layer_retention");
     expect(registrations.map((registration) => registration.name)).toContain("list_source_failures");
@@ -551,6 +564,21 @@ describe("MCP tool handlers", () => {
     const branchResolve = registrations.find((registration) => registration.name === "resolve_branch_memory_triage")!;
     expect(branchResolve.inputSchema.action!.safeParse("promote_to_core")).toMatchObject({ success: true });
     expect(branchResolve.inputSchema.action!.safeParse("auto_promote")).toMatchObject({ success: false });
+    const memoryReview = registrations.find((registration) => registration.name === "resolve_memory_review")!;
+    expect(memoryReview.inputSchema.action!.safeParse("verify")).toMatchObject({ success: true });
+    expect(memoryReview.inputSchema.reviewToken!.safeParse("stale")).toMatchObject({ success: false });
+    const reviewResponse = await memoryReview.callback({
+      memoryId: reviewCandidate.id,
+      category: "candidate",
+      action: "verify",
+      reviewToken
+    });
+    expect(JSON.parse(reviewResponse.content[0]!.text)).toMatchObject({
+      memoryId: reviewCandidate.id,
+      action: "verify",
+      review: { actor: "mcp" },
+      memory: { qualityStatus: "active" }
+    });
     store.close();
   });
 
@@ -574,7 +602,7 @@ describe("MCP tool handlers", () => {
     store.close();
   });
 
-  it("keeps the architecture copies consistent with the complete 28-tool list", () => {
+  it("keeps the architecture copies consistent with the complete 34-tool list", () => {
     const rootArchitecturePath = join(process.cwd(), "architecture.html");
     const published = readFileSync(join(process.cwd(), "docs", "public", "architecture.html"), "utf8");
     const architecture = existsSync(rootArchitecturePath)
@@ -586,9 +614,9 @@ describe("MCP tool handlers", () => {
     if (existsSync(rootArchitecturePath)) {
       expect(published).toBe(architecture);
     }
-    expect(architecture).toContain("MCP Tools (28)");
-    expect(architecture).toContain("28 exposed tools");
-    expect(toolNames).toHaveLength(28);
+    expect(architecture).toContain("MCP Tools (34)");
+    expect(architecture).toContain("34 exposed tools");
+    expect(toolNames).toHaveLength(34);
     expect([...toolNames].sort()).toEqual([
       "cleanup_temporary_memory",
       "current_project",
@@ -598,12 +626,17 @@ describe("MCP tool handlers", () => {
       "find_decisions",
       "find_memories",
       "find_related_commits",
+      "get_applicable_rules",
+      "get_memory_history",
       "investigate_project_history",
       "list_source_failures",
       "read_memory_source",
+      "read_project_handbook",
+      "record_rule_attestation",
       "refresh_project_summary",
       "remember_project_memory",
       "resolve_branch_memory_triage",
+      "resolve_memory_review",
       "run_doctor",
       "search_project_memory",
       "search_temporary_memory",
@@ -611,6 +644,7 @@ describe("MCP tool handlers", () => {
       "suggest_memory_layer_promotions",
       "summarize_active_context",
       "summarize_memory_health",
+      "summarize_memory_movement",
       "summarize_project_brief",
       "summarize_project_state",
       "summarize_recent_activity",
@@ -630,7 +664,7 @@ describe("MCP tool handlers", () => {
     store.init();
     const generator: ProjectSummaryGenerator = {
       async generate() {
-        return "# MCP Generated Brief\n";
+        return "## What this is\nMCP Generated Brief\n";
       }
     };
 

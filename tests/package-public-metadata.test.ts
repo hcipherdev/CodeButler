@@ -20,7 +20,7 @@ describe("public package metadata", () => {
 
   it("publishes discoverable metadata for the public npm package", () => {
     expect(packageJson.name).toBe("code-butler");
-    expect(packageJson.version).toBe("1.0.0");
+    expect(packageJson.version).toBe("2.0.0");
     expect(packageJson.engines?.node).toBe(">=24.0.0");
     expect(packageJson.license).toBe("Apache-2.0");
     expect(packageJson.repository).toEqual({
@@ -38,12 +38,13 @@ describe("public package metadata", () => {
     );
     expect(packageJson.scripts?.prepack).toBe("npm run build");
     expect(packageJson.scripts?.["test:publish"]).toBe("vitest run --no-file-parallelism --maxWorkers=1 --minWorkers=1");
-    expect(packageJson.scripts?.prepublishOnly).toBe("npm run typecheck && npm run test:publish");
+    // Publishing also checks that the native helper ships in the package.
+    expect(packageJson.scripts?.prepublishOnly).toBe("npm run typecheck && npm run test:publish && npm run check:native-package");
   });
 
   it("uses a cross-platform build helper for public package builds", () => {
-    expect(packageJson.scripts?.build).toBe("node scripts/build.mjs");
+    expect(packageJson.scripts?.build).toBe("node scripts/build/build.mjs");
     expect(packageJson.scripts?.build).not.toMatch(/\bchmod\b|&&/);
-    expect(existsSync(join(process.cwd(), "scripts", "build.mjs"))).toBe(true);
+    expect(existsSync(join(process.cwd(), "scripts", "build", "build.mjs"))).toBe(true);
   });
 });

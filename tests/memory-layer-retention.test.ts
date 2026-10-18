@@ -36,6 +36,16 @@ function root(): string {
 function store(rootDir = root()): MemoryStore {
   const opened = openMemoryStore(rootDir);
   opened.init();
+  opened.addSourceWithChunks({
+    source: {
+      id: "retention-evidence",
+      type: "conversation",
+      title: "Retention evidence",
+      origin: "test",
+      rawContent: "The retention fixtures are current project memories."
+    },
+    chunks: [{ text: "The retention fixtures are current project memories." }]
+  });
   stores.push(opened);
   return opened;
 }
@@ -100,7 +110,11 @@ function memory(layer: string, title: string, dedupeKey: string): ExtractedMemor
     reason: `${title} reason.`,
     confidence: 1,
     dedupeKey,
-    evidence: [],
+    evidence: [{
+      sourceType: "conversation",
+      sourceId: "retention-evidence",
+      locator: "retention-evidence:chunk:0"
+    }],
     relatedFiles: []
   };
 }

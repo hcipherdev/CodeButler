@@ -10,7 +10,7 @@ const originSchema = z.object({
   deviceId: z.string().min(1), platform: z.string().min(1), arch: z.string().min(1),
   generatedAt: z.string().datetime(),
   method: z.enum(["deterministic", "llm", "manual"]),
-  channel: z.enum(["sync", "cli", "mcp"]),
+  channel: z.enum(["sync", "cli", "mcp", "desktop"]),
   client: z.object({ name: z.string(), version: z.string().optional() }).optional(),
   generator: z.object({ provider: z.string().optional(), model: z.string().optional() }).optional()
 });

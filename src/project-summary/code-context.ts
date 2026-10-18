@@ -1,3 +1,4 @@
+import { gitExecutable } from "../git-executable.js";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
@@ -155,9 +156,9 @@ export interface ProjectSummaryReadOptions {
 
 export function collectProjectSummaryCodeFiles(
   rootDir: string,
-  input: ProjectSummaryCodeFileInput
+  input: ProjectSummaryCodeFileInput,
+  trackedPaths: ReadonlySet<string> = readTrackedPaths(rootDir)
 ): ProjectSummaryCodeFile[] {
-  const trackedPaths = readTrackedPaths(rootDir);
   const candidates = new Map<string, ProjectSummaryCodeSelectionReason>();
 
   for (const path of manifestEntrypoints(rootDir, input.manifests, trackedPaths)) {
@@ -200,7 +201,7 @@ export function collectProjectSummaryCodeFiles(
 
 export function readTrackedPaths(rootDir: string): ReadonlySet<string> {
   try {
-    const output = execFileSync("git", ["-C", rootDir, "ls-files", "-z"], {
+    const output = execFileSync(gitExecutable(), ["-C", rootDir, "ls-files", "-z"], {
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
       stdio: ["ignore", "pipe", "ignore"]

@@ -5,11 +5,20 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ensureProjectConfig } from "../src/config.js";
 import { closeProjectMemoryServer, createProjectMemoryServer, type ProjectMemoryServer } from "../src/server.js";
+import { binding, saveBinding } from "../src/cloud/state.js";
+import { automaticSyncStatus } from "../src/cloud/sync-owner.js";
 import { MemoryStoreCheckpointBusyError } from "../src/storage/store.js";
+import { readProjectSetupStatus } from "../src/project-setup.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("server startup sync", () => {
   let tempDirs: string[] = [];
+  function initializeTestProject(root: string): void {
+    ensureProjectConfig(root);
+    // These fixtures explicitly supply their own source locations below. The
+    // generated machine-local defaults must not override those fixture paths.
+    writeFileSync(join(root, ".code-butler", "config.local.json"), "{}");
+  }
 
   afterEach(() => {
     for (const dir of tempDirs) cleanupTempDir(dir);
@@ -54,7 +63,7 @@ describe("server startup sync", () => {
       ].join("\n")
     );
 
-    ensureProjectConfig(rootDir);
+    initializeTestProject(rootDir);
     writeFileSync(
       join(rootDir, ".code-butler", "config.json"),
       JSON.stringify(
@@ -93,8 +102,11 @@ describe("server startup sync", () => {
     expect(existsSync(join(repoDir, "AGENTS.md"))).toBe(false);
     expect(existsSync(join(repoDir, "CLAUDE.md"))).toBe(false);
     expect(existsSync(join(repoDir, ".code-butler", "project-summary.md"))).toBe(false);
+    expect(existsSync(join(rootDir, "AGENTS.md"))).toBe(true);
+    expect(existsSync(join(rootDir, "CLAUDE.md"))).toBe(true);
+    expect(existsSync(join(rootDir, ".code-butler", "project-summary.md"))).toBe(true);
 
-    projectServer.store.close();
+    await closeProjectMemoryServer(projectServer);
   });
 
   it("defers startup sync so the client handshake is answered first", async () => {
@@ -110,7 +122,7 @@ describe("server startup sync", () => {
         payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "deferred sync note" }] }
       })
     ].join("\n"));
-    ensureProjectConfig(rootDir);
+    initializeTestProject(rootDir);
     writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({
       sources: {
         git: { enabled: false },
@@ -136,7 +148,7 @@ describe("server startup sync", () => {
   it("omits startupSync when the caller wants sync to finish before serving", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
-    ensureProjectConfig(rootDir);
+    initializeTestProject(rootDir);
     writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({
       sources: { git: { enabled: false }, codex: { enabled: false, roots: [] }, claude: { enabled: false, roots: [] } },
       sync: { autoSyncOnServerStart: true }
@@ -145,6 +157,31 @@ describe("server startup sync", () => {
     const projectServer = await createProjectMemoryServer(rootDir);
     expect(projectServer.startupSync).toBeUndefined();
     projectServer.store.close();
+  });
+
+  it("does not replace a completed cloud request on unchanged routine startup", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    vi.stubEnv("CODE_BUTLER_HOME", join(rootDir, "home"));
+    try {
+      initializeTestProject(rootDir);
+      writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({
+        sources: { git: { enabled: false }, codex: { enabled: false }, claude: { enabled: false } },
+        sync: { autoSyncOnServerStart: false }
+      }));
+      saveBinding(rootDir, { server: "http://127.0.0.1", projectId: "test", vaultId: "test", enabled: true, revision: 0, fingerprint: "", status: "synced" });
+      const projectServer = await createProjectMemoryServer({ rootDir, deferStartupSync: true,
+        cloudSchedulerOptions: { automatic: false, sync: async () => binding(rootDir) } });
+      try {
+        await projectServer.startupSync?.();
+        expect(readProjectSetupStatus(rootDir)).toMatchObject({ status: "ready", missing: [] });
+        expect(automaticSyncStatus(rootDir).pending).toBe(true);
+        expect((await projectServer.stopCloud!.run()).outcome).toBe("success");
+        expect(automaticSyncStatus(rootDir).pending).toBe(false);
+        await projectServer.startupSync?.();
+        expect(automaticSyncStatus(rootDir).pending).toBe(false);
+      } finally { await closeProjectMemoryServer(projectServer); }
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("applies project redaction rules before startup sync writes", async () => {
@@ -161,7 +198,7 @@ describe("server startup sync", () => {
         payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: `ordinary ${secret}` }] }
       })
     ].join("\n"));
-    ensureProjectConfig(rootDir);
+    initializeTestProject(rootDir);
     writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({
       sources: {
         git: { enabled: false },

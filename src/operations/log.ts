@@ -47,6 +47,7 @@ const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const SOURCE_TYPES = new Set<SourceType>(["conversation", "commit", "decision"]);
 const LIFECYCLE_STATUSES = new Set<MemoryLifecycleStatus>(["current", "superseded", "retracted"]);
 const BRANCH_TRIAGE_ACTIONS = new Set(["promote_to_core", "discard", "retain_branch"]);
+const MEMORY_REVIEW_ACTIONS = new Set(["verify", "correct", "discard"]);
 const AUTOMATIC_PROMOTION_DECISIONS = new Set(["promote", "converge", "defer", "skip"]);
 const LAYER_RETENTION_DECISIONS = new Set(["archive", "skip"]);
 /** Both decision-bearing operation types share the `decision` metadata key. */
@@ -84,6 +85,7 @@ const METADATA_KEYS: Record<OperationType, ReadonlySet<string>> = {
     "policyVersion"
   ]),
   cloud_merge: new Set(["identifier", "count", "category"]),
+  memory_review: new Set(["memoryIdHash", "replacementMemoryIdHash", "reasonHash", "category", "action"]),
   migration: new Set(["migrationVersion"]),
   lifecycle_change: new Set(["memoryIdHash", "previousStatus", "newStatus", "replacementMemoryIdHash"]),
   redaction: new Set(["identifier", "count", "category"]),
@@ -303,13 +305,13 @@ export function validateOperationMetadata<T extends OperationType>(
   for (const key of Object.keys(metadata)) {
     if (!allowedKeys.has(key)) throw new Error(`${key} is not allowed in ${operationType} operation metadata`);
     const value = metadata[key];
-    validateMetadataValue(key, value);
+    validateMetadataValue(operationType, key, value);
     if (value !== undefined) canonical[key] = value;
   }
   return canonical as OperationLogEntry<T>["metadata"];
 }
 
-function validateMetadataValue(key: string, value: unknown): void {
+function validateMetadataValue(operationType: OperationType, key: string, value: unknown): void {
   if (value === undefined) return;
   if (key === "identifier") {
     assertSafeIdentifier(value, `${key} metadata`);
@@ -339,8 +341,9 @@ function validateMetadataValue(key: string, value: unknown): void {
       throw new Error(`${key} operation metadata must be a SHA-256 hex digest`);
     }
   } else if (key === "action") {
-    if (typeof value !== "string" || !BRANCH_TRIAGE_ACTIONS.has(value)) {
-      throw new Error("action operation metadata must be a branch triage action");
+    const allowed = operationType === "memory_review" ? MEMORY_REVIEW_ACTIONS : BRANCH_TRIAGE_ACTIONS;
+    if (typeof value !== "string" || !allowed.has(value)) {
+      throw new Error(`action operation metadata is invalid for ${operationType}`);
     }
   } else if (key === "decision") {
     if (typeof value !== "string" || !DECISION_VALUES.has(value)) {

@@ -90,8 +90,17 @@ function configFor(repoPath: string, overrides: Partial<ProjectConfig["promotion
   return { ...base, sources: { ...base.sources, git: { ...base.sources.git, repoPath } } } as ProjectConfig;
 }
 
-/** A project-scoped branch candidate: eligible on scope alone, no evidence needed. */
+/** A project-scoped branch candidate with structurally valid durable evidence. */
 function branchCandidate(s: MemoryStore, text: string, dedupeKey = "auto-promote") {
+  s.addCommit({
+    hash: "auto-promotion-evidence",
+    authorName: "Test User",
+    authorEmail: "test@example.com",
+    authoredAt: "2026-09-22T00:00:00.000Z",
+    message: "Record automatic-promotion evidence",
+    changedFiles: ["feature.md"],
+    diffSummary: "Record the branch-scoped cache decision."
+  });
   return s.upsertMemoryCandidate({
     layer: `branch:${BRANCH}:device:${DEVICE}`,
     type: "decision",
@@ -100,7 +109,7 @@ function branchCandidate(s: MemoryStore, text: string, dedupeKey = "auto-promote
     reason: "Discovered while building the feature.",
     confidence: 0.95,
     scope: { kind: "project" },
-    evidence: [],
+    evidence: [{ sourceType: "commit", sourceId: "auto-promotion-evidence" }],
     relatedFiles: [],
     dedupeKey
   }, { qualityStatus: "active", qualityReasons: [] });

@@ -1,7 +1,9 @@
 import { parseScope, sanitizeScope, scopeKey } from "../memory/scope.js";
+import { purgeRetrieval } from "../retrieval/privacy.js";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { invalidateHandbookExport, purgeHandbookExportBackups } from "../memory/export.js";
 
 import { parseMemoryOrigin, sanitizeMemoryOrigin } from "../memory/origin.js";
 import {
@@ -34,6 +36,12 @@ import {
 } from "../storage/privacy-maintenance.js";
 import { withTransaction } from "../storage/transactions.js";
 import type { EvidenceRef, RetentionConfig, SourceType } from "../types.js";
+
+function purgePrivacyBackups(store: MemoryStore): BackupPurgeResult {
+  const database = purgeDatabaseBackups(store.paths.databasePath);
+  const handbook = purgeHandbookExportBackups(store.paths.rootDir);
+  return { removed: [...database.removed, ...handbook.removed], failed: [...database.failed, ...handbook.failed] };
+}
 
 export interface PrivacyAuditFinding {
   table: string;
@@ -203,6 +211,7 @@ export function importPrivacy(
         tableCounts[table] = rows.length;
         for (const row of rows) insertRow(store, table, row);
       }
+      if(!store.db.prepare("select 1 from memory_events where kind='coverage'").get())store.db.prepare("insert into memory_events(id,event_key,kind,memory_id,category,layer,actor,occurred_at) values(?,?,'coverage','','promoted','core','system',?)").run("coverage-import-"+timestamp,"coverage-import-"+timestamp,timestamp);
       scrubStoredContent(store);
       rebuildPrivacyDerivedIndexes(store.db);
       for (const provider of document.embeddingProviders ?? []) {
@@ -238,6 +247,7 @@ export function importPrivacy(
 }
 
 export function scrubPrivacy(store: MemoryStore, options: PrivacyScrubOptions = {}): PrivacyScrubResult {
+  purgeRetrieval(store.paths.rootDir);
   const timestamp = (options.now?.() ?? new Date()).toISOString();
   const operation = store.beginOperation({
     operationType: "redaction",
@@ -264,7 +274,7 @@ export function scrubPrivacy(store: MemoryStore, options: PrivacyScrubOptions = 
     assertPrivacyDatabaseIntegrity(store.db);
     store.completeOperation(operation.id, { completedAt: timestamp });
     const purge = options.purgeBackups
-      ? purgeDatabaseBackups(store.paths.databasePath)
+      ? purgePrivacyBackups(store)
       : undefined;
     if (!options.purgeBackups) removeRecoveryBackup(backupPath);
     return {
@@ -317,6 +327,7 @@ export function deletePrivacySource(
   const source = store.readSource(input.sourceId);
   if (!source || !source.id) throw new Error(`Unknown source: ${input.sourceId}`);
   const sourceId = source.id;
+  purgeRetrieval(store.paths.rootDir);
   const timestamp = (input.now?.() ?? new Date()).toISOString();
   const sourceIdHash = hashOperationIdentifier(sourceId);
   const operation = store.beginOperation({
@@ -350,7 +361,7 @@ export function deletePrivacySource(
     input.afterCommitVerification?.();
     assertPrivacyDatabaseIntegrity(store.db);
     store.completeOperation(operation.id, { completedAt: timestamp });
-    const purge = input.purgeBackups ? purgeDatabaseBackups(store.paths.databasePath) : undefined;
+    const purge = input.purgeBackups ? purgePrivacyBackups(store) : undefined;
     if (!input.purgeBackups) removeRecoveryBackup(backupPath);
     return {
       sourceIdHash,
@@ -385,6 +396,7 @@ export function prunePrivacySources(
     now?: () => Date;
   }
 ): PrivacyPruneResult {
+  if(options.apply) purgeRetrieval(store.paths.rootDir);
   const now = options.now?.() ?? new Date();
   const rows = store.db.prepare(
     "select id, type, origin, metadata_json, created_at from sources order by created_at, id"
@@ -448,7 +460,7 @@ export function prunePrivacySources(
     }
     store.completeOperation(operation.id, { completedAt: timestamp });
     if (options.purgeBackups) {
-      result.purge = purgeDatabaseBackups(store.paths.databasePath);
+      result.purge = purgePrivacyBackups(store);
     } else if (backupPath) {
       removeRecoveryBackup(backupPath);
     }
@@ -483,7 +495,8 @@ function parseExportDocument(raw: string): PrivacyExportDocument {
     throw new Error("Invalid privacy export document");
   }
   const document = value as Partial<PrivacyExportDocument>;
-  if (document.format !== PRIVACY_EXPORT_FORMAT || document.version !== PRIVACY_EXPORT_VERSION) {
+  const exportVersion = (value as Record<string, unknown>).version;
+  if (document.format !== PRIVACY_EXPORT_FORMAT || (exportVersion !== 1 && exportVersion !== PRIVACY_EXPORT_VERSION)) {
     throw new Error("Unsupported privacy export format or version");
   }
   if (!document.tables || typeof document.tables !== "object" || Array.isArray(document.tables)) {
@@ -513,14 +526,14 @@ function parseExportDocument(raw: string): PrivacyExportDocument {
   )) {
     throw new Error("Invalid privacy export embedding providers");
   }
-  return document as PrivacyExportDocument;
+  return { ...document, version: PRIVACY_EXPORT_VERSION } as PrivacyExportDocument;
 }
 
 function countImportableRows(store: MemoryStore): number {
   return PRIVACY_EXPORT_TABLES
-    .filter((table) => table !== "operation_log" && table !== "private_identity_mappings")
+    .filter((table) => table !== "operation_log" && table !== "private_identity_mappings" && table !== "extraction_status")
     .reduce((total, table) => {
-      const row = store.db.prepare(`select count(*) as count from ${table}`).get() as { count: number };
+      const row = store.db.prepare(`select count(*) as count from ${table}${table==="memory_events"?" where kind<>'coverage'":""}`).get() as { count: number };
       return total + row.count;
     }, 0);
 }
@@ -541,6 +554,7 @@ function clearImportTables(store: MemoryStore, preserveOperationId: string): voi
 
 function importOrder(): readonly string[] {
   return [
+    "memory_events", "memory_topics", "memory_topic_links",
     "operation_log",
     "private_identity_mappings",
     "sources",
@@ -550,12 +564,16 @@ function importOrder(): readonly string[] {
     "relations",
     "sync_sources",
     "sync_cursors",
+    "extraction_jobs",
+    "extraction_status",
     "memories",
     "memory_candidates",
     "memory_links",
     "temporary_memories",
     "temporary_memory_links",
     "memory_relations",
+    "memory_review_resolutions",
+    "memory_review_resolution_compensations",
     "branch_triage_reviews",
     "promotion_decisions",
     "layer_retention_decisions",
@@ -566,6 +584,9 @@ function importOrder(): readonly string[] {
 }
 
 const PRIVACY_EXPORT_COLUMNS: Readonly<Record<string, readonly string[]>> = {
+  memory_events:["id","event_key","kind","memory_id","category","layer","related_memory_id","related_category","related_layer","from_value","to_value","reason","actor","occurred_at","recorded"],
+  memory_topics:["id","topic_id","layer","name","introduction","prefixes_json","parents_json","deleted","created_at"],
+  memory_topic_links:["id","topic_id","memory_id","category","layer","mode","created_at"],
   sources: ["id", "type", "title", "origin", "raw_content", "metadata_json", "created_at"],
   chunks: ["id", "source_id", "chunk_index", "text", "metadata_json"],
   commits: ["hash", "author_name", "author_email", "authored_at", "message", "changed_files_json", "diff_summary"],
@@ -573,16 +594,16 @@ const PRIVACY_EXPORT_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   relations: ["id", "from_type", "from_id", "relation", "to_type", "to_id", "locator"],
   sync_sources: ["source", "enabled", "last_sync_at", "last_success_at", "last_error", "metadata_json"],
   sync_cursors: ["source", "cursor_key", "cursor_value", "updated_at"],
+  extraction_jobs: ["adapter", "source_type", "source_id", "enqueued_at", "attempts", "last_attempt_at", "last_error"],
+  extraction_status: ["id", "last_success_at"],
   memory_candidates: [
-    "scope_json", "scope_key", "layer", "origin_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
+    "scope_json", "scope_key", "layer", "origin_json", "statement_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
     "related_files_json", "dedupe_key", "promotion_state", "promoted_memory_id",
-    "evidence_signature", "quality_status", "quality_reasons_json", "last_verified_at",
-    "created_at", "updated_at"
+    "evidence_signature", "created_at", "updated_at"
   ],
   memories: [
-    "scope_json", "scope_key", "layer", "origin_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
-    "related_files_json", "dedupe_key", "evidence_signature", "source", "quality_status",
-    "quality_reasons_json", "last_verified_at", "subject_key", "lifecycle_status",
+    "scope_json", "scope_key", "layer", "origin_json", "statement_json", "id", "type", "title", "summary", "reason", "confidence", "evidence_json",
+    "related_files_json", "dedupe_key", "evidence_signature", "source", "subject_key", "lifecycle_status",
     "valid_from", "valid_until", "status_reason", "status_changed_at",
     "lifecycle_generation", "created_at", "promoted_at"
   ],
@@ -595,6 +616,16 @@ const PRIVACY_EXPORT_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   ],
   temporary_memory_links: ["id", "memory_id", "target_type", "target_id", "locator", "metadata_json"],
   memory_relations: ["id", "from_memory_id", "to_memory_id", "relation_type", "created_at", "reason"],
+  memory_review_resolutions: [
+    "id", "memory_id", "category", "layer", "memory_version", "context_fingerprint", "action",
+    "resolved_reasons_json", "reason", "reviewed_at", "actor", "replacement_memory_id", "replacement_category",
+    "verdict", "policy_version", "provider", "model", "confidence", "citation_ids_json",
+    "reconciliation_run_id", "reconciliation_item_id"
+  ],
+  memory_review_resolution_compensations: [
+    "id", "resolution_id", "memory_id", "category", "layer", "reason", "reverted_at", "actor",
+    "reconciliation_run_id", "reconciliation_item_id"
+  ],
   branch_triage_reviews: [
     "id", "memory_id", "category", "branch", "layer", "memory_version", "action", "reason",
     "reviewed_at", "actor", "promoted_memory_id", "supersedes_memory_id"
@@ -632,6 +663,7 @@ const RESTORE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
 };
 
 const RESTORE_TABLE_ORDER = [
+  "memory_events", "memory_topics", "memory_topic_links",
   "schema_migrations",
   "operation_log",
   "private_identity_mappings",
@@ -642,12 +674,16 @@ const RESTORE_TABLE_ORDER = [
   "relations",
   "sync_sources",
   "sync_cursors",
+  "extraction_jobs",
+  "extraction_status",
   "memories",
   "memory_candidates",
   "memory_links",
   "temporary_memories",
   "temporary_memory_links",
   "memory_relations",
+  "memory_review_resolutions",
+  "memory_review_resolution_compensations",
   "branch_triage_reviews",
   "promotion_decisions",
   "layer_retention_decisions",
@@ -659,6 +695,11 @@ const RESTORE_TABLE_ORDER = [
 ] as const;
 
 function insertRow(store: MemoryStore, table: string, row: Record<string, unknown>): void {
+  if (table === "memory_candidates" || table === "memories") {
+    // v1 portable exports carried what is now a device-local derived cache.
+    const { quality_status: _status, quality_reasons_json: _reasons, last_verified_at: _verified, ...shared } = row;
+    row = shared;
+  }
   if (["memory_candidates", "memories", "temporary_memories"].includes(table)) {
     if (row.scope_json != null && typeof row.scope_json !== "string") throw new Error("Invalid memory scope metadata");
     const scope = sanitizeScope(store.contentPolicy, parseScope(row.scope_json as string | undefined));
@@ -708,6 +749,8 @@ function quoteIdentifier(value: string): string {
 }
 
 function scrubStoredContent(store: MemoryStore): number {
+  store.localDb.exec("delete from memory_wording_runs");
+  invalidateHandbookExport(store.paths.rootDir);
   store.db.exec("pragma defer_foreign_keys = on");
   let redactions = rekeySensitiveSourceIdentifiers(store);
   const text = (value: unknown): string | null => {
@@ -764,12 +807,12 @@ function scrubStoredContent(store: MemoryStore): number {
   });
   update("relations", "id", { relation: "text", locator: "text" });
   update("memory_candidates", "id", {
-    title: "text", summary: "text", reason: "text", evidence_json: "json",
-    related_files_json: "json", quality_reasons_json: "json"
+    title: "text", summary: "text", reason: "text", statement_json: "json", evidence_json: "json",
+    related_files_json: "json"
   });
   update("memories", "id", {
-    title: "text", summary: "text", reason: "text", evidence_json: "json",
-    related_files_json: "json", quality_reasons_json: "json", status_reason: "text"
+    title: "text", summary: "text", reason: "text", statement_json: "json", evidence_json: "json",
+    related_files_json: "json", status_reason: "text"
   });
   for (const table of ["memories", "memory_candidates", "temporary_memories"]) {
     const rows = store.db.prepare(`select id, scope_json from ${table}`).all() as Array<{ id: string; scope_json: string }>;
@@ -788,6 +831,13 @@ function scrubStoredContent(store: MemoryStore): number {
   });
   update("temporary_memory_links", "id", { locator: "text", metadata_json: "json" });
   update("memory_relations", "id", { reason: "text" });
+  update("memory_events","id",{reason:"text",from_value:"text",to_value:"text"});
+  update("memory_topics","id",{name:"text",introduction:"text",prefixes_json:"json"});
+  update("memory_review_resolutions", "id", {
+    layer: "text", resolved_reasons_json: "json", reason: "text", citation_ids_json: "json",
+    provider: "text", model: "text"
+  });
+  update("memory_review_resolution_compensations", "id", { layer: "text", reason: "text" });
   update("branch_triage_reviews", "id", { branch: "text", layer: "text", reason: "text" });
   update("promotion_decisions", "id", { target_layer: "text", reason_codes_json: "json" });
   update("layer_retention_decisions", "id", { layer: "text", reason_codes_json: "json" });
@@ -795,6 +845,7 @@ function scrubStoredContent(store: MemoryStore): number {
   update("source_failures", "id", { path: "text", message: "text" });
   update("sync_sources", "source", { last_error: "text", metadata_json: "json" });
   update("sync_cursors", ["source", "cursor_key"], { cursor_value: "text" });
+  update("extraction_jobs", ["source_type", "source_id"], { last_error: "text" });
   redactFileTargets(store, "relations", "id", "to_type", "to_id", () => { redactions += 1; });
   redactFileTargets(store, "memory_links", "id", "target_type", "target_id", () => { redactions += 1; });
   redactFileTargets(
@@ -821,6 +872,7 @@ function rekeySensitiveSourceIdentifiers(store: MemoryStore): number {
        from sources where id = ?`
     ).run(nextId, source.id);
     store.db.prepare("update chunks set source_id = ? where source_id = ?").run(nextId, source.id);
+    store.db.prepare("update extraction_jobs set source_id = ? where source_id = ?").run(nextId, source.id);
     if (source.type === "commit") {
       store.db.prepare(
         `insert into commits
@@ -1003,6 +1055,47 @@ function readEvidenceOwners(
   });
 }
 
+/**
+ * Make a merged database honour every privacy deletion either side recorded.
+ *
+ * Source tombstones are not merged row by row, so a source forgotten on one device can
+ * arrive intact in the other device's copy — always so when the merge has no common
+ * ancestor. The peer's tombstones (and the operations they cite) are adopted first, then
+ * any source still matching a tombstone is deleted the same way a privacy deletion would.
+ * Runs inside the caller's transaction; returns how many sources were removed.
+ */
+export function enforceSourceTombstones(store: MemoryStore, peer?: import("node:sqlite").DatabaseSync): number {
+  const hasTable = (db: import("node:sqlite").DatabaseSync, name: string) =>
+    !!db.prepare("select 1 from sqlite_master where type = 'table' and name = ?").get(name);
+  if (!hasTable(store.db, "source_tombstones")) return 0;
+  if (peer && hasTable(peer, "source_tombstones") && hasTable(peer, "operation_log")) {
+    const columns = (db: import("node:sqlite").DatabaseSync) =>
+      new Set((db.prepare("pragma table_info(operation_log)").all() as Array<{ name: string }>).map(row => row.name));
+    const local = columns(store.db), shared = [...columns(peer)].filter(name => local.has(name));
+    const quoted = shared.map(quoteIdentifier).join(", ");
+    for (const tombstone of peer.prepare("select source_type, source_id_hash, deleted_at, operation_id from source_tombstones").all() as Array<{ source_type: string; source_id_hash: string; deleted_at: string; operation_id: string }>) {
+      const operation = peer.prepare(`select ${quoted} from operation_log where id = ?`).get(tombstone.operation_id) as Record<string, string | number | null> | undefined;
+      if (!operation) continue;
+      store.db.prepare(`insert or ignore into operation_log (${quoted}) values (${shared.map(() => "?").join(", ")})`).run(...shared.map(name => operation[name]!));
+      store.db.prepare("insert or ignore into source_tombstones (source_type, source_id_hash, deleted_at, operation_id) values (?, ?, ?, ?)")
+        .run(tombstone.source_type, tombstone.source_id_hash, tombstone.deleted_at, tombstone.operation_id);
+    }
+  }
+  const tombstones = new Map((store.db.prepare("select source_type, source_id_hash, deleted_at, operation_id from source_tombstones").all() as Array<{ source_type: SourceType; source_id_hash: string; deleted_at: string; operation_id: string }>)
+    .map(row => [`${row.source_type}\0${row.source_id_hash}`, row]));
+  if (!tombstones.size) return 0;
+  let removed = 0;
+  for (const source of store.db.prepare("select id, type, origin from sources").all() as Array<{ id: string; type: SourceType; origin: string }>) {
+    let hash: string;
+    try { hash = hashOperationIdentifier(source.id); } catch { continue; }
+    const tombstone = tombstones.get(`${source.type}\0${hash}`);
+    if (!tombstone) continue;
+    deleteSourceData(store, { sourceId: source.id, sourceType: source.type, sourceIdHash: hash, sourceOrigin: source.origin, timestamp: tombstone.deleted_at, operationId: tombstone.operation_id });
+    removed++;
+  }
+  return removed;
+}
+
 function deleteSourceData(
   store: MemoryStore,
   input: {
@@ -1024,6 +1117,7 @@ function deleteSourceData(
     input.sourceType
   );
   for (const candidate of affectedCandidates) {
+    store.db.prepare("delete from memory_events where (memory_id=? and category='candidate') or (related_memory_id=? and related_category='candidate')").run(candidate.id,candidate.id);
     store.db.prepare("delete from memory_links where owner_kind = 'candidate' and owner_id = ?")
       .run(candidate.id);
     deletedCandidates += Number(
@@ -1051,7 +1145,11 @@ function deleteSourceData(
     }
   }
   const affectedMemories = [...affectedMemoriesById.values()];
+  invalidateHandbookExport(store.paths.rootDir);
+  store.localDb.exec("delete from memory_wording_runs");
   for (const memory of affectedMemories) {
+    store.db.prepare("delete from memory_events where memory_id=? or related_memory_id=?").run(memory.id,memory.id);
+    store.db.prepare("delete from memory_topic_links where memory_id=?").run(memory.id);
     const remaining = memory.evidence.filter((evidence) =>
       !evidenceMatchesSource(evidence, input.sourceType, input.sourceId)
     );
@@ -1087,6 +1185,7 @@ function deleteSourceData(
     input.sourceId,
     input.sourceType
   )) {
+    store.db.prepare("delete from memory_events where (memory_id=? and category='temporary') or (related_memory_id=? and related_category='temporary')").run(temporary.id,temporary.id);
     const remaining = temporary.evidence.filter((evidence) =>
       !evidenceMatchesSource(evidence, input.sourceType, input.sourceId)
     );

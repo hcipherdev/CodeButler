@@ -48,41 +48,20 @@ describe("project config", () => {
     const generatedProjectConfig = JSON.parse(readFileSync(configPath, "utf8"));
 
     expect(existsSync(configPath)).toBe(true);
+    expect(generatedProjectConfig).toEqual({});
     expect(generatedProjectConfig.extractor).toBeUndefined();
     expect(generatedProjectConfig.investigator).toBeUndefined();
-    expect(generatedProjectConfig.retrieval).toEqual({ mode: "fts", rrfK: 60 });
+    expect(generatedProjectConfig.retrieval).toBeUndefined();
     expect(generatedProjectConfig.embeddings).toBeUndefined();
-    expect(generatedProjectConfig.privacy).toEqual({ allowRemoteEmbeddings: false, redactionPatterns: [] });
-    expect(generatedProjectConfig.retention).toEqual({
-      migrationBackups: 2,
-      sources: {
-        git: { maxAgeDays: null },
-        codex: { maxAgeDays: null },
-        claude: { maxAgeDays: null },
-        manual: { maxAgeDays: null }
-      },
-      overrides: [],
-      layers: {
-        enabled: true,
-        graceDays: 30,
-        branch: { onDeleted: "archive", onMerged: "keep", maxIdleDays: null },
-        device: { maxIdleDays: null }
-      },
-      artifacts: {
-        logs: { maxBytes: 5 * 1024 * 1024, maxFiles: 3 },
-        projectSummaryBackups: { maxFiles: 5 },
-        recoveryBackups: { maxFiles: 5, minAgeDays: 7 },
-        cloudHandles: { reapStale: true }
-      }
-    });
     expect(existsSync(join(rootDir, ".code-butler", ".gitignore"))).toBe(true);
     expect(readFileSync(join(rootDir, ".code-butler", ".gitignore"), "utf8")).toBe(
-      ["/*", "!/.gitignore", "!/config.json", "!/project-summary.md", ""].join("\n")
+      ["/*", "!/.gitignore", "!/project-summary.md", ""].join("\n")
     );
     expect(existsSync(join(rootDir, ".code-butler", ".env.example"))).toBe(true);
-    expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.local.json"), "utf8"))).toEqual({
+    expect(existsSync(join(rootDir, ".code-butler", "config.local.json"))).toBe(false);
+    expect(existsSync(join(rootDir, ".code-butler", "config.examples.json"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(globalHome, "config.json"), "utf8"))).toMatchObject({
       sources: {
-        git: { repoPath: ".", hookInstall: false },
         codex: {
           roots: [
             join(homedir(), ".codex", "sessions"),
@@ -93,9 +72,9 @@ describe("project config", () => {
         claude: { roots: [join(homedir(), ".claude", "projects")] }
       }
     });
-    expect(existsSync(join(rootDir, ".code-butler", "config.examples.json"))).toBe(true);
     expect(defaults.sources.git.enabled).toBe(true);
     expect(defaults.promotion.confidenceThreshold).toBe(0.85);
+    expect(defaults.retention?.artifacts.recoveryBackups).toEqual({ maxFiles: 2, minAgeDays: 2 });
     expect(defaults.extractor.provider).toBe("openai-compatible");
     expect(defaults.sources.codex.roots).toEqual([
       join(homedir(), ".codex", "sessions"),
@@ -209,6 +188,76 @@ describe("project config", () => {
     expect(readFileSync(configPath, "utf8")).toContain('"maxCommits"');
   });
 
+  it("layers global machine defaults before sparse project overrides", () => {
+    // Absolute on this platform, so the roots are used as given rather than resolved against the project.
+    const sharedCodex = process.platform === "win32" ? "C:/shared/codex" : "/shared/codex";
+    const sharedClaude = process.platform === "win32" ? "C:/shared/claude" : "/shared/claude";
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    originalEnv.set("CODE_BUTLER_HOME", process.env.CODE_BUTLER_HOME);
+    process.env.CODE_BUTLER_HOME = globalHome;
+
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(
+      join(globalHome, "config.json"),
+      JSON.stringify({
+        sources: {
+          codex: { roots: [sharedCodex], includeDefaultRoots: false, projectOnly: false },
+          claude: { roots: [sharedClaude], projectOnly: false }
+        },
+        embeddings: { enabled: true, model: "global-model" },
+        extractor: { model: "global-extractor" }
+      }, null, 2)
+    );
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        sources: { codex: { projectOnly: true } },
+        embeddings: { model: "project-model" }
+      }, null, 2)
+    );
+
+    const config = loadProjectConfig(rootDir);
+
+    expect(config.sources.codex.roots).toEqual([sharedCodex]);
+    expect(config.sources.codex.includeDefaultRoots).toBe(false);
+    expect(config.sources.codex.projectOnly).toBe(true);
+    expect(config.sources.claude.roots).toEqual([sharedClaude]);
+    expect(config.sources.claude.projectOnly).toBe(false);
+    expect(config.embeddings.enabled).toBe(true);
+    expect(config.embeddings.model).toBe("project-model");
+    expect(config.extractor.model).toBe("global-extractor");
+  });
+
+  it("keeps legacy local overrides above global and project config", () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    originalEnv.set("CODE_BUTLER_HOME", process.env.CODE_BUTLER_HOME);
+    process.env.CODE_BUTLER_HOME = globalHome;
+
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(join(globalHome, "config.json"), JSON.stringify({ embeddings: { model: "global-model" } }));
+    writeFileSync(join(rootDir, ".code-butler", "config.local.json"), JSON.stringify({ embeddings: { model: "legacy-model" } }));
+    writeFileSync(configPath, JSON.stringify({ embeddings: { enabled: true, model: "project-model" } }));
+
+    expect(loadProjectConfig(rootDir).embeddings).toMatchObject({ enabled: true, model: "legacy-model" });
+  });
+
+  it("rejects malformed global configuration", () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    originalEnv.set("CODE_BUTLER_HOME", process.env.CODE_BUTLER_HOME);
+    process.env.CODE_BUTLER_HOME = globalHome;
+
+    ensureProjectConfig(rootDir);
+    writeFileSync(join(globalHome, "config.json"), JSON.stringify({ sources: { codex: { roots: [42] } } }));
+
+    expect(() => loadProjectConfig(rootDir)).toThrow("global.sources.codex.roots must be an array of nonempty strings");
+  });
+
   it("migrates local-only shared config into config.local.json without overwriting local choices", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -255,9 +304,12 @@ describe("project config", () => {
     expect(migrateSharedConfigToLocal(rootDir, { apply: true }).moved).toEqual([]);
   });
 
-  it("creates project-local env and config examples without secrets", () => {
+  it("creates project-local env and global config without secrets", () => {
     const rootDir = makeTempDir();
-    tempDirs.push(rootDir);
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    originalEnv.set("CODE_BUTLER_HOME", process.env.CODE_BUTLER_HOME);
+    process.env.CODE_BUTLER_HOME = globalHome;
 
     ensureProjectConfig(rootDir);
 
@@ -268,59 +320,8 @@ describe("project config", () => {
     expect(envExample).toContain("AWS_REGION=us-east-1");
     expect(envExample).not.toContain("sk-");
 
-    const examples = JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.examples.json"), "utf8"));
-    expect(examples.note).toContain("extractor and investigator are independent");
-    expect(examples.localEmbeddings).toMatchObject({
-      retrieval: { mode: "hybrid", rrfK: 60 },
-      embeddings: {
-        enabled: true,
-        baseUrl: "http://127.0.0.1:11434/v1",
-        model: "nomic-embed-text"
-      },
-      privacy: { allowRemoteEmbeddings: false }
-    });
-    expect(examples.privacyControls).toEqual({
-      description: expect.any(String),
-      privacy: {
-        redactionPatterns: [
-          { name: "internal token", kind: "regex", pattern: "INTERNAL-[A-Za-z0-9]+" },
-          { name: "literal password", kind: "literal", pattern: "replace-this-example" }
-        ]
-      },
-      retention: {
-        migrationBackups: 2,
-        sources: {
-          git: { maxAgeDays: null },
-          codex: { maxAgeDays: 90 },
-          claude: { maxAgeDays: 90 },
-          manual: { maxAgeDays: null }
-        },
-        overrides: []
-      }
-    });
-    expect(examples.openaiCompatible.extractor).toMatchObject({
-      provider: "openai-compatible",
-      baseUrl: "https://api.openai.com/v1",
-      apiKeyEnv: "OPENAI_API_KEY"
-    });
-    expect(examples.openaiCompatible.investigator).toMatchObject({
-      enabled: true,
-      provider: "openai-compatible",
-      apiKeyEnv: "OPENAI_API_KEY"
-    });
-    expect(examples.claudeAnthropicAws.extractor).toMatchObject({
-      provider: "anthropic-aws",
-      apiKeyEnv: "ANTHROPIC_AWS_API_KEY",
-      workspaceIdEnv: "ANTHROPIC_AWS_WORKSPACE_ID",
-      regionEnv: "AWS_REGION"
-    });
-    expect(examples.claudeAnthropicAws.investigator).toMatchObject({
-      enabled: true,
-      provider: "anthropic-aws",
-      apiKeyEnv: "ANTHROPIC_AWS_API_KEY",
-      workspaceIdEnv: "ANTHROPIC_AWS_WORKSPACE_ID",
-      regionEnv: "AWS_REGION"
-    });
+    expect(existsSync(join(globalHome, "config.json"))).toBe(true);
+    expect(existsSync(join(rootDir, ".code-butler", "config.examples.json"))).toBe(false);
   });
 
   it("merges retrieval, embedding, and privacy overrides independently from provider profiles", () => {
@@ -376,7 +377,7 @@ describe("project config", () => {
       sources: { codex: { maxAgeDays: 30 }, git: { maxAgeDays: null } }
     });
     expect(config.extractor).toMatchObject({ model: "gpt-5-mini", apiKeyEnv: "OPENAI_API_KEY" });
-    expect(config.investigator).toMatchObject({ model: "gpt-5-mini", apiKeyEnv: "OPENAI_API_KEY" });
+    expect(config.investigator).toMatchObject({ model: "gpt-5", apiKeyEnv: "OPENAI_API_KEY" });
   });
 
   it("applies every Release 3 default to a legacy config without Release 3 sections", () => {
@@ -447,7 +448,7 @@ describe("project config", () => {
     expect(() => loadProjectConfig(rootDir)).toThrow(SyntaxError);
   });
 
-  it("backfills missing example files without rewriting existing active config", () => {
+  it("backfills the environment example without rewriting existing active config", () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const codeButlerDir = join(rootDir, ".code-butler");
@@ -460,7 +461,7 @@ describe("project config", () => {
 
     expect(readFileSync(configPath, "utf8")).toBe(existingConfig);
     expect(existsSync(join(codeButlerDir, ".env.example"))).toBe(true);
-    expect(existsSync(join(codeButlerDir, "config.examples.json"))).toBe(true);
+    expect(existsSync(join(codeButlerDir, "config.examples.json"))).toBe(false);
   });
 
   it("upgrades legacy project ignore files to hide local memory state", () => {
@@ -474,7 +475,7 @@ describe("project config", () => {
     ensureProjectConfig(rootDir);
 
     expect(readFileSync(gitignorePath, "utf8")).toBe(
-      ["/*", "!/.gitignore", "!/config.json", "!/project-summary.md", ""].join("\n")
+      ["/*", "!/.gitignore", "!/project-summary.md", ""].join("\n")
     );
   });
 

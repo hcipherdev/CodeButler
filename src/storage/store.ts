@@ -1,4 +1,6 @@
 import { registerDatabaseHandle } from "../cloud/gate.js";
+import { cachedRead, hasCachedRead } from "../retrieval/read-cache.js";
+import { stateDirectory } from "../cloud/state.js";
 import { normalizeScope, parseScope, sanitizeScope, scopeKey, assessApplicability } from "../memory/scope.js";
 import { CORE_LAYER, deviceLayer, matchesLayerFilter, normalizeLayer, sanitizeLayer } from "../memory/layer.js";
 
@@ -19,7 +21,17 @@ import { mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { claimText, createStatement, memoryContentText, parseStatement } from "../memory/statement.js";
+import { presentMemory } from "../memory/presentation.js";
 import { parseMemoryOrigin, sanitizeMemoryOrigin } from "../memory/origin.js";
+import {
+  confidenceBasis,
+  createMemoryReviewContext,
+  currentMemoryReview,
+  effectiveTerminalMemoryReview,
+  trustDisplayStatus
+} from "../memory/review-state.js";
+import { readMemoryPopulation } from "../memory/quality.js";
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
 import {
   createEmbeddingContentHash,
@@ -28,6 +40,11 @@ import {
 } from "../embeddings/fingerprint.js";
 import { createEvidenceSignature } from "../memory/evidence-signature.js";
 import { createMemorySubjectKey } from "../memory/lifecycle.js";
+import {
+  pendingQuality,
+  withResolvedQuality,
+  writeExplicitMemoryQuality
+} from "../memory/quality-cache.js";
 import { redactSensitiveText } from "../privacy/redaction.js";
 import type { RedactionPolicy } from "../privacy/policy.js";
 import {
@@ -39,13 +56,23 @@ import {
   listOperations
 } from "../operations/log.js";
 import { initializeSchema } from "./migrations.js";
+import {
+  openLocalMemoryDatabase,
+  invalidateLocalMemoryQuality,
+  pruneLocalMemoryQuality,
+  seedLegacyMemoryQuality
+} from "./local-memory.js";
 import { createStorageContentPolicy, type StorageContentPolicy } from "./content-policy.js";
+import { recordMemoryEvent } from "../memory/events.js";
+import { moveTopicMemberships } from "../memory/topics.js";
 import {
   addSourceWithChunks,
   findSourcesMentioningFile,
+  listSourceChunks,
   readChunkWindow,
   readConversationWindow,
   readSource,
+  readSourceMetadata,
   shouldSuppressSourceWrite
 } from "./source-store.js";
 import {
@@ -134,13 +161,18 @@ function sanitizeDecision(policy: StorageContentPolicy, decision: DecisionRecord
 }
 
 function sanitizeExtractedMemory(policy: StorageContentPolicy, memory: ExtractedMemory): ExtractedMemory {
+  const parsed = memory.statement === undefined ? undefined : parseStatement(memory.statement, memory.type);
+  if (memory.statement !== undefined && !parsed) throw new Error("Invalid memory statement");
+  const statement = parsed ? createStatement(policy.text(parsed.text), memory.type, parsed.origin,
+    Object.fromEntries(Object.entries(parsed.fields).map(([key, value]) => [key, policy.text(value)]))) : undefined;
   return {
+    ...(statement ? { statement } : {}),
     scope: sanitizeScope(policy, memory.scope),
     layer: sanitizeLayer(policy, memory.layer),
     origin: sanitizeMemoryOrigin(policy, memory.origin),
     type: memory.type,
     title: policy.text(memory.title),
-    summary: policy.text(memory.summary),
+    summary: statement?.text ?? policy.text(memory.summary),
     reason: policy.text(memory.reason),
     confidence: memory.confidence,
     evidence: policy.evidence(memory.evidence),
@@ -293,9 +325,27 @@ export interface ProjectSummary {
     active: number;
     needsReview: number;
     quarantined: number;
+    retired: number;
+    replaced: number;
   };
   lastSyncAt?: string;
   syncSources: Partial<Record<SyncSourceName, SyncStatus>>;
+  extraction?: ExtractionStatus;
+}
+
+export interface ExtractionJob {
+  adapter: SyncSourceName;
+  sourceType: "conversation" | "commit";
+  sourceId: string;
+  enqueuedAt: string;
+  attempts: number;
+  lastAttemptAt?: string;
+  lastError?: string;
+}
+
+export interface ExtractionStatus {
+  pending: number;
+  lastSuccessAt?: string;
 }
 
 export type MemoryQualityStatusFilter = MemoryQualityStatus | "all";
@@ -312,13 +362,17 @@ export interface MemoryStore {
   findSourceTombstone(sourceType: SourceType, sourceId: string): SourceTombstone | undefined;
   addSourceWithChunks(input: AddSourceInput): string;
   readSource(sourceId: string): MemorySource | undefined;
+  readSourceMetadata(sourceId: string): Omit<MemorySource, "rawContent"> | undefined;
+  prefetchCitationReads(evidence: EvidenceRef[]): void;
   readChunkWindow(sourceId: string, chunkIndex: number, before: number, after: number): MemoryChunk[];
+  listSourceChunks(sourceId: string): MemoryChunk[];
   readConversationWindow(sourceId: string, anchorChunkId: string, before: number, after: number): MemoryChunk[];
   search(input: { query: string; sourceTypes?: string[]; limit?: number }): SearchResult[];
   readSearchResultsByChunkIds(chunkIds: string[]): SearchResult[];
   addCommit(commit: CommitRecord): string;
   readCommit(hash: string): CommitRecord | undefined;
   findCommits(input: { query?: string; filePath?: string; limit?: number }): CommitRecord[];
+  hasSensitiveGitEvidence(): boolean;
   getEntityLinks(entity: InvestigationEntityRef): InvestigationEntityLink[];
   findSourcesMentioningFile(filePath: string, limit?: number): MemorySource[];
   findMemoriesByEvidence(sourceType: SourceType, sourceId: string, limit?: number): MemorySearchResult[];
@@ -327,6 +381,12 @@ export interface MemoryStore {
   recordSyncStatus(status: SyncStatus): void;
   getSyncStatus(source: SyncSourceName): SyncStatus | undefined;
   listSyncStatuses(): SyncStatus[];
+  enqueueExtractionEvidence(adapter: SyncSourceName, sourceType: ExtractionJob["sourceType"], sourceId: string): void;
+  listPendingExtractionEvidence(sources?: readonly SyncSourceName[], limit?: number): ExtractionJob[];
+  completeExtractionEvidence(jobs: readonly ExtractionJob[], completedAt?: string): void;
+  discardExtractionEvidence(jobs: readonly ExtractionJob[]): void;
+  recordExtractionFailure(jobs: readonly ExtractionJob[], error: string, attemptedAt?: string): void;
+  getExtractionStatus(): ExtractionStatus;
   recordSourceFailure(input: {
     adapter: SyncSourceName;
     path: string;
@@ -408,7 +468,7 @@ export interface MemoryStore {
   promoteMemoryCandidate(
     candidateId: string,
     source?: DurableMemory["source"],
-    options?: { layer?: string | undefined }
+    options?: { layer?: string | undefined; actor?: import("../types.js").OperationActor | undefined }
   ): DurableMemory;
   upsertManualDecisionMemory(decision: DecisionRecord, origin?: MemoryOrigin): DurableMemory;
   readMemory(id: string): DurableMemory | undefined;
@@ -420,6 +480,8 @@ export interface MemoryStore {
       validUntil?: string | null;
       statusReason?: string | null;
       statusChangedAt?: string;
+      actor?: import("../types.js").OperationActor | undefined;
+      replacementMemoryId?: string | undefined;
     }
   ): DurableMemory;
   addMemoryRelation(input: {
@@ -443,6 +505,7 @@ export interface MemoryStore {
     owner?: MemoryLayerOwner;
     query?: string;
     limit?: number | null;
+    excludeTerminalReviews?: boolean;
   }): MemoryCandidate[];
   listMemories(input?: {
     type?: MemoryType;
@@ -463,6 +526,8 @@ export interface MemoryStore {
       lastVerifiedAt?: string | undefined;
     }
   ): void;
+  readTemporaryMemory(id: string): TemporaryMemory | undefined;
+  keepTemporaryMemory(id: string, now?: string): TemporaryMemory;
   upsertTemporaryMemory(input: TemporaryMemoryUpsertInput): TemporaryMemory;
   searchTemporaryMemory(input: {
     query: string;
@@ -487,16 +552,25 @@ export interface MemoryStore {
     qualityStatus?: MemoryQualityStatusFilter;
     layer?: MemoryLayerFilter;
     owner?: MemoryLayerOwner;
+    offset?: number;
     limit?: number;
+    summaryOnly?: boolean;
   }): MemorySearchResult[];
-  readMemorySearchResultsByIds(memoryIds: string[]): MemorySearchResult[];
+  readMemorySearchResultsByIds(memoryIds: string[], input?: {
+    lifecycleStatus?: MemoryLifecycleStatusFilter;
+    includeCandidates?: boolean;
+    summaryOnly?: boolean;
+  }): MemorySearchResult[];
   getProjectSummary(): ProjectSummary;
+  maintainLocalQualityCache(): number;
   readonly contentPolicy: StorageContentPolicy;
   db: DatabaseSync;
+  localDb: DatabaseSync;
   paths: {
     rootDir: string;
     dataDir: string;
     databasePath: string;
+    localDatabasePath: string;
     conversationsDir: string;
     decisionsDir: string;
   };
@@ -555,6 +629,7 @@ interface MemoryCandidateRow {
   scope_key: string;
   layer: string;
   origin_json: string | null;
+  statement_json: string | null;
   id: string;
   type: MemoryType;
   title: string;
@@ -566,9 +641,6 @@ interface MemoryCandidateRow {
   dedupe_key: string;
   promotion_state: MemoryPromotionState;
   promoted_memory_id: string | null;
-  quality_status: MemoryQualityStatus;
-  quality_reasons_json: string;
-  last_verified_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -578,6 +650,7 @@ interface MemoryRow {
   scope_key: string;
   layer: string;
   origin_json: string | null;
+  statement_json: string | null;
   id: string;
   type: MemoryType;
   title: string;
@@ -588,9 +661,6 @@ interface MemoryRow {
   related_files_json: string;
   dedupe_key: string;
   source: DurableMemory["source"];
-  quality_status: MemoryQualityStatus;
-  quality_reasons_json: string;
-  last_verified_at: string | null;
   subject_key: string;
   lifecycle_status: MemoryLifecycleStatus;
   valid_from: string;
@@ -677,6 +747,8 @@ interface ActiveEmbeddingVectorRow extends EmbeddingVectorRow {
   current_memory_title: string | null;
   current_memory_summary: string | null;
   current_memory_reason: string | null;
+  current_memory_statement: string | null;
+  current_memory_type: MemoryType;
 }
 
 const TEMPORARY_MEMORY_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -688,6 +760,8 @@ export interface OpenMemoryStoreOptions {
   readonly backupRetention?: number;
   /** Resolves the layer for working context; injectable so tests need no global device identity. */
   readonly deviceLayer?: () => string;
+  /** Injectable for tests; configured stores keep this database outside cloud snapshots. */
+  readonly localDatabasePath?: string;
 }
 
 export class MemoryStoreCheckpointBusyError extends Error {
@@ -697,11 +771,19 @@ export class MemoryStoreCheckpointBusyError extends Error {
   }
 }
 
+export function deviceLocalMemoryDatabasePath(rootDir: string): string {
+  const dataDir = basename(rootDir) === ".code-butler" ? rootDir : join(rootDir, ".code-butler");
+  return process.env.VITEST
+    ? join(dataDir, "memory-local.sqlite")
+    : join(stateDirectory(basename(rootDir) === ".code-butler" ? join(rootDir, "..") : rootDir), "memory-local.sqlite");
+}
+
 export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions = {}): MemoryStore {
   const dataDir = basename(rootDir) === ".code-butler" ? rootDir : join(rootDir, ".code-butler");
   const conversationsDir = join(dataDir, "imports", "conversations");
   const decisionsDir = join(dataDir, "decisions");
   const databasePath = join(dataDir, "memory.sqlite");
+  const localDatabasePath = options.localDatabasePath ?? deviceLocalMemoryDatabasePath(rootDir);
   mkdirSync(dataDir, { recursive: true });
 
   const releaseHandle = registerDatabaseHandle(dataDir);
@@ -711,6 +793,14 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
   db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA journal_mode = WAL");
+  let localDb: DatabaseSync;
+  try {
+    localDb = openLocalMemoryDatabase(localDatabasePath);
+  } catch (error) {
+    db.close();
+    releaseHandle();
+    throw error;
+  }
   // Resolved once, and lazily, so opening a store never reaches for the global device identity.
   let resolvedDeviceLayer: string | undefined;
   const workingContextLayer = (): string =>
@@ -718,31 +808,42 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
   const baseContentPolicy = createStorageContentPolicy(options.privacyPolicy);
   const contentPolicy = createDurableContentPolicy(db, baseContentPolicy);
   const backupRetention = options.backupRetention;
+  let closed = false;
 
   const store: MemoryStore = {
     db,
+    localDb,
     contentPolicy,
     paths: {
       rootDir,
       dataDir,
       databasePath,
+      localDatabasePath,
       conversationsDir,
       decisionsDir
     },
     init() {
       mkdirSync(conversationsDir, { recursive: true });
       mkdirSync(decisionsDir, { recursive: true });
+      const before = readMainSchemaVersion(db);
+      if (before < 20) seedLegacyMemoryQuality(db, localDb);
       initializeSchema(db, databasePath, backupRetention === undefined ? {} : { backupRetention });
+      if (before < 20) {
+        invalidateLocalMemoryQuality(localDb);
+        pruneLocalMemoryQuality(db, localDb);
+      }
+    },
+    maintainLocalQualityCache() {
+      return pruneLocalMemoryQuality(db, localDb);
     },
     close() {
-      const checkpoint = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
-      if (checkpoint.busy !== 0) {
-        throw new MemoryStoreCheckpointBusyError(
-          "Cannot safely close Code Butler memory database: another SQLite reader prevented WAL checkpointing. Close the reader and retry before committing or syncing this project."
-        );
-      }
-      db.close();
-      releaseHandle();
+      if (closed) return;
+      const busy = (db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number }).busy !== 0 ||
+        (localDb.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number }).busy !== 0;
+      if (busy) throw new MemoryStoreCheckpointBusyError(
+        "Cannot safely close Code Butler memory database: another SQLite reader prevented WAL checkpointing. Close the reader and retry before committing or syncing this project."
+      );
+      try { localDb.close(); } finally { try { db.close(); } finally { closed = true; releaseHandle(); } }
     },
     beginOperation(input) {
       return beginOperation(db, input);
@@ -769,13 +870,42 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       return addSourceWithChunks(db, contentPolicy, input);
     },
     readSource(sourceId) {
-      return readSource(db, contentPolicy, sourceId);
+      return cachedRead(store,`raw-source:${sourceId}`,()=>readSource(db, contentPolicy, sourceId));
+    },
+    readSourceMetadata(sourceId) {
+      return cachedRead(store, `source:${sourceId}`, () => readSourceMetadata(db, contentPolicy, sourceId));
+    },
+    prefetchCitationReads(evidence) {
+      const sourceIds=[...new Set(evidence.filter(e=>e.sourceType!=="commit").map(e=>contentPolicy.identifier(e.sourceId)))].filter(id=>!hasCachedRead(store,`source:${id}`));
+      const chunkIds=[...new Set(evidence.filter(e=>!hasCachedRead(store,JSON.stringify(["window",e.sourceId,e.locator,0,0]))).flatMap(e=>e.locator ? [contentPolicy.identifier(e.locator)] : []))];
+      const hashes=[...new Set(evidence.filter(e=>e.sourceType==="commit").map(e=>contentPolicy.identifier(e.sourceId)))].filter(id=>!hasCachedRead(store,`commit:${id}`));
+      for(const batch of chunked(sourceIds,SQLITE_READ_BATCH_SIZE)) {
+        const rows=db.prepare(`select id,type,title,origin,metadata_json from sources where id in (${batch.map(()=>"?").join(",")})`).all(...batch) as Array<{id:string;type:MemorySource["type"];title:string;origin:string;metadata_json:string}>;
+        const byId=new Map(rows.map(r=>[r.id,{id:r.id,type:r.type,title:r.title,origin:r.origin,metadata:parseJsonObject(r.metadata_json)}]));
+        for(const id of batch) cachedRead(store,`source:${id}`,()=>byId.get(id));
+      }
+      for(const batch of chunked(chunkIds,SQLITE_READ_BATCH_SIZE)) {
+        const rows=db.prepare(`select * from chunks where id in (${batch.map(()=>"?").join(",")})`).all(...batch) as Array<{id:string;source_id:string;chunk_index:number;text:string;metadata_json:string}>;
+        const byId=new Map(rows.map(r=>[r.id,{id:r.id,sourceId:r.source_id,chunkIndex:r.chunk_index,text:r.text,metadata:parseJsonObject(r.metadata_json)}]));
+        for(const ref of evidence) if(ref.locator && batch.includes(ref.locator)) {
+          const row=byId.get(ref.locator);
+          cachedRead(store,JSON.stringify(["window",ref.sourceId,ref.locator,0,0]),()=>row?.sourceId===ref.sourceId ? [row] : []);
+        }
+      }
+      for(const batch of chunked(hashes,SQLITE_READ_BATCH_SIZE)) {
+        const rows=db.prepare(`select * from commits where hash in (${batch.map(()=>"?").join(",")})`).all(...batch) as unknown as CommitRow[];
+        const byId=new Map(rows.map(r=>[r.hash,commitFromRow(r)]));
+        for(const id of batch) cachedRead(store,`commit:${id}`,()=>byId.get(id));
+      }
     },
     readChunkWindow(sourceId, chunkIndex, before, after) {
       return readChunkWindow(db, contentPolicy, sourceId, chunkIndex, before, after);
     },
+    listSourceChunks(sourceId) {
+      return listSourceChunks(db, contentPolicy, sourceId);
+    },
     readConversationWindow(sourceId, anchorChunkId, before, after) {
-      return readConversationWindow(db, contentPolicy, sourceId, anchorChunkId, before, after);
+      return cachedRead(store, JSON.stringify(["window", sourceId, anchorChunkId, before, after]), () => readConversationWindow(db, contentPolicy, sourceId, anchorChunkId, before, after));
     },
     search(input) {
       const query = toFtsQuery(input.query);
@@ -900,6 +1030,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       });
     },
     readCommit(hash) {
+      return cachedRead(store,`commit:${hash}`,()=>{
       hash = contentPolicy.identifier(hash);
       const row = db
         .prepare(
@@ -909,35 +1040,38 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         )
         .get(hash) as CommitRow | undefined;
       return row ? commitFromRow(row) : undefined;
+      });
     },
     findCommits(input) {
-      const rows = db
-        .prepare(
-          `select hash, author_name, author_email, authored_at, message, changed_files_json, diff_summary
-           from commits
-           order by authored_at desc, rowid asc`
-        )
-        .all() as unknown as CommitRow[];
       const query = input.query?.toLowerCase();
       const filePath = input.filePath === undefined ? undefined : contentPolicy.path(input.filePath);
       const limit = normalizeLimit(input.limit);
-
-      return rows
-        .map(commitFromRow)
-        .filter((commit) => {
-          if (filePath && !commit.changedFiles.includes(filePath)) return false;
-          if (!query) return true;
-          const haystack = [
-            commit.hash,
-            commit.message,
-            commit.diffSummary,
-            commit.changedFiles.join(" ")
-          ]
-            .join(" ")
-            .toLowerCase();
-          return haystack.includes(query);
-        })
-        .slice(0, limit);
+      const rows = db.prepare(
+        `select hash, author_name, author_email, authored_at, message, changed_files_json, diff_summary
+           from commits
+          ${filePath ? "where exists (select 1 from json_each(commits.changed_files_json) where value = ?)" : ""}
+          order by authored_at desc, rowid asc
+          ${query ? "" : "limit ?"}`
+      ).iterate(...(filePath ? [filePath] : []), ...(query ? [] : [limit])) as unknown as Iterable<CommitRow>;
+      const matches: CommitRecord[] = [];
+      for (const row of rows) {
+        const commit = commitFromRow(row);
+        if (query) {
+          const haystack = [commit.hash, commit.message, commit.diffSummary, commit.changedFiles.join(" ")]
+            .join(" ").toLowerCase();
+          if (!haystack.includes(query)) continue;
+        }
+        matches.push(commit);
+        if (matches.length >= limit) break;
+      }
+      return matches;
+    },
+    hasSensitiveGitEvidence() {
+      const row = db.prepare(`select exists(
+        select 1 from commits c, json_each(c.changed_files_json) f
+        where lower(f.value) like 'secrets/%'
+      ) as found`).get() as { found: number };
+      return row.found !== 0;
     },
     getEntityLinks(entity) {
       entity = sanitizeEntityRef(contentPolicy, entity);
@@ -1139,6 +1273,65 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         )
         .all() as unknown as SyncStatusRow[];
       return rows.map(syncStatusFromRow);
+    },
+    enqueueExtractionEvidence(adapter, sourceType, sourceId) {
+      db.prepare(
+        `insert into extraction_jobs (adapter, source_type, source_id, enqueued_at)
+         values (?, ?, ?, ?)
+         on conflict(source_type, source_id) do update set
+           adapter = excluded.adapter,
+           enqueued_at = excluded.enqueued_at,
+           attempts = 0,
+           last_attempt_at = null,
+           last_error = null`
+      ).run(adapter, sourceType, contentPolicy.identifier(sourceId), new Date().toISOString());
+    },
+    listPendingExtractionEvidence(sources, limit = 100) {
+      const selected = sources?.filter(Boolean) ?? [];
+      const where = selected.length ? `where adapter in (${selected.map(() => "?").join(", ")})` : "";
+      const rows = db.prepare(
+        `select adapter, source_type, source_id, enqueued_at, attempts, last_attempt_at, last_error
+         from extraction_jobs ${where}
+         order by attempts, enqueued_at, source_type, source_id limit ?`
+      ).all(...selected, Math.max(1, Math.floor(limit))) as unknown as Array<{
+        adapter: SyncSourceName; source_type: ExtractionJob["sourceType"]; source_id: string;
+        enqueued_at: string; attempts: number; last_attempt_at: string | null; last_error: string | null;
+      }>;
+      return rows.map(row => ({
+        adapter: row.adapter, sourceType: row.source_type, sourceId: row.source_id,
+        enqueuedAt: row.enqueued_at, attempts: row.attempts,
+        ...(row.last_attempt_at ? { lastAttemptAt: row.last_attempt_at } : {}),
+        ...(row.last_error ? { lastError: row.last_error } : {})
+      }));
+    },
+    completeExtractionEvidence(jobs, completedAt = new Date().toISOString()) {
+      withTransaction(db, () => {
+        const remove = db.prepare("delete from extraction_jobs where source_type = ? and source_id = ?");
+        for (const job of jobs) remove.run(job.sourceType, contentPolicy.identifier(job.sourceId));
+        db.prepare("insert into extraction_status (id, last_success_at) values (1, ?) on conflict(id) do update set last_success_at = excluded.last_success_at").run(completedAt);
+      });
+    },
+    discardExtractionEvidence(jobs) {
+      const remove = db.prepare("delete from extraction_jobs where source_type = ? and source_id = ?");
+      withTransaction(db, () => {
+        for (const job of jobs) remove.run(job.sourceType, contentPolicy.identifier(job.sourceId));
+      });
+    },
+    recordExtractionFailure(jobs, error, attemptedAt = new Date().toISOString()) {
+      const update = db.prepare(
+        `update extraction_jobs set attempts = attempts + 1, last_attempt_at = ?, last_error = ?
+         where source_type = ? and source_id = ?`
+      );
+      const safeError = contentPolicy.text(error).slice(0, 500);
+      withTransaction(db, () => {
+        for (const job of jobs) update.run(attemptedAt, safeError, job.sourceType, contentPolicy.identifier(job.sourceId));
+      });
+    },
+    getExtractionStatus() {
+      const pending = (db.prepare("select count(*) as count from extraction_jobs").get() as { count: number }).count;
+      const row = db.prepare("select last_success_at from extraction_status where id = 1")
+        .get() as { last_success_at: string | null } | undefined;
+      return { pending, ...(row?.last_success_at ? { lastSuccessAt: row.last_success_at } : {}) };
     },
     recordSourceFailure(input) {
       const occurredAt = input.occurredAt ?? new Date().toISOString();
@@ -1461,7 +1654,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
                 ev.created_at, ev.updated_at,
                 c.text as current_chunk_text,
                 m.title as current_memory_title, m.summary as current_memory_summary,
-                m.reason as current_memory_reason
+                m.reason as current_memory_reason, m.statement_json as current_memory_statement, m.type as current_memory_type
          from embedding_vectors ev
          left join chunks c on ev.owner_kind = 'chunk' and c.id = ev.owner_id
          left join memories m on ev.owner_kind = 'memory' and m.id = ev.owner_id
@@ -1474,7 +1667,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
           ? row.current_chunk_text
           : row.current_memory_title === null || row.current_memory_summary === null || row.current_memory_reason === null
             ? null
-            : [row.current_memory_title, row.current_memory_summary, row.current_memory_reason].join("\n\n");
+            : memoryContentText({ title: row.current_memory_title, summary: row.current_memory_summary, reason: row.current_memory_reason, statement: parseStatement(row.current_memory_statement, row.current_memory_type) });
         return text !== null && createEmbeddingContentHash(text) === row.content_hash
           ? [embeddingVectorFromRow(row)]
           : [];
@@ -1527,26 +1720,24 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         const layer = sanitizeLayer(contentPolicy, memory.layer);
         const existing = db
           .prepare(
-            `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                    dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
+            `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                    dedupe_key, promotion_state, promoted_memory_id,
                     created_at, updated_at
              from memory_candidates
              where dedupe_key = ? and scope_key = ? and layer = ?`
           )
           .get(memory.dedupeKey, scopeKey(memory.scope), layer) as MemoryCandidateRow | undefined;
+        const statement = memory.statement ?? (existing?.summary === memory.summary ? parseStatement(existing.statement_json, memory.type) : undefined);
         const candidateId = existing?.id ?? `candidate-${randomUUID()}`;
         const promotionState = options?.promotionState ?? existing?.promotion_state ?? "candidate";
-        const qualityStatus = options?.qualityStatus ?? existing?.quality_status ?? "active";
-        const qualityReasons = options?.qualityReasons ?? parseJsonArray(existing?.quality_reasons_json ?? "[]");
-        const lastVerifiedAt = options?.lastVerifiedAt ?? existing?.last_verified_at ?? null;
         db.prepare(
           `insert into memory_candidates
-             (scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-              dedupe_key, promotion_state, evidence_signature, quality_status, quality_reasons_json,
-              last_verified_at, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             (scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+              dedupe_key, promotion_state, evidence_signature, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            on conflict(dedupe_key, scope_key, layer) do update set
              type = excluded.type,
+             statement_json = excluded.statement_json,
              title = excluded.title,
              summary = excluded.summary,
              reason = excluded.reason,
@@ -1555,13 +1746,11 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
              related_files_json = excluded.related_files_json,
              promotion_state = excluded.promotion_state,
              evidence_signature = excluded.evidence_signature,
-             quality_status = excluded.quality_status,
-             quality_reasons_json = excluded.quality_reasons_json,
-             last_verified_at = excluded.last_verified_at,
              updated_at = excluded.updated_at`
         ).run(
           JSON.stringify(normalizeScope(memory.scope)), scopeKey(memory.scope), layer,
           memory.origin ? JSON.stringify(memory.origin) : null,
+          statement ? JSON.stringify(statement) : null,
           candidateId,
           memory.type,
           memory.title,
@@ -1573,23 +1762,28 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
           memory.dedupeKey,
           promotionState,
           createEvidenceSignature(memory.evidence),
-          qualityStatus,
-          JSON.stringify(qualityReasons),
-          lastVerifiedAt,
           existing?.created_at ?? now,
           now
         );
         rebuildMemoryLinks(db, "candidate", candidateId, memory.evidence, memory.relatedFiles);
         const row = db
           .prepare(
-            `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                    dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
+            `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                    dedupe_key, promotion_state, promoted_memory_id,
                     created_at, updated_at
              from memory_candidates
              where id = ?`
           )
           .get(candidateId) as unknown as MemoryCandidateRow;
-        return memoryCandidateFromRow(row);
+        const candidate = memoryCandidateFromRow(row);
+        if (options?.qualityStatus !== undefined || options?.qualityReasons !== undefined || options?.lastVerifiedAt !== undefined) {
+          writeExplicitMemoryQuality(store, "candidate", candidate, {
+            qualityStatus: options?.qualityStatus ?? "active",
+            qualityReasons: options?.qualityReasons ?? [],
+            lastVerifiedAt: options?.lastVerifiedAt
+          }, now);
+        }
+        return withResolvedQuality(store, "candidate", candidate);
       });
     },
     promoteMemoryCandidate(candidateId, source = "auto", options = {}) {
@@ -1597,8 +1791,8 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         candidateId = contentPolicy.identifier(candidateId);
         const candidate = db
           .prepare(
-            `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                    dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
+            `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                    dedupe_key, promotion_state, promoted_memory_id,
                     created_at, updated_at
              from memory_candidates
              where id = ?`
@@ -1607,11 +1801,14 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         if (!candidate) {
           throw new Error(`Unknown memory candidate: ${candidateId}`);
         }
+        const resolvedCandidate = withResolvedQuality(store, "candidate", memoryCandidateFromRow(candidate));
         const layer = options.layer === undefined ? candidate.layer : sanitizeLayer(contentPolicy, options.layer);
-        const memory = upsertMemoryRow(db, {
+        const previousLayer = candidate.promoted_memory_id ? readMemoryRowRaw(db, candidate.promoted_memory_id)?.layer ?? candidate.layer : candidate.layer;
+        let memory = upsertMemoryRow(db, {
           scope: parseScope(candidate.scope_json),
           layer,
           origin: parseMemoryOrigin(candidate.origin_json),
+          statement: parseStatement(candidate.statement_json, candidate.type),
           id: candidate.promoted_memory_id ?? undefined,
           type: candidate.type,
           title: candidate.title,
@@ -1622,23 +1819,37 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
           relatedFiles: parseJsonArray(candidate.related_files_json),
           dedupeKey: candidate.dedupe_key,
           source,
-          qualityStatus: candidate.quality_status,
-          qualityReasons: parseJsonArray(candidate.quality_reasons_json),
-          lastVerifiedAt: candidate.last_verified_at ?? undefined,
+          actor: options.actor,
           createdAt: candidate.created_at
         });
+        if (memory.layer !== layer) {
+          db.prepare("update memories set layer=? where id=?").run(layer, memory.id);
+          memory = readMemoryRow(db, memory.id)!;
+        }
+        if (previousLayer !== layer) {
+          moveTopicMemberships(store,memory.id,previousLayer,layer);
+          recordMemoryEvent(db, contentPolicy, {
+          kind: "sharing_changed", memoryId: memory.id, category: "promoted", layer,
+          from: previousLayer, to: layer, reason: "Shared while making this candidate durable", actor: options.actor ?? "system"
+          });
+        }
         db.prepare(
           `update memory_candidates
            set promotion_state = 'promoted', promoted_memory_id = ?, layer = ?, updated_at = ?
            where id = ?`
         ).run(memory.id, layer, new Date().toISOString(), candidateId);
-        return memory;
+        writeExplicitMemoryQuality(store, "promoted", memory, {
+          qualityStatus: resolvedCandidate.qualityStatus,
+          qualityReasons: resolvedCandidate.qualityReasons,
+          lastVerifiedAt: resolvedCandidate.lastVerifiedAt
+        });
+        return withResolvedQuality(store, "promoted", memory);
       });
     },
     upsertManualDecisionMemory(decision, origin) {
       return withTransaction(db, () => {
         decision = sanitizeDecision(contentPolicy, decision);
-        return upsertMemoryRow(db, {
+        const memory = upsertMemoryRow(db, {
           scope: decision.scope,
           layer: CORE_LAYER,
           origin: sanitizeMemoryOrigin(contentPolicy, origin),
@@ -1646,26 +1857,35 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
           type: "decision",
           title: decision.topic,
           summary: decision.decision,
+          statement: createStatement(decision.decision, "decision", "submitted", { choice: decision.decision, rationale: decision.reason }),
           reason: decision.reason,
           confidence: 1,
           evidence: decision.evidence,
           relatedFiles: [],
           dedupeKey: `manual-decision:${decision.id}`,
           source: "manual",
-          qualityStatus: "active",
-          qualityReasons: [],
           createdAt: decision.createdAt
         });
+        writeExplicitMemoryQuality(store, "promoted", memory, {
+          qualityStatus: "active",
+          qualityReasons: [],
+          lastVerifiedAt: decision.createdAt
+        }, decision.createdAt);
+        return withResolvedQuality(store, "promoted", memory);
       });
     },
     readMemory(id) {
-      return readMemoryRow(db, contentPolicy.identifier(id));
+      const memory = readMemoryRow(db, contentPolicy.identifier(id));
+      return memory ? withResolvedQuality(store, "promoted", memory) : undefined;
     },
     updateMemoryLifecycle(id, lifecycle) {
       return updateStoredMemoryLifecycle(
         db,
         contentPolicy,
-        (memoryId) => readMemoryRow(db, memoryId),
+        (memoryId) => {
+          const memory = readMemoryRow(db, memoryId);
+          return memory ? withResolvedQuality(store, "promoted", memory) : undefined;
+        },
         id,
         lifecycle
       );
@@ -1674,7 +1894,10 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       return addStoredMemoryRelation(
         db,
         contentPolicy,
-        (memoryId) => readMemoryRow(db, memoryId),
+        (memoryId) => {
+          const memory = readMemoryRow(db, memoryId);
+          return memory ? withResolvedQuality(store, "promoted", memory) : undefined;
+        },
         input
       );
     },
@@ -1688,32 +1911,36 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       const layer = layerSqlPredicate(input.layer, input.owner, importedPeerLayers(db));
       const rows = db
         .prepare(
-          `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, promotion_state, promoted_memory_id, quality_status, quality_reasons_json, last_verified_at,
+          `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                  dedupe_key, promotion_state, promoted_memory_id,
                   created_at, updated_at
            from memory_candidates
            ${layer.clause}
            order by updated_at desc, created_at desc, rowid desc`
         )
-        .all(...layer.parameters) as unknown as MemoryCandidateRow[];
-      return rows
-        .map(memoryCandidateFromRow)
-        .filter((candidate) => {
-          if (input.type && candidate.type !== input.type) return false;
-          if (input.promotionState && candidate.promotionState !== input.promotionState) return false;
-          if (!matchesQualityStatus(candidate.qualityStatus, input.qualityStatus)) return false;
-          if (!matchesLayerFilter(candidate.layer, input.layer)) return false;
-          return matchesMemoryQuery(candidate, input.query);
-        })
-        .slice(0, input.limit === null ? undefined : normalizeLimit(input.limit));
+        .iterate(...layer.parameters) as unknown as Iterable<MemoryCandidateRow>;
+      const matches: MemoryCandidate[] = [];
+      const limit = input.limit === null ? Infinity : normalizeLimit(input.limit);
+      for (const row of rows) {
+        if (input.type && row.type !== input.type) continue;
+        if (input.promotionState && row.promotion_state !== input.promotionState) continue;
+        const candidate = withResolvedQuality(store, "candidate", memoryCandidateFromRow(row));
+        if (!matchesQualityStatus(candidate.qualityStatus, input.qualityStatus)) continue;
+        if (!matchesLayerFilter(candidate.layer, input.layer)) continue;
+        if (!matchesMemoryQuery(candidate, input.query)) continue;
+        if (input.excludeTerminalReviews && effectiveTerminalMemoryReview(store, "candidate", candidate) !== undefined) continue;
+        matches.push(candidate);
+        if (matches.length >= limit) break;
+      }
+      return matches;
     },
     listMemories(input = {}) {
       if (input.status === "candidate") return [];
       const layer = layerSqlPredicate(input.layer, input.owner, importedPeerLayers(db));
       const rows = db
         .prepare(
-          `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+          `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                  dedupe_key, source,
                   subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                   lifecycle_generation,
                   created_at, promoted_at
@@ -1721,31 +1948,55 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
            ${layer.clause}
            order by promoted_at desc, created_at desc`
         )
-        .all(...layer.parameters) as unknown as MemoryRow[];
-      return rows
-        .map(memoryFromRow)
-        .filter((memory) => {
-          if (input.type && memory.type !== input.type) return false;
-          if (!matchesLifecycleStatus(memory.lifecycleStatus, input.lifecycleStatus)) return false;
-          if (!matchesQualityStatus(memory.qualityStatus, input.qualityStatus)) return false;
-          if (!matchesLayerFilter(memory.layer, input.layer)) return false;
-          return matchesMemoryQuery(memory, input.query);
-        })
-        .slice(0, input.limit === null ? undefined : normalizeLimit(input.limit));
+        .iterate(...layer.parameters) as unknown as Iterable<MemoryRow>;
+      const matches: DurableMemory[] = [];
+      const limit = input.limit === null ? Infinity : normalizeLimit(input.limit);
+      for (const row of rows) {
+        if (input.type && row.type !== input.type) continue;
+        if (!matchesLifecycleStatus(row.lifecycle_status, input.lifecycleStatus)) continue;
+        const memory = withResolvedQuality(store, "promoted", memoryFromRow(row));
+        if (!matchesQualityStatus(memory.qualityStatus, input.qualityStatus)) continue;
+        if (!matchesLayerFilter(memory.layer, input.layer)) continue;
+        if (!matchesMemoryQuery(memory, input.query)) continue;
+        matches.push(memory);
+        if (matches.length >= limit) break;
+      }
+      return matches;
     },
     updateMemoryQuality(kind, id, quality) {
       id = contentPolicy.identifier(id);
-      const table = kind === "candidate" ? "memory_candidates" : "memories";
-      db.prepare(
-        `update ${table}
-         set quality_status = ?, quality_reasons_json = ?, last_verified_at = ?
-         where id = ?`
-      ).run(
-        quality.qualityStatus,
-        JSON.stringify(quality.qualityReasons.map(contentPolicy.text)),
-        quality.lastVerifiedAt ?? null,
-        id
-      );
+      const memory = kind === "candidate"
+        ? db.prepare(
+            `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence,
+                    evidence_json, related_files_json, dedupe_key, promotion_state, promoted_memory_id, created_at, updated_at
+               from memory_candidates where id = ?`
+          ).get(id) as MemoryCandidateRow | undefined
+        : readMemoryRowRaw(db, id);
+      if (!memory) return;
+      const mapped = kind === "candidate" ? memoryCandidateFromRow(memory as MemoryCandidateRow) : memoryFromRow(memory as MemoryRow);
+      writeExplicitMemoryQuality(store, kind, mapped, {
+        qualityStatus: quality.qualityStatus,
+        qualityReasons: quality.qualityReasons.map(contentPolicy.text),
+        lastVerifiedAt: quality.lastVerifiedAt
+      });
+      db.prepare("insert into retrieval_changes(entity,entity_id,operation) values(?,?, 'quality')").run(kind==="promoted" ? "memories" : "memory_candidates",id);
+    },
+    readTemporaryMemory(id) {
+      const row = db.prepare("select * from temporary_memories where id=? and project_id=?").get(id, store.paths.rootDir) as unknown as TemporaryMemoryRow | undefined;
+      if (!row) return undefined;
+      const memory = temporaryMemoryFromRow(row);
+      memory.citations = resolveEvidenceCitations(store, memory);
+      return memory;
+    },
+    keepTemporaryMemory(id, now = new Date().toISOString()) {
+      return withTransaction(db, () => {
+        const memory = store.readTemporaryMemory(id);
+        if (!memory || Date.parse(memory.expiresAt) <= Date.parse(now)) throw new Error("Working context has expired or is unavailable");
+        if (db.prepare("select 1 from peer_partitions where layer=?").get(memory.layer ?? "core")) throw new Error("Another device's working context is read-only");
+        const expiry = capTemporaryMemoryExpiry(memory.createdAt, new Date(Math.max(Date.parse(memory.expiresAt), Date.parse(now) + TEMPORARY_MEMORY_DEFAULT_TTL_MS)).toISOString());
+        db.prepare("update temporary_memories set expires_at=?,updated_at=? where id=?").run(expiry, now, id);
+        return store.readTemporaryMemory(id)!;
+      });
     },
     upsertTemporaryMemory(input) {
       return withTransaction(db, () => {
@@ -1914,9 +2165,11 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
     },
     searchMemoryLayer(input = {}) {
       const limit = normalizeLimit(input.limit);
+      const offset = normalizeOffset(input.offset);
+      const sourceLimit = offset + limit;
       const promotedInput: Parameters<typeof store.listMemories>[0] = {
         status: "promoted",
-        limit
+        limit: sourceLimit
       };
       if (input.type !== undefined) promotedInput.type = input.type;
       if (input.query !== undefined) promotedInput.query = input.query;
@@ -1928,39 +2181,68 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         input.status === "candidate"
           ? []
           : store.listMemories(promotedInput);
-      const candidateInput: Parameters<typeof store.listMemoryCandidates>[0] = { limit };
+      const candidateInput: Parameters<typeof store.listMemoryCandidates>[0] = {
+        limit: sourceLimit,
+        promotionState: "candidate",
+        excludeTerminalReviews: true
+      };
       if (input.type !== undefined) candidateInput.type = input.type;
       if (input.query !== undefined) candidateInput.query = input.query;
       if (input.qualityStatus !== undefined) candidateInput.qualityStatus = input.qualityStatus;
       if (input.layer !== undefined) candidateInput.layer = input.layer;
       if (input.owner !== undefined) candidateInput.owner = input.owner;
       const candidates =
-        input.status === "promoted"
+        input.status === "promoted" || promoted.length >= sourceLimit
           ? []
           : store.listMemoryCandidates(candidateInput);
 
-      return [
-        ...promoted.map<MemorySearchResult>((memory) => memorySearchResult(store, "promoted", memory)),
-        ...candidates.map<MemorySearchResult>((candidate) => memorySearchResult(store, "candidate", candidate))
-      ].slice(0, limit);
+      const matches: Array<{
+        kind: MemorySearchResult["kind"];
+        memory: MemoryCandidate | DurableMemory;
+      }> = [
+        ...promoted.map((memory) => ({ kind: "promoted" as const, memory })),
+        ...candidates.map((memory) => ({ kind: "candidate" as const, memory }))
+      ];
+      return matches
+        .slice(offset, offset + limit)
+        .map(({ kind, memory }) => input.summaryOnly
+          ? memorySearchSummaryResult(store, kind, memory)
+          : memorySearchResult(store, kind, memory));
     },
-    readMemorySearchResultsByIds(memoryIds) {
+    readMemorySearchResultsByIds(memoryIds, input = {}) {
       memoryIds = memoryIds.map(contentPolicy.identifier);
       if (memoryIds.length === 0) return [];
-      const rows = chunked(memoryIds, SQLITE_READ_BATCH_SIZE).flatMap((batch) =>
+      const memoryRows = chunked(memoryIds, SQLITE_READ_BATCH_SIZE).flatMap((batch) =>
         db.prepare(
-          `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                  dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+          `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                  dedupe_key, source,
                   subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                   lifecycle_generation, created_at, promoted_at
-           from memories where lifecycle_status = 'current'
-             and id in (${batch.map(() => "?").join(", ")})`
+           from memories where id in (${batch.map(() => "?").join(", ")})`
         ).all(...batch) as unknown as MemoryRow[]
       );
-      const byId = new Map(rows.map((row) => [row.id, memoryFromRow(row)]));
+      const candidateRows = input.includeCandidates ? chunked(memoryIds, SQLITE_READ_BATCH_SIZE).flatMap((batch) =>
+        db.prepare(
+          `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                  dedupe_key, promotion_state, promoted_memory_id,
+                  created_at, updated_at
+           from memory_candidates where promotion_state = 'candidate'
+             and id in (${batch.map(() => "?").join(", ")})`
+        ).all(...batch) as unknown as MemoryCandidateRow[]
+      ) : [];
+      const byId = new Map<string, MemorySearchResult>([
+        ...candidateRows.map((row) => [
+          row.id,
+          (input.summaryOnly ? memorySearchSummaryResult : memorySearchResult)(store, "candidate", withResolvedQuality(store, "candidate", memoryCandidateFromRow(row)))
+        ] as const),
+        ...memoryRows
+          .map((row) => withResolvedQuality(store, "promoted", memoryFromRow(row)))
+          .filter((memory) => matchesLifecycleStatus(memory.lifecycleStatus, input.lifecycleStatus))
+          .map((memory) => [memory.id, (input.summaryOnly ? memorySearchSummaryResult : memorySearchResult)(store, "promoted", memory)] as const)
+      ]);
       return memoryIds.flatMap((memoryId) => {
         const memory = byId.get(memoryId);
-        return memory ? [memorySearchResult(store, "promoted", memory)] : [];
+        return memory ? [memory] : [];
       });
     },
     getProjectSummary() {
@@ -1984,8 +2266,9 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         candidateMemories: countRows(db, "memory_candidates"),
         promotedMemories: countRows(db, "memories"),
         temporaryMemories: countRows(db, "temporary_memories"),
-        memoryHealth: countMemoryHealth(db),
-        syncSources
+        memoryHealth: countMemoryHealth(store),
+        syncSources,
+        extraction: store.getExtractionStatus()
       };
       if (lastSyncAt !== undefined) summary.lastSyncAt = lastSyncAt;
       return summary;
@@ -2001,6 +2284,7 @@ function upsertMemoryRow(
     scope?: import("../types.js").MemoryScope | undefined;
     layer: string;
     origin?: MemoryOrigin | null;
+    statement?: import("../types.js").MemoryStatement | undefined;
     id?: string | undefined;
     type: MemoryType;
     title: string;
@@ -2011,9 +2295,7 @@ function upsertMemoryRow(
     relatedFiles: string[];
     dedupeKey: string;
     source: DurableMemory["source"];
-    qualityStatus: MemoryQualityStatus;
-    qualityReasons: string[];
-    lastVerifiedAt?: string | undefined;
+    actor?: import("../types.js").OperationActor | undefined;
     createdAt: string;
   }
 ): DurableMemory {
@@ -2021,8 +2303,8 @@ function upsertMemoryRow(
   const existing = input.id
     ? readMemoryRowRaw(db, input.id)
     : db.prepare(
-        `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-                dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+        `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                dedupe_key, source,
                 subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
                 lifecycle_generation,
                 created_at, promoted_at
@@ -2031,38 +2313,37 @@ function upsertMemoryRow(
       ).get(input.dedupeKey, evidenceSignature, input.source, scopeKey(input.scope), input.layer) as MemoryRow | undefined;
   const id = existing?.id ?? input.id ?? `memory-${randomUUID()}`;
   const subjectKey = createMemorySubjectKey(input.type, input.title);
+  const statement = input.statement ?? (existing?.summary === input.summary ? parseStatement(existing.statement_json, input.type) : undefined);
   if (existing) {
     db.prepare(
       `update memories set
-         type = ?, title = ?, summary = ?, reason = ?, confidence = ?, evidence_json = ?,
-         related_files_json = ?, dedupe_key = ?, evidence_signature = ?, source = ?, subject_key = ?,
-         quality_status = ?, quality_reasons_json = ?, last_verified_at = ?
+         type = ?, title = ?, summary = ?, statement_json = ?, reason = ?, confidence = ?, evidence_json = ?,
+         related_files_json = ?, dedupe_key = ?, evidence_signature = ?, source = ?, subject_key = ?
        where id = ?`
     ).run(
-      input.type, input.title, input.summary, input.reason, input.confidence,
+      input.type, input.title, input.summary, statement ? JSON.stringify(statement) : null, input.reason, input.confidence,
       JSON.stringify(input.evidence), JSON.stringify(input.relatedFiles), input.dedupeKey,
-      evidenceSignature, input.source, subjectKey, input.qualityStatus,
-      JSON.stringify(input.qualityReasons), input.lastVerifiedAt ?? null, id
+      evidenceSignature, input.source, subjectKey, id
     );
   } else {
     const promotedAt = new Date().toISOString();
     const lifecycleGeneration = randomUUID();
     db.prepare(
       `insert into memories
-         (scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-          dedupe_key, evidence_signature, source, quality_status, quality_reasons_json,
-          last_verified_at, subject_key, lifecycle_status, valid_from, valid_until,
+         (scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+          dedupe_key, evidence_signature, source, subject_key, lifecycle_status, valid_from, valid_until,
           status_reason, status_changed_at, lifecycle_generation, created_at, promoted_at)
-       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?, ?)`
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?, null, null, ?, ?, ?, ?)`
     ).run(
       JSON.stringify(normalizeScope(input.scope)), scopeKey(input.scope), input.layer,
       input.origin ? JSON.stringify(input.origin) : null,
+      statement ? JSON.stringify(statement) : null,
       id, input.type, input.title, input.summary, input.reason, input.confidence,
       JSON.stringify(input.evidence), JSON.stringify(input.relatedFiles), input.dedupeKey,
-      evidenceSignature, input.source, input.qualityStatus, JSON.stringify(input.qualityReasons),
-      input.lastVerifiedAt ?? null, subjectKey, input.createdAt, promotedAt, lifecycleGeneration,
+      evidenceSignature, input.source, subjectKey, input.createdAt, promotedAt, lifecycleGeneration,
       input.createdAt, promotedAt
     );
+    recordMemoryEvent(db,createStorageContentPolicy(),{kind:"made_durable",memoryId:id,category:"promoted",layer:input.layer,at:promotedAt,actor:input.actor ?? "system",key:`made-durable:${id}`});
   }
   rebuildMemoryLinks(db, "memory", id, input.evidence, input.relatedFiles);
   return readMemoryRow(db, id) as DurableMemory;
@@ -2070,8 +2351,8 @@ function upsertMemoryRow(
 
 function readMemoryRowRaw(db: DatabaseSync, id: string): MemoryRow | undefined {
   return db.prepare(
-    `select scope_json, scope_key, layer, origin_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
-            dedupe_key, source, quality_status, quality_reasons_json, last_verified_at,
+    `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+            dedupe_key, source,
             subject_key, lifecycle_status, valid_from, valid_until, status_reason, status_changed_at,
             lifecycle_generation,
             created_at, promoted_at
@@ -2224,13 +2505,13 @@ function isCurrentEmbeddingOwner(
       && createEmbeddingContentHash(chunk.text) === input.contentHash;
   }
   const memory = db.prepare(
-    `select title, summary, reason, lifecycle_generation
+    `select type, title, summary, reason, statement_json, lifecycle_generation
      from memories where id = ? and lifecycle_status = 'current'`
   ).get(input.ownerId) as
-    | { title: string; summary: string; reason: string; lifecycle_generation: string }
+    | { type: MemoryType; title: string; summary: string; reason: string; statement_json: string | null; lifecycle_generation: string }
     | undefined;
   if (!memory || memory.lifecycle_generation !== input.ownerVersion) return false;
-  const text = [memory.title, memory.summary, memory.reason].join("\n\n");
+  const text = memoryContentText({ ...memory, statement: parseStatement(memory.statement_json, memory.type) });
   return createEmbeddingContentHash(text) === input.contentHash;
 }
 
@@ -2345,15 +2626,30 @@ function countRows(db: DatabaseSync, table: string): number {
   return row.count;
 }
 
-function countMemoryHealth(db: DatabaseSync): { active: number; needsReview: number; quarantined: number } {
-  const rows = [
-    ...db.prepare("select quality_status as status from memory_candidates where promotion_state = 'candidate'").all(),
-    ...db.prepare("select quality_status as status from memories").all()
-  ] as Array<{ status: string }>;
+function readMainSchemaVersion(db: DatabaseSync): number {
+  try {
+    const row = db.prepare("select max(version) as version from schema_migrations").get() as { version: number | null };
+    return row.version ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+function countMemoryHealth(store: MemoryStore): {
+  active: number;
+  needsReview: number;
+  quarantined: number;
+  retired: number;
+  replaced: number;
+} {
+  const population = readMemoryPopulation(store);
+  const live = population.live.map(({ memory }) => memory.qualityStatus);
   return {
-    active: rows.filter((row) => normalizeQualityStatus(row.status) === "active").length,
-    needsReview: rows.filter((row) => normalizeQualityStatus(row.status) === "needs_review").length,
-    quarantined: rows.filter((row) => normalizeQualityStatus(row.status) === "quarantined").length
+    active: live.filter((status) => status === "active").length,
+    needsReview: live.filter((status) => status === "needs_review").length,
+    quarantined: live.filter((status) => status === "quarantined").length,
+    retired: population.retired,
+    replaced: population.replaced
   };
 }
 
@@ -2387,6 +2683,11 @@ function layerSqlPredicate(
 function normalizeLimit(limit: number | undefined): number {
   if (!limit || !Number.isFinite(limit)) return 10;
   return Math.max(1, Math.min(Math.floor(limit), 100));
+}
+
+function normalizeOffset(offset: number | undefined): number {
+  if (!offset || !Number.isFinite(offset)) return 0;
+  return Math.max(0, Math.min(Math.floor(offset), 10_000));
 }
 
 function chunked<T>(items: T[], size: number): T[][] {
@@ -2453,6 +2754,8 @@ function formatCommitSearchText(commit: CommitRecord): string {
 }
 
 function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
+  const quality = pendingQuality();
+  const statement = parseStatement(row.statement_json, row.type);
   return {
     scope: parseScope(row.scope_json),
     layer: row.layer,
@@ -2461,7 +2764,8 @@ function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
     id: row.id,
     type: row.type,
     title: row.title,
-    summary: row.summary,
+    summary: statement?.text ?? row.summary,
+    ...(statement ? { statement } : {}),
     reason: row.reason,
     confidence: row.confidence,
     evidence: parseEvidenceJson(row.evidence_json),
@@ -2469,15 +2773,16 @@ function memoryCandidateFromRow(row: MemoryCandidateRow): MemoryCandidate {
     dedupeKey: row.dedupe_key,
     promotionState: row.promotion_state,
     promotedMemoryId: row.promoted_memory_id ?? undefined,
-    qualityStatus: normalizeQualityStatus(row.quality_status),
-    qualityReasons: parseJsonArray(row.quality_reasons_json),
-    lastVerifiedAt: row.last_verified_at ?? undefined,
+    qualityStatus: quality.qualityStatus,
+    qualityReasons: quality.qualityReasons,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
 }
 
 function memoryFromRow(row: MemoryRow): DurableMemory {
+  const quality = pendingQuality();
+  const statement = parseStatement(row.statement_json, row.type);
   return {
     scope: parseScope(row.scope_json),
     layer: row.layer,
@@ -2486,16 +2791,16 @@ function memoryFromRow(row: MemoryRow): DurableMemory {
     id: row.id,
     type: row.type,
     title: row.title,
-    summary: row.summary,
+    summary: statement?.text ?? row.summary,
+    ...(statement ? { statement } : {}),
     reason: row.reason,
     confidence: row.confidence,
     evidence: parseEvidenceJson(row.evidence_json),
     relatedFiles: parseJsonArray(row.related_files_json),
     dedupeKey: row.dedupe_key,
     source: row.source,
-    qualityStatus: normalizeQualityStatus(row.quality_status),
-    qualityReasons: parseJsonArray(row.quality_reasons_json),
-    lastVerifiedAt: row.last_verified_at ?? undefined,
+    qualityStatus: quality.qualityStatus,
+    qualityReasons: quality.qualityReasons,
     subjectKey: row.subject_key,
     lifecycleStatus: row.lifecycle_status,
     validFrom: row.valid_from,
@@ -2508,11 +2813,17 @@ function memoryFromRow(row: MemoryRow): DurableMemory {
   };
 }
 
+
+function dbPeer(store:MemoryStore,layer?:string):boolean { return layer!==undefined && layer!=="core" && !!store.db.prepare("select 1 from peer_partitions where layer=?").get(layer); }
+
 function memorySearchResult(
   store: MemoryStore,
   kind: MemorySearchResult["kind"],
   memory: MemoryCandidate | DurableMemory
 ): MemorySearchResult {
+  const reviewContext = createMemoryReviewContext(store, kind, memory);
+  const basis = confidenceBasis(memory);
+  const review = currentMemoryReview(store, kind, memory, reviewContext);
   const citations = resolveEvidenceCitations(store, {
     evidence: memory.evidence,
     relatedFiles: memory.relatedFiles
@@ -2526,15 +2837,19 @@ function memorySearchResult(
     id: memory.id,
     type: memory.type,
     title: memory.title,
-    summary: memory.summary,
+    summary: claimText(memory),
+    ...(memory.statement ? { statement: memory.statement } : {}),
     reason: memory.reason,
     confidence: memory.confidence,
+    confidenceBasis: basis,
     evidence: memory.evidence,
     relatedFiles: memory.relatedFiles,
     dedupeKey: memory.dedupeKey,
     qualityStatus: memory.qualityStatus,
     qualityReasons: memory.qualityReasons,
     lastVerifiedAt: memory.lastVerifiedAt,
+    reviewToken: reviewContext.reviewToken,
+    ...(review === undefined ? {} : { review }),
     citations,
     trust: buildTrustSummary({
       status: memory.qualityStatus,
@@ -2545,6 +2860,10 @@ function memorySearchResult(
       lastVerifiedAt: memory.lastVerifiedAt
     })
   };
+  if (result.trust) {
+    result.trust.displayStatus = trustDisplayStatus(store, kind, memory);
+    result.trust.confidenceBasis = basis;
+  }
   if ("lifecycleStatus" in memory) {
     result.subjectKey = memory.subjectKey;
     result.lifecycleStatus = memory.lifecycleStatus;
@@ -2553,6 +2872,37 @@ function memorySearchResult(
     result.statusReason = memory.statusReason;
     result.statusChangedAt = memory.statusChangedAt;
   }
+  result.presentation = presentMemory(result, dbPeer(store, memory.layer));
+  return result;
+}
+
+function memorySearchSummaryResult(
+  store: MemoryStore,
+  kind: MemorySearchResult["kind"],
+  memory: MemoryCandidate | DurableMemory
+): MemorySearchResult {
+  const result: MemorySearchResult = {
+    kind,
+    scope: normalizeScope(memory.scope),
+    origin: memory.origin ?? null,
+    applicability: assessApplicability(memory.scope),
+    id: memory.id,
+    type: memory.type,
+    title: memory.title,
+    summary: claimText(memory),
+    ...(memory.statement ? { statement: memory.statement } : {}),
+    reason: memory.reason,
+    confidence: memory.confidence,
+    evidence: memory.evidence,
+    relatedFiles: memory.relatedFiles,
+    dedupeKey: memory.dedupeKey,
+    layer: normalizeLayer(memory.layer),
+    qualityStatus: memory.qualityStatus,
+    qualityReasons: memory.qualityReasons,
+    displayStatus: trustDisplayStatus(store, kind, memory)
+  };
+  if ("lifecycleStatus" in memory) result.lifecycleStatus = memory.lifecycleStatus;
+  result.presentation = presentMemory(result, dbPeer(store, memory.layer));
   return result;
 }
 
@@ -2672,13 +3022,13 @@ function rebuildCommitRelations(db: DatabaseSync, commit: CommitRecord): void {
 }
 
 function matchesMemoryQuery(
-  value: Pick<MemoryCandidate, "title" | "summary" | "reason" | "relatedFiles">,
+  value: Pick<MemoryCandidate, "title" | "summary" | "reason" | "relatedFiles" | "statement">,
   query?: string
 ): boolean {
   if (!query) return true;
   const normalized = query.trim().toLowerCase();
   if (!normalized) return true;
-  const haystack = [value.title, value.summary, value.reason, value.relatedFiles.join(" ")]
+  const haystack = [memoryContentText(value), value.relatedFiles.join(" ")]
     .join(" ")
     .toLowerCase();
   return haystack.includes(normalized);

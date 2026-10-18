@@ -2,15 +2,18 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { SyncSourceName } from "./types.js";
+import { globalConfigDir } from "./config.js";
+import { requestGlobalWatchStop } from "./global-watch.js";
 
 export type WatchSource = SyncSourceName | "all";
 export type WatchServiceCommandRunner = (command: string, args: string[]) => void;
 
 export interface WatchServiceOptions {
   cwd: string;
+  global?: boolean;
   homeDir?: string | undefined;
   platform?: NodeJS.Platform | undefined;
   intervalSeconds?: number | undefined;
@@ -32,6 +35,7 @@ export interface WatchServiceResult {
 }
 
 interface ResolvedWatchService {
+  global: boolean;
   cwd: string;
   homeDir: string;
   platform: NodeJS.Platform;
@@ -67,6 +71,21 @@ export function uninstallWatchService(options: WatchServiceOptions): WatchServic
   throw new Error(`background watcher uninstall is not supported on ${service.platform}`);
 }
 
+/** Prevent a scheduled restart, then ask the running global watcher to drain. */
+export function pauseGlobalWatchService(options: WatchServiceOptions): void {
+  const service = resolveWatchService({ ...options, global: true });
+  if (service.platform === "win32") {
+    if (service.runCommands) for (const name of scheduledTaskNames(service))
+      runIgnoringFailure(service, "schtasks.exe", ["/Change", "/TN", name, "/DISABLE"]);
+  }
+  requestGlobalWatchStop();
+}
+export function resumeGlobalWatchService(options: WatchServiceOptions): void {
+  const service = resolveWatchService({ ...options, global: true });
+  if (service.platform === "win32" && service.runCommands) for (const name of scheduledTaskNames(service))
+    runIgnoringFailure(service, "schtasks.exe", ["/Change", "/TN", name, "/ENABLE"]);
+}
+
 export function getWatchServiceStatus(options: WatchServiceOptions): WatchServiceResult {
   const service = resolveWatchService(options);
 
@@ -81,6 +100,9 @@ export function getWatchServiceStatus(options: WatchServiceOptions): WatchServic
   }
 
   if (service.platform === "win32") {
+    if (service.global && existsSync(windowsStartupPath(service))) {
+      return { platform: service.platform, label: service.label, servicePath: windowsStartupPath(service), logsDir: service.logsDir, installed: true };
+    }
     let taskName = scheduledTaskName(service);
     let installed = false;
     if (service.runCommands) {
@@ -99,20 +121,20 @@ export function getWatchServiceStatus(options: WatchServiceOptions): WatchServic
 }
 
 function resolveWatchService(options: WatchServiceOptions): ResolvedWatchService {
-  const cwd = options.cwd;
+  const cwd = options.global ? globalConfigDir() : options.cwd;
   const homeDir = options.homeDir ?? homedir();
   const platform = options.platform ?? process.platform;
   const intervalSeconds = options.intervalSeconds ?? 30;
   const source = options.source ?? "all";
   const cliPath = options.cliPath ?? process.argv[1] ?? join(cwd, "dist", "cli.js");
   const nodePath = options.nodePath ?? process.execPath;
-  const hash = createHash("sha256").update(cwd).digest("hex").slice(0, 16);
+  const hash = options.global ? "global" : createHash("sha256").update(cwd).digest("hex").slice(0, 16);
   const label = `com.codebutler.watch.${hash}`;
-  const logsDir = join(cwd, ".code-butler", "logs");
+  const logsDir = options.global ? join(cwd, "watch", "logs") : join(cwd, ".code-butler", "logs");
   const runner = options.commandRunner ?? defaultCommandRunner;
   const runCommands = options.runCommands ?? true;
 
-  return { cwd, homeDir, platform, intervalSeconds, source, cliPath, nodePath, hash, label, logsDir, runner, runCommands };
+  return { global: options.global ?? false, cwd, homeDir, platform, intervalSeconds, source, cliPath, nodePath, hash, label, logsDir, runner, runCommands };
 }
 
 function installLaunchdService(service: ResolvedWatchService): WatchServiceResult {
@@ -168,8 +190,24 @@ function installScheduledTask(service: ResolvedWatchService): WatchServiceResult
   writeFileSync(windowsLauncherPath(service), windowsLauncher(service));
 
   if (service.runCommands) {
-    run(service, "schtasks.exe", ["/Create", "/TN", taskName, "/TR", taskCommand, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"]);
-    run(service, "schtasks.exe", ["/Run", "/TN", taskName]);
+    try {
+      run(service, "schtasks.exe", ["/Create", "/TN", taskName, "/TR", taskCommand, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"]);
+      if (service.global) {
+        run(service, "powershell.exe", ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
+          "$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 10 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Set-ScheduledTask -TaskName 'CodeButler-watch-global' -Settings $settings | Out-Null"]);
+      }
+      run(service, "schtasks.exe", ["/Run", "/TN", taskName]);
+      if (service.global) rmSync(windowsStartupPath(service), { force: true });
+    } catch (error) {
+      if (!service.global) throw error;
+      // Standard Windows accounts can be denied Task Scheduler creation.
+      runIgnoringFailure(service, "schtasks.exe", ["/Delete", "/TN", taskName, "/F"]);
+      const startupPath = windowsStartupPath(service);
+      mkdirSync(dirname(startupPath), { recursive: true });
+      writeFileSync(startupPath, `Set shell = CreateObject("WScript.Shell")\r\nshell.Run "${taskCommand.replaceAll('"', '""')}", 0, False\r\n`);
+      run(service, "wscript.exe", ["//B", startupPath]);
+      return { platform: service.platform, label: service.label, servicePath: startupPath, logsDir: service.logsDir, installed: true };
+    }
   }
 
   return { platform: service.platform, label: service.label, taskName, logsDir: service.logsDir, installed: true };
@@ -177,6 +215,10 @@ function installScheduledTask(service: ResolvedWatchService): WatchServiceResult
 
 function uninstallScheduledTask(service: ResolvedWatchService): WatchServiceResult {
   const taskName = scheduledTaskName(service);
+  if (service.global) {
+    requestGlobalWatchStop();
+    rmSync(windowsStartupPath(service), { force: true });
+  }
   if (service.runCommands) {
     for (const name of scheduledTaskNames(service)) {
       runIgnoringFailure(service, "schtasks.exe", ["/End", "/TN", name]);
@@ -198,6 +240,7 @@ function launchdPlist(service: ResolvedWatchService): string {
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
     '<plist version="1.0">',
     "<dict>",
+    ...(service.global ? ["  <key>EnvironmentVariables</key>", "  <dict>", "    <key>CODE_BUTLER_HOME</key>", `    <string>${xmlEscape(service.cwd)}</string>`, "  </dict>"] : []),
     "  <key>Label</key>",
     `  <string>${xmlEscape(service.label)}</string>`,
     "  <key>ProgramArguments</key>",
@@ -239,6 +282,7 @@ function systemdService(service: ResolvedWatchService): string {
     "",
     "[Service]",
     "Type=simple",
+    ...(service.global ? [`Environment=${systemdArg(`CODE_BUTLER_HOME=${service.cwd}`)}`] : []),
     `WorkingDirectory=${systemdArg(service.cwd)}`,
     `ExecStart=${watchArgs(service).map(systemdArg).join(" ")}`,
     "Restart=always",
@@ -264,16 +308,32 @@ function scheduledTaskNames(service: ResolvedWatchService): string[] {
 }
 
 function windowsTaskCommand(service: ResolvedWatchService): string {
+  if (service.global) return `powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File ${windowsArg(windowsLauncherPath(service))}`;
   return windowsArg(windowsLauncherPath(service));
 }
 
+function windowsStartupPath(service: ResolvedWatchService): string {
+  const roaming = service.homeDir === homedir() ? process.env.APPDATA ?? join(service.homeDir, "AppData", "Roaming") : join(service.homeDir, "AppData", "Roaming");
+  return join(roaming, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "CodeButler-watch-global.vbs");
+}
+
 function windowsLauncherPath(service: ResolvedWatchService): string {
+  if (service.global) return join(service.cwd, "watch", "code-butler-watch-global.ps1");
   return join(service.cwd, ".code-butler", `code-butler-watch-${service.hash}.cmd`);
 }
 
 function windowsLauncher(service: ResolvedWatchService): string {
   const outLog = join(service.logsDir, "watch.out.log");
   const errLog = join(service.logsDir, "watch.err.log");
+  if (service.global) {
+    const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
+    return [
+      `$env:CODE_BUTLER_HOME = ${quote(service.cwd)}`,
+      `Set-Location -LiteralPath ${quote(service.cwd)}`,
+      `& ${watchArgs(service).map(quote).join(" ")} >> ${quote(outLog)} 2>> ${quote(errLog)}`,
+      "exit $LASTEXITCODE"
+    ].join("\r\n") + "\r\n";
+  }
   return [
     "@echo off",
     `cd /d ${windowsCmdArg(service.cwd)}`,
@@ -283,7 +343,7 @@ function windowsLauncher(service: ResolvedWatchService): string {
 }
 
 function watchArgs(service: ResolvedWatchService): string[] {
-  return [service.nodePath, service.cliPath, "watch", "--interval", String(service.intervalSeconds), "--source", service.source];
+  return [service.nodePath, service.cliPath, "watch", ...(service.global ? ["--global"] : []), "--interval", String(service.intervalSeconds), "--source", service.source];
 }
 
 function run(service: ResolvedWatchService, command: string, args: string[]): void {
@@ -308,7 +368,7 @@ function commandSucceeds(service: ResolvedWatchService, command: string, args: s
 }
 
 function defaultCommandRunner(command: string, args: string[]): void {
-  execFileSync(command, args, { stdio: "ignore" });
+  execFileSync(command, args, { stdio: "ignore", windowsHide: true, timeout: 10_000 });
 }
 
 function systemdArg(value: string): string {
