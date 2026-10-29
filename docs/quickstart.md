@@ -41,6 +41,13 @@ source paths. It also writes `.code-butler/project-summary.md`, installs short
 agent bootstrap instructions, and tries to start the per-project background
 watcher.
 
+LLM extraction is opt-in. If the only provider key is one exported in your
+shell, such as `OPENAI_API_KEY`, `init` asks before sending anything to that
+provider, and stays off when it cannot ask. Pass `--allow-remote-models`, or run
+`code-butler config remote-models on` later. A provider you configure in the
+desktop app or a config file needs no extra step. See
+[privacy](privacy.md#remote-ai-models).
+
 ## Sync Memory
 
 Run an incremental sync:

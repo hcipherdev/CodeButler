@@ -1,10 +1,13 @@
 // Tests summary generation, refresh ownership, and safe repository context.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
+import { rememberProjectMemory } from "../src/memory/remember.js";
+import { assembleHumanSummary } from "../src/project-summary/memory-sections.js";
 import {
   initializeProjectSummary,
   installProjectSummary,
@@ -17,7 +20,7 @@ import {
   type ProjectSummaryGeneratorInput
 } from "../src/project-summary/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
-import { syncProjectMemory } from "../src/sync/service.js";
+import { importNewGitCommits, syncProjectMemory } from "../src/sync/service.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("project narrative summary", () => {
@@ -339,6 +342,23 @@ describe("project narrative summary", () => {
     store.close();
   });
 
+  it("runs the summary model call through aroundModelCall", async () => {
+    const { rootDir, generator, outputs } = createProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const wrapped: number[] = [];
+    const result = await refreshProjectSummary(store, config, {
+      generator,
+      now: () => new Date("2026-06-16T00:00:00Z"),
+      aroundModelCall: async call => { wrapped.push(outputs.length); const value = await call(); wrapped.push(outputs.length); return value; }
+    });
+    expect(result.generated).toBe(true);
+    // The generator ran inside the wrapper: no output before it, one after.
+    expect(wrapped).toEqual([0, 1]);
+    store.close();
+  });
+
   it("includes user-owned notes in the input fingerprint without changing their bytes", async () => {
     const { rootDir, generator, inputs } = createProject();
     const store = openMemoryStore(rootDir);
@@ -502,6 +522,125 @@ describe("project narrative summary", () => {
     store.close();
   });
 
+  it("adopts an edited summary as the baseline, dated when noticed, and keeps it protected", async () => {
+    const { rootDir, generator, outputs } = createProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const summaryPath = join(rootDir, ".code-butler", "project-summary.md");
+    const metaPath = join(rootDir, ".code-butler", "project-summary.meta.json");
+    await refreshProjectSummary(store, config, { generator, now: () => new Date("2026-06-18T09:00:00Z") });
+    const manual = "# Manual project brief\nKeep this edit.\n";
+    writeFileSync(summaryPath, manual);
+
+    const result = await refreshProjectSummary(store, config, { generator, now: () => new Date("2026-06-18T10:00:00Z") });
+    const meta = JSON.parse(readFileSync(metaPath, "utf8")) as Record<string, unknown>;
+    const status = getProjectSummaryStatus(rootDir, { store, config });
+
+    expect(result).toMatchObject({ generated: false, skippedReason: "manual_edits_detected", manualEditsDetected: true });
+    expect(meta).toMatchObject({
+      outputContentHash: createHash("sha256").update(manual).digest("hex"),
+      contentSource: "edited",
+      contentUpdatedAt: "2026-06-18T10:00:00.000Z",
+      lastGeneratedAt: "2026-06-18T09:00:00.000Z"
+    });
+    expect(status).toMatchObject({ manualEditsDetected: true, stale: true, contentSource: "edited", contentUpdatedAt: "2026-06-18T10:00:00.000Z" });
+    expect(readFileSync(summaryPath, "utf8")).toBe(manual);
+
+    await refreshProjectSummary(store, config, { generator, now: () => new Date("2026-06-19T10:00:00Z") });
+    expect(JSON.parse(readFileSync(metaPath, "utf8"))).toMatchObject({ contentUpdatedAt: "2026-06-18T10:00:00.000Z" });
+    expect(outputs).toHaveLength(1);
+
+    const forced = await refreshProjectSummary(store, config, { generator, force: true, now: () => new Date("2026-06-19T11:00:00Z") });
+    expect(forced.generated).toBe(true);
+    expect(readFileSync(forced.backupPath!, "utf8")).toBe(manual);
+    expect(JSON.parse(readFileSync(metaPath, "utf8"))).not.toHaveProperty("contentSource");
+    store.close();
+  });
+
+  it("dates a committed summary by its git commit and replaces it automatically with a backup", async () => {
+    const { rootDir, generator, outputs } = createProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    const summaryPath = join(rootDir, ".code-butler", "project-summary.md");
+    const committed = "# Committed summary\n";
+    writeFileSync(summaryPath, committed);
+    git(rootDir, ["add", "--all"]);
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "summary", "--date=2026-05-01T08:00:00Z"], {
+      cwd: rootDir, env: { ...process.env, GIT_COMMITTER_DATE: "2026-05-01T08:00:00Z" }
+    });
+
+    await expect(refreshProjectSummary(store, config, {
+      generator: { async generate() { throw new Error("provider unavailable"); } }
+    })).rejects.toThrow("provider unavailable");
+    const adopted = getProjectSummaryStatus(rootDir, { store, config });
+    expect(adopted).toMatchObject({
+      outputBaselineMissing: false,
+      manualEditsDetected: false,
+      stale: true,
+      contentSource: "git",
+      contentUpdatedAt: "2026-05-01T08:00:00.000Z",
+      contentCommit: git(rootDir, ["log", "-1", "--format=%h"])
+    });
+    expect(readFileSync(summaryPath, "utf8")).toBe(committed);
+
+    const result = await refreshProjectSummary(store, config, { generator });
+    expect(result.generated).toBe(true);
+    expect(readFileSync(result.backupPath!, "utf8")).toBe(committed);
+    expect(outputs).toHaveLength(1);
+    expect(getProjectSummaryStatus(rootDir, { store, config })).not.toHaveProperty("contentSource");
+    store.close();
+  });
+
+  it("stays current when the only new commit records the summary itself", async () => {
+    const { rootDir, generator } = createProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    await refreshProjectSummary(store, config, { generator });
+    const commit = (hash: string, changedFiles: string[]) => store.addCommit({
+      hash, authorName: "Test", authorEmail: "test@example.com", authoredAt: new Date().toISOString(),
+      message: `commit ${hash}`, changedFiles, diffSummary: ""
+    });
+
+    commit("a".repeat(40), [".code-butler/project-summary.md", ".code-butler/project-summary.meta.json"]);
+    expect(getProjectSummaryStatus(rootDir, { store, config }).stale).toBe(false);
+
+    commit("b".repeat(40), [".code-butler/project-summary.md", "src/lib.rs"]);
+    expect(getProjectSummaryStatus(rootDir, { store, config }).stale).toBe(true);
+    store.close();
+  });
+
+  it("imports a commit made just before a manual refresh so the summary includes it", async () => {
+    const { rootDir } = createProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    const config = loadProjectConfig(rootDir);
+    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "-m", "Add encryption entry point"], { cwd: rootDir });
+    const hash = git(rootDir, ["rev-parse", "HEAD"]);
+    expect(collectProjectSummaryInput(store, config).codeContext.commits.map(c => c.hash)).not.toContain(hash);
+
+    expect(importNewGitCommits(store, config)).toBe(1);
+    expect(collectProjectSummaryInput(store, config).codeContext.commits.map(c => c.hash)).toContain(hash);
+    expect(importNewGitCommits(store, config)).toBe(0);
+    store.close();
+  });
+
+  it("records the generation time when the summary is written, not when the refresh starts", async () => {
+    const { rootDir } = createProject();
+    const store = openMemoryStore(rootDir);
+    store.init();
+    let clock = new Date("2026-06-18T09:00:00Z");
+    const result = await refreshProjectSummary(store, loadProjectConfig(rootDir), {
+      now: () => clock,
+      generator: { async generate() { clock = new Date("2026-06-18T09:02:30Z"); return "## What this is\nA slow summary."; } }
+    });
+
+    expect(result.meta).toMatchObject({ lastGeneratedAt: "2026-06-18T09:02:30.000Z", lastCheckedAt: "2026-06-18T09:02:30.000Z" });
+    store.close();
+  });
+
   it("establishes a legacy output baseline only when the input fingerprint is still current", async () => {
     const { rootDir, generator, outputs } = createProject();
     const store = openMemoryStore(rootDir);
@@ -540,6 +679,118 @@ describe("project narrative summary", () => {
     expect(after.summary).toBe(before.summary);
     expect(after.meta?.lastCheckedAt).toBe("2026-06-16T00:00:00.000Z");
     store.close();
+  });
+
+  describe("memory-only changes", () => {
+    const generatedAt = new Date("2026-06-15T00:00:00Z");
+    const at = (days: number) => () => new Date(generatedAt.getTime() + days * 24 * 60 * 60 * 1000);
+    const prose = (summary: string) => [summary.split("## Key decisions")[0], summary.split("## Open risks and questions")[1]];
+
+    async function generatedProject() {
+      const project = createProject();
+      const store = openMemoryStore(project.rootDir);
+      store.init();
+      const config = loadProjectConfig(project.rootDir);
+      const kept = rememberProjectMemory(store, { type: "decision", text: "Use local project storage.", scope: { kind: "project" } }).memory!;
+      await refreshProjectSummary(store, config, { generator: project.generator, now: at(0) });
+      return { ...project, store, config, kept, before: readProjectBrief(project.rootDir) };
+    }
+
+    it("re-renders the memory sections and keeps the generated prose", async () => {
+      const { rootDir, generator, outputs, store, config, kept, before } = await generatedProject();
+      try {
+        rememberProjectMemory(store, { type: "decision", text: "Ship releases from the default branch.", scope: { kind: "project" } });
+        const added = await refreshProjectSummary(store, config, { generator, now: at(1) });
+        const after = readProjectBrief(rootDir);
+
+        expect(added).toMatchObject({ checked: true, generated: true, memorySectionsOnly: true });
+        expect(outputs).toHaveLength(1);
+        expect(after.summary).toContain("Ship releases from the default branch.");
+        expect(prose(after.summary)).toEqual(prose(before.summary));
+        expect(after.meta?.lastGeneratedAt).toBe(before.meta?.lastGeneratedAt);
+        expect(after.meta?.basis).toEqual(before.meta?.basis);
+        expect(after.meta?.memorySectionsUpdatedAt).toBe("2026-06-16T00:00:00.000Z");
+        expect(getProjectSummaryStatus(rootDir, { store, config }).stale).toBe(false);
+
+        store.updateMemoryLifecycle(kept.id, { lifecycleStatus: "superseded" });
+        const removed = await refreshProjectSummaryIfDue(store, config, { generator, now: at(2) });
+        expect(removed.memorySectionsOnly).toBe(true);
+        expect(outputs).toHaveLength(1);
+        expect(readProjectBrief(rootDir).summary).not.toContain("Use local project storage.");
+      } finally { store.close(); }
+    });
+
+    it("reproduces an unchanged summary byte for byte", async () => {
+      const { rootDir, store, config, before } = await generatedProject();
+      try {
+        const memories = collectProjectSummaryInput(store, config).codeContext.memories;
+        expect(`${assembleHumanSummary(memories, before.summary).trim()}\n`).toBe(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8"));
+      } finally { store.close(); }
+    });
+
+    it("rewrites the prose once it is a week old", async () => {
+      const { generator, outputs, store, config } = await generatedProject();
+      try {
+        rememberProjectMemory(store, { type: "decision", text: "Ship releases from the default branch.", scope: { kind: "project" } });
+        const result = await refreshProjectSummary(store, config, { generator, now: at(7) });
+        expect(result.generated).toBe(true);
+        expect(result.memorySectionsOnly).toBeUndefined();
+        expect(outputs).toHaveLength(2);
+      } finally { store.close(); }
+    });
+
+    it("rewrites the prose when forced", async () => {
+      const { generator, outputs, store, config } = await generatedProject();
+      try {
+        rememberProjectMemory(store, { type: "decision", text: "Ship releases from the default branch.", scope: { kind: "project" } });
+        const result = await refreshProjectSummary(store, config, { generator, now: at(1), force: true });
+        expect(result.memorySectionsOnly).toBeUndefined();
+        expect(outputs).toHaveLength(2);
+      } finally { store.close(); }
+    });
+
+    it("rewrites the prose when the metadata cannot show what changed", async () => {
+      const { rootDir, generator, outputs, store, config } = await generatedProject();
+      try {
+        const metaPath = join(rootDir, ".code-butler", "project-summary.meta.json");
+        const { inputDigest: _digest, ...meta } = JSON.parse(readFileSync(metaPath, "utf8")) as Record<string, unknown>;
+        writeFileSync(metaPath, `${JSON.stringify(meta, null, 2)}\n`);
+        rememberProjectMemory(store, { type: "decision", text: "Ship releases from the default branch.", scope: { kind: "project" } });
+        const result = await refreshProjectSummary(store, config, { generator, now: at(1) });
+        expect(result.memorySectionsOnly).toBeUndefined();
+        expect(outputs).toHaveLength(2);
+      } finally { store.close(); }
+    });
+
+    it("leaves an edited summary alone", async () => {
+      const { rootDir, generator, outputs, store, config, before } = await generatedProject();
+      try {
+        const edited = `${before.summary.trim()}\n\nA note added by hand.\n`;
+        writeFileSync(before.summaryPath, edited);
+        rememberProjectMemory(store, { type: "decision", text: "Ship releases from the default branch.", scope: { kind: "project" } });
+        const result = await refreshProjectSummary(store, config, { generator, now: at(1) });
+        expect(result).toMatchObject({ generated: false, skippedReason: "manual_edits_detected" });
+        expect(outputs).toHaveLength(1);
+        expect(readFileSync(join(rootDir, ".code-butler", "project-summary.md"), "utf8")).toBe(edited);
+      } finally { store.close(); }
+    });
+
+    it("keeps an edit made while the memory sections are written", async () => {
+      const { generator, store, config, before } = await generatedProject();
+      try {
+        const manual = "# Edited during the update\n";
+        rememberProjectMemory(store, { type: "decision", text: "Ship releases from the default branch.", scope: { kind: "project" } });
+        const result = await refreshProjectSummary(store, config, {
+          generator,
+          now: at(1),
+          summaryBeforeCommit(destinationPath) {
+            if (destinationPath === before.summaryPath) writeFileSync(before.summaryPath, manual);
+          }
+        });
+        expect(result).toMatchObject({ generated: false, skippedReason: "manual_edits_detected", manualEditsDetected: true });
+        expect(readFileSync(before.summaryPath, "utf8")).toBe(manual);
+      } finally { store.close(); }
+    });
   });
 
   it("does not regenerate the next day after a sync with no new evidence", async () => {

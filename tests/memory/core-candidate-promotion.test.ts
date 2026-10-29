@@ -1,4 +1,4 @@
-// Tests planAutomaticPromotions(), runAutomaticPromotions() and undoAutomaticPromotions() in src/memory/automatic-promotion.ts for core-layer candidates, plus active-candidate verification in src/memory/review.ts.
+// Tests planAutomaticPromotions(), runAutomaticPromotions() and undoAutomaticPromotions() in src/memory/automatic-promotion.ts for core-layer candidates, including AI-corrected replacements, plus active-candidate verification in src/memory/review.ts.
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -11,7 +11,7 @@ import {
   undoAutomaticPromotions
 } from "../../src/memory/automatic-promotion.js";
 import { rememberProjectMemory } from "../../src/memory/remember.js";
-import { resolveMemoryReview } from "../../src/memory/review.js";
+import { compensateMemoryReview, resolveMemoryReview } from "../../src/memory/review.js";
 import { exportPrivacy, importPrivacy } from "../../src/privacy/service.js";
 import { openMemoryStore, type MemoryStore } from "../../src/storage/store.js";
 import { withTransaction } from "../../src/storage/transactions.js";
@@ -136,7 +136,34 @@ describe("core candidate promotion", () => {
     expect(decisionFor(s, below.id, { singleSourceMinConfidence: 0.85 })).toMatchObject({ decision: "promote" });
   });
 
-  it("does not count an AI review's verification of the replacement it wrote", () => {
+  it("promotes the replacement an AI correction wrote, on that correction's verdict", () => {
+    const s = store();
+    const correct = (key: string, confidence: number) => resolveMemoryReview(s, {
+      memoryId: candidate(s, key, { summary: "Documentation includes Setup." }).id, category: "candidate", action: "correct", reason: "Rewrite the placeholder.",
+      correction: { text: `The ${key} guide documents the two-tier configuration model.` },
+      provenance: { verdict: "changed", policyVersion: "test", confidence, citationIds: [], reconciliationRunId: "run", reconciliationItemId: key }
+    }, "ai");
+    const at = correct("rewritten", 0.95).replacement!;
+    const below = correct("rewritten-low", 0.85).replacement!;
+    expect(at.dedupeKey.startsWith("ai-reconciliation:")).toBe(true);
+
+    expect(decisionFor(s, at.id)).toMatchObject({ decision: "promote" });
+    expect(decisionFor(s, at.id)!.reasonCodes).toEqual(expect.arrayContaining(["ai_corrected_replacement", "meets_single_source_confidence"]));
+    expect(decisionFor(s, below.id)!.reasonCodes).toEqual(expect.arrayContaining(["ai_corrected_replacement", "below_single_source_confidence"]));
+  });
+
+  it("does not promote an AI rewrite of a legacy docs-heading record", () => {
+    const s = store();
+    const legacy = candidate(s, "deterministic:docs:README.md:setup", { summary: "Documentation includes Setup." });
+    const replacement = resolveMemoryReview(s, {
+      memoryId: legacy.id, category: "candidate", action: "correct", reason: "Rewrite the placeholder.",
+      correction: { text: "The README has a Setup section describing installation." },
+      provenance: { verdict: "changed", policyVersion: "test", confidence: 0.95, citationIds: [], reconciliationRunId: "run", reconciliationItemId: "legacy" }
+    }, "ai").replacement!;
+    expect(decisionFor(s, replacement.id)?.reasonCodes ?? []).not.toContain("ai_corrected_replacement");
+  });
+
+  it("does not count an AI review's verification of a replacement whose correction was reverted", () => {
     const s = store();
     const original = candidate(s, "rewritten", { summary: "Documentation includes Setup." });
     const correction = resolveMemoryReview(s, {
@@ -145,12 +172,10 @@ describe("core candidate promotion", () => {
       provenance: { verdict: "changed", policyVersion: "test", confidence: 0.95, citationIds: [], reconciliationRunId: "run", reconciliationItemId: "item" }
     }, "ai");
     const replacement = correction.replacement!;
-    expect(replacement.dedupeKey.startsWith("ai-reconciliation:")).toBe(true);
+    compensateMemoryReview(s, { resolutionId: correction.review.id, reason: "Correction was wrong." });
     aiVerify(s, replacement.id);
 
-    expect(decisionFor(s, replacement.id)!.reasonCodes).toContain("ai_self_verified");
-    resolveMemoryReview(s, { memoryId: replacement.id, category: "candidate", action: "verify" }, "desktop");
-    expect(decisionFor(s, replacement.id)!.reasonCodes).toContain("human_verified");
+    expect(decisionFor(s, replacement.id)?.reasonCodes ?? []).not.toContain("ai_corrected_replacement");
   });
 
   it("applies the standard bar to independent sources", () => {

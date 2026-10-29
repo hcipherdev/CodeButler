@@ -26,7 +26,7 @@ export function createRecoveryBackup(databasePath: string, now: Date = new Date(
       .then(() => source.close())
       .catch((error) => { try { source.close(); } catch {} console.error(error); process.exitCode = 1; });
   `;
-  execFileSync(process.execPath, ["-e", script, databasePath, backupPath], { stdio: "ignore" });
+  execFileSync(process.execPath, ["-e", script, databasePath, backupPath], { stdio: "ignore", windowsHide: true });
   verifyDatabaseFile(backupPath);
   return backupPath;
 }

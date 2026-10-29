@@ -2,7 +2,7 @@
 import { runCloudCommand } from "./cloud/cli.js";
 import { binding } from "./cloud/state.js";
 import { secretBinding } from "./secrets/state.js";
-import { encryptedSecretsSync } from "./secrets/sync.js";
+import { encryptedSecretsSync, secretsSyncInterruption } from "./secrets/sync.js";
 import { localCloudChangeStamp, projectOperation, startCloudScheduler, syncQuietly } from "./cloud/client.js";
 import { automaticSyncPending, requestLocalChangeSync } from "./cloud/sync-owner.js";
 import { queueAutomaticConnection } from "./cloud/auto-connect.js";
@@ -18,6 +18,7 @@ import { runMemoryCommand } from "./cli/commands/memory.js";
 import { runPrivacyCommand } from "./cli/commands/privacy.js";
 import { runSourcesCommand } from "./cli/commands/sources.js";
 import { runExtractionCommand } from "./cli/commands/extraction.js";
+import { runRemoteModelsCommand, settleInitRemoteModelConsent, type Confirm } from "./cli/commands/remote-models.js";
 import { addDecision, importDecisionMarkdown } from "./decisions/store.js";
 import { runDoctor } from "./doctor/service.js";
 import type { EmbeddingServiceOptions } from "./embeddings/service.js";
@@ -36,7 +37,8 @@ import {
   refreshProjectSummaryIfDue,
   relativeSummaryPath,
   type ProjectSummaryGenerator,
-  type ProjectSummaryOperationOptions
+  type ProjectSummaryOperationOptions,
+  type ProjectSummaryRefreshResult
 } from "./project-summary/service.js";
 import { initializeProjectMemory } from "./project-initialization.js";
 import { validateProjectSetupPaths } from "./project-setup.js";
@@ -45,7 +47,9 @@ import { globalWatchStatus, registerWatchedProject, runGlobalWatch, unregisterWa
 import { startServer as startProjectMemoryServer, type ProjectMemoryServerOptions } from "./server.js";
 import { openConfiguredMemoryStore } from "./storage/open-configured-store.js";
 import type { MemoryStore } from "./storage/store.js";
-import { syncProjectMemory, syncWatchedProjectMemory } from "./sync/service.js";
+import { backgroundBudgetPaused } from "./ai/usage.js";
+import { importNewGitCommits, ingestionOutcomes, syncProjectMemory, syncWatchedProjectMemory } from "./sync/service.js";
+import { launchAutomaticReviewIfDue } from "./memory/auto-review.js";
 import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, MemoryLifecycleStatus, MemoryType, SyncSourceName } from "./types.js";
 import {
   getWatchServiceStatus,
@@ -72,6 +76,8 @@ export interface CliOptions {
   watchServiceCommandRunner?: WatchServiceCommandRunner | undefined;
   cliPath?: string | undefined;
   embeddingServiceOptions?: EmbeddingServiceOptions | undefined;
+  /** Answers init's remote-model question; without it init asks only on a terminal. */
+  confirm?: Confirm | undefined;
 }
 
 export async function runCli(args = process.argv.slice(2), options: CliOptions = {}): Promise<number> {
@@ -117,6 +123,7 @@ async function runCliOperation(args: string[], options: CliOptions): Promise<num
     if (command === "cloud") return await runCloudCommand(rest, cwd, stdout);
 
     if (command === "init") {
+      await settleInitRemoteModelConsent(cwd, rest, { stdout, confirm: options.confirm });
       const installed = await initializeProjectMemory(cwd, {
         ...projectSummaryOperationOptions(options),
         warn: stdout
@@ -306,7 +313,8 @@ async function runConfig(args: string[], cwd: string, stdout: (line: string) => 
     else printConfigMigration(result, cwd, stdout);
     return 0;
   }
-  throw new Error("Usage: code-butler config <init|global init|migrate-local>");
+  if (subcommand === "remote-models") return runRemoteModelsCommand(nested === undefined ? [] : [nested, ...rest], cwd, stdout);
+  throw new Error("Usage: code-butler config <init|global init|migrate-local|remote-models>");
 }
 
 function printConfigMigration(
@@ -521,12 +529,13 @@ async function runProjectSummary(
     if (fallback) {
       operationOptions.generator = createFallbackProjectSummaryGenerator(new Error("local fallback requested"));
     }
+    importNewGitCommits(store, config);
     const result = await refreshProjectSummary(store, config, {
       ...operationOptions,
       force
     });
     if (result.generated) {
-      stdout(`Refreshed project summary at ${relativeSummaryPath(cwd, result.summaryPath)}`);
+      stdout(`${summaryWriteVerb(result)} project summary at ${relativeSummaryPath(cwd, result.summaryPath)}`);
     } else {
       stdout(`Project summary unchanged at ${relativeSummaryPath(cwd, result.summaryPath)}`);
       if (result.skippedReason) stdout(`reason=${result.skippedReason}`);
@@ -611,9 +620,12 @@ async function runWatch(
             const status = await encryptedSecretsSync(cwd);
             report({ outcome: status.status === "conflict" ? "deferred" : "success", stage: "cloud",
               ...(status.status === "conflict" ? { reason: "Secrets sync needs conflict resolution" } : {}) });
-          } catch {
+          } catch (error) {
             // The native binding records a bounded error state; never write secret paths or values to watcher logs.
-            report({ outcome: "failed", stage: "cloud", reason: "Secrets sync failed; open Sync in the desktop app" });
+            const interruption = secretsSyncInterruption(error);
+            report(interruption
+              ? { outcome: "deferred", stage: "cloud", reason: interruption === "busy" ? "Secrets sync deferred: another local Butler operation is active" : "Secrets sync deferred: the cloud could not be reached" }
+              : { outcome: "failed", stage: "cloud", reason: "Secrets sync failed; open Sync in the desktop app" });
           }
         }
         return;
@@ -624,17 +636,13 @@ async function runWatch(
       let projectBriefExists = false;
       const config = loadProjectConfig(cwd);
       const result = await syncWatchedProjectMemory(cwd, config, { source });
-      for (const [name, resultSource] of Object.entries(result.sources)) {
-        if (resultSource.error) report({ outcome: "failed", stage: "ingestion", reason: `${name} sync failed: ${resultSource.error}` });
-      }
-      if (result.memories.error) report({ outcome: "failed", stage: "ingestion", reason: `Memory extraction failed: ${result.memories.error}` });
-      else if (result.memories.pending) report({ outcome: "deferred", stage: "ingestion", reason: `${result.memories.pending} memory extraction item(s) pending` });
-      else report({ outcome: "success", stage: "ingestion" });
+      for (const outcome of ingestionOutcomes(result)) report(outcome);
       stdout(
         `Synced project memory at ${result.completedAt} (git=${result.sources.git.imported}, codex=${result.sources.codex.imported}, claude=${result.sources.claude.imported}, promoted=${result.memories.promoted})`
       );
       projectBriefExists = readProjectBrief(config.sources.git.repoPath).exists;
-      if (projectBriefExists) {
+      // The scheduled refresh is background work; once today's budget is spent it waits for tomorrow.
+      if (projectBriefExists && !backgroundBudgetPaused()) {
         try {
           // Summary generation can call a remote provider; the database handle
           // guard still blocks unsafe restores without holding the project gate.
@@ -648,7 +656,7 @@ async function runWatch(
             if (summaryResult.checked) {
               stdout(
                 summaryResult.generated
-                  ? `Refreshed project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
+                  ? `${summaryWriteVerb(summaryResult)} project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
                   : `Checked project summary at ${relativeSummaryPath(cwd, summaryResult.summaryPath)}`
               );
             }
@@ -658,6 +666,8 @@ async function runWatch(
           report(errorOutcome(error, "summary"));
         }
       }
+      // Its own detached process: a pass is short-lived, and the review takes minutes of model calls.
+      if (launchAutomaticReviewIfDue(cwd, config)) stdout("Started the daily automatic memory review");
     } catch (error) {
       report(errorOutcome(error, "ingestion"));
     } finally {
@@ -832,6 +842,10 @@ function watchServiceLocationLine(service: WatchServiceResult): string {
   return `platform=${service.platform}`;
 }
 
+function summaryWriteVerb(result: ProjectSummaryRefreshResult): string {
+  return result.memorySectionsOnly ? "Updated memory sections in" : "Refreshed";
+}
+
 function projectSummaryOperationOptions(
   options: Pick<CliOptions, "projectSummaryGenerator" | "now">
 ): ProjectSummaryOperationOptions {
@@ -1004,10 +1018,11 @@ function usage(): string {
   return [
     "Usage:",
     "  code-butler rules path|list|show <id>|match|conflicts|resolve <id>|attestations|attest <id>|revoke <id>|sync status|enable|disable|now",
-    "  code-butler init",
+    "  code-butler init [--allow-remote-models]",
     "  code-butler config init",
     "  code-butler config global init",
     "  code-butler config migrate-local <--dry-run|--apply> [--json]",
+    "  code-butler config remote-models <on|off|status>",
     "  code-butler cloud <register|login> --server <https-origin> --email <email>",
     "  code-butler cloud logout",
     "  code-butler cloud init --recovery-file <path> [--label <name>] [--recovery-code-file <path>]",

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { prepareCached } from "./statements.js";
 
 import type { MemoryQualityStatus } from "../types.js";
 
@@ -124,6 +125,47 @@ export function initializeLocalMemorySchema(db: DatabaseSync): void {
       on memory_reconciliation_items(memory_id, category, created_at desc);
     create index if not exists idx_memory_reconciliation_items_state
       on memory_reconciliation_items(run_id, state, item_id);
+    create table if not exists conversation_extraction_cursors (
+      source_id text primary key,
+      extracted_chunks integer not null,
+      last_chunk_hash text not null,
+      updated_at text not null
+    );
+    create table if not exists pending_invalidations (
+      id text primary key,
+      target_category text not null check (target_category in ('candidate', 'promoted')),
+      target_id text not null,
+      replacement_category text not null check (replacement_category in ('candidate', 'promoted')),
+      replacement_id text not null,
+      confidence real not null,
+      reason text not null,
+      source text not null,
+      run_id text,
+      created_at text not null,
+      resolved_at text,
+      outcome text
+    );
+    create index if not exists idx_pending_invalidations_open on pending_invalidations(resolved_at, created_at);
+    create table if not exists consolidation_runs (
+      id text primary key,
+      status text not null,
+      provider text,
+      model text,
+      created_at text not null,
+      updated_at text not null,
+      applied_at text,
+      summary_json text not null default '{}',
+      error text
+    );
+    create table if not exists consolidation_items (
+      run_id text not null,
+      item_id text not null,
+      kind text not null check (kind in ('group', 'invalidation')),
+      payload_json text not null,
+      state text not null,
+      result_json text,
+      primary key (run_id, item_id)
+    );
     create table if not exists memory_evidence_observations (
       hash text primary key,
       kind text not null,
@@ -134,6 +176,9 @@ export function initializeLocalMemorySchema(db: DatabaseSync): void {
       created_at text not null
     );
   `);
+  // Additive and idempotent, so the schema version stays put: an older build sharing
+  // this device-local database ignores the column instead of refusing a newer version.
+  ensureLocalColumn(db, "extraction_runs", "merged", "integer not null default 0");
   const row = db.prepare("select max(version) as version from local_schema_migrations").get() as { version: number | null };
   if ((row.version ?? 0) > LOCAL_MEMORY_SCHEMA_VERSION) {
     throw new Error(`Device-local memory database uses newer schema version ${row.version}`);
@@ -155,7 +200,7 @@ export function readLocalMemoryQuality(
   category: LocalMemoryQualityRow["category"],
   memoryId: string
 ): LocalMemoryQualityRow | undefined {
-  const row = db.prepare(
+  const row = prepareCached(db,
     `select category, memory_id, memory_version, assessment_fingerprint, policy_version,
             quality_status, quality_reasons_json, last_verified_at, assessed_at
        from memory_quality_cache where category = ? and memory_id = ?`

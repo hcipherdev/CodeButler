@@ -25,6 +25,10 @@ describe("OpenAI-compatible extractor", () => {
                     type: "bug_fix",
                     title: "Fix stale cache reads",
                     summary: "Write invalidation was added after stale reads were reproduced.",
+                    statement: {
+                      version: 1, text: "Write invalidation was added after stale reads were reproduced.", origin: "extracted",
+                      fields: { symptom: "Reads returned stale cache entries.", fix: "Invalidate the cache after every write." }
+                    },
                     reason: "TTL-only invalidation left a stale read window.",
                     confidence: 0.92,
                     dedupeKey: "cache-stale-reads",

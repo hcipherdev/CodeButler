@@ -17,6 +17,8 @@ import { loadProjectConfig } from "../config.js";
 import { memoryContentText } from "../memory/statement.js";
 import { presentMemory, sharingLabel } from "../memory/presentation.js";
 import { readMemoryKnowledge } from "../memory/knowledge.js";
+import { countMatchedTerms, queryTermsFor } from "../search/query-terms.js";
+import { isSearchExcludedPath } from "../sources/sensitive-path.js";
 export interface RetrievalFreshness {
     revision: string;
     indexedAt: string;
@@ -50,8 +52,15 @@ export interface Publication {
     summaryStatus?: ProjectSummaryStatus;
     summaryCommits?: ReturnType<MemoryStore["findCommits"]>;
 }
+function isGeneratedOnlyCommit(store: MemoryStore, hash: string): boolean {
+    const row = store.db.prepare("select changed_files_json from commits where hash=?").get(hash) as {
+        changed_files_json: string;
+    } | undefined;
+    const files = row ? JSON.parse(row.changed_files_json) as string[] : [];
+    return files.length > 0 && files.every(isSearchExcludedPath);
+}
 export function publicationPrivacyMatches(root: string, p: Publication): boolean {
-    return p.privacyPolicy ? p.privacyPolicy === retrievalPrivacyPolicy(root) : p.policy === retrievalPolicy(root, 2) || p.policy === retrievalPolicy(root);
+    return p.privacyPolicy ? p.privacyPolicy === retrievalPrivacyPolicy(root) : p.policy === retrievalPolicy(root, 2, 1) || p.policy === retrievalPolicy(root, undefined, 1);
 }
 function publishedSummaryStatus(root: string, db: DatabaseSync, summary: ReturnType<MemoryStore["getProjectSummary"]>, commits: ReturnType<MemoryStore["findCommits"]>): ProjectSummaryStatus {
     const projected = { paths: { rootDir: root }, findCommits: () => commits,
@@ -343,6 +352,8 @@ export function publishRetrieval(store: MemoryStore, root: string, identity: str
             const source = store.readSourceMetadata(id);
             if (!source)
                 continue;
+            // Generated-only commits stay quotable as evidence but are kept out of raw search.
+            const searchable = source.type !== "commit" || !isGeneratedOnlyCommit(store, id);
             addSource.run(id, source.type, source.title, JSON.stringify(source.metadata ?? {}), JSON.stringify(source.type === "conversation" ? null : resolveEvidenceCitations(store, { evidence: [{ sourceType: source.type, sourceId: id }] })));
             for (const chunk of store.db.prepare("select * from chunks where source_id=? order by chunk_index").iterate(id) as Iterable<{
                 id: string;
@@ -351,10 +362,12 @@ export function publishRetrieval(store: MemoryStore, root: string, identity: str
                 metadata_json: string;
             }>) {
                 const inserted = addChunk.run(chunk.id, id, chunk.chunk_index, chunk.text, chunk.metadata_json);
-                addFts.run(inserted.lastInsertRowid, chunk.id, id, source.type, source.title, chunk.text);
+                if (searchable)
+                    addFts.run(inserted.lastInsertRowid, chunk.id, id, source.type, source.title, chunk.text);
             }
         }
-        const counts = db.prepare("select quality,count(*) as n from records where peer=0 and ((category='promoted' and lifecycle='current') or (category='candidate' and terminal=0)) group by quality").all() as Array<{
+        const counts = db.prepare("select category,quality,count(*) as n from records where peer=0 and ((category='promoted' and lifecycle='current') or (category='candidate' and terminal=0)) group by category,quality").all() as Array<{
+            category: string;
             quality: string;
             n: number;
         }>;
@@ -366,14 +379,22 @@ export function publishRetrieval(store: MemoryStore, root: string, identity: str
                 vectorInsert.run(vector.providerKey, vector.providerFingerprint, vector.ownerKind, vector.ownerId, JSON.stringify(payload), vectorBlob);
             }
         }
-        const health = { active: 0, needsReview: 0, quarantined: 0, retired: 0, replaced: 0 };
-        for (const row of counts)
+        const health = { active: 0, needsReview: 0, quarantined: 0, retired: 0, replaced: 0, candidates: { needsReview: 0, quarantined: 0 } };
+        for (const row of counts) {
+            const candidate = row.category === "candidate";
             if (row.quality === "active")
-                health.active = row.n;
-            else if (row.quality === "needs_review")
-                health.needsReview = row.n;
-            else
-                health.quarantined = row.n;
+                health.active += row.n;
+            else if (row.quality === "needs_review") {
+                health.needsReview += row.n;
+                if (candidate)
+                    health.candidates.needsReview += row.n;
+            }
+            else {
+                health.quarantined += row.n;
+                if (candidate)
+                    health.candidates.quarantined += row.n;
+            }
+        }
         health.retired = Number((db.prepare("select count(*) n from records where peer=0 and (lifecycle='retracted' or (category='candidate' and terminal=2))").get() as {
             n: number;
         }).n);
@@ -384,7 +405,9 @@ export function publishRetrieval(store: MemoryStore, root: string, identity: str
             n: number;
         }).n);
         const topReasons = db.prepare("select j.value as reason,count(*) as count from records r,json_each(r.payload,'$.qualityReasons') j where peer=0 and ((category='promoted' and lifecycle='current') or (category='candidate' and terminal=0)) group by j.value order by count desc,reason asc").all();
-        const auditHealth = { ...health, scanned: historicalTotal, total: health.active + health.needsReview + health.quarantined, historicalTotal, complete: true, rejected: health.quarantined, topReasons };
+        // The candidate split is for the desktop overview; the audit shape matches summarizeMemoryHealth exactly.
+        const { candidates: _candidates, ...auditCounts } = health;
+        const auditHealth = { ...auditCounts, scanned: historicalTotal, total: health.active + health.needsReview + health.quarantined, historicalTotal, complete: true, rejected: health.quarantined, topReasons };
         const summary: ReturnType<MemoryStore["getProjectSummary"]> = { sources: 0, chunks: 0, commits: 0, decisions: 0, candidateMemories: 0, promotedMemories: 0, temporaryMemories: 0, memoryHealth: health, syncSources: {} };
         for (const [table, field] of [["sources", "sources"], ["chunks", "chunks"], ["commits", "commits"], ["decisions", "decisions"], ["memory_candidates", "candidateMemories"], ["memories", "promotedMemories"], ["temporary_memories", "temporaryMemories"]] as const)
             summary[field] = Number((store.db.prepare(`select count(*) n from ${table}`).get() as {
@@ -397,7 +420,8 @@ export function publishRetrieval(store: MemoryStore, root: string, identity: str
             summary.lastSyncAt = lastSyncAt;
         if (retrievalEpoch(root) !== epoch || retrievalPolicy(root) !== policy)
             throw new RetrievalUnavailableError("Memory index was invalidated during publication.");
-        const summaryCommits = store.findCommits({ limit: 20 });
+        // The same window the live summary filters from, so both compute the same fingerprint.
+        const summaryCommits = store.findCommits({ limit: 100 });
         const knowledgeMemories=(db.prepare("select payload from records where category in ('candidate','promoted') order by id").all() as Array<{payload:string}>).map(row=>JSON.parse(row.payload) as MemorySearchResult);
         db.prepare("insert or replace into memory_knowledge values(1,?)").run(JSON.stringify(readMemoryKnowledge(store,knowledgeMemories)));
         const publication: Publication = { format: 3, identity, sequence, epoch, policy, privacyPolicy: retrievalPrivacyPolicy(root), indexedAt: new Date().toISOString(), revision, health: auditHealth, summary, summaryCommits, summaryStatus: publishedSummaryStatus(root, db, summary, summaryCommits) };
@@ -616,7 +640,46 @@ export function readPublishedMemories(root: string, input: RetrievalInput = {}):
         }
         let prefix = "";
         let from = "records r";
-        if (query) {
+        let order = "case r.category when 'promoted' then 0 else 1 end,r.time1 desc,r.time2 desc,r.tie";
+        const orderParams: SQLInputValue[] = [];
+        const terms = queryTermsFor(query, input.match);
+        if (terms) {
+            // Any term may match; promoted still leads, then the most terms matched, then recency.
+            const hits = `(${terms.map(() => "(instr(r.text,?)>0)").join("+")})`;
+            const trigram = terms.every(term => [...term].length >= 3 && !term.includes("\0"));
+            if (trigram) {
+                const match = terms.map(term => `"${term.replaceAll('"', '""')}"`).join(" OR ");
+                const key = `\0${match}`;
+                let cache = candidates.get(root);
+                if (!cache || cache.revision !== p.revision) {
+                    cache = { revision: p.revision, queries: new Map() };
+                    candidates.set(root, cache);
+                }
+                let preview = cache.queries.get(key);
+                if (!preview) {
+                    preview = prepare("select rowid from record_fts where record_fts match ? limit 129").all(match) as Array<{
+                        rowid: number;
+                    }>;
+                    if (cache.queries.size >= 128)
+                        cache.queries.delete(cache.queries.keys().next().value!);
+                    cache.queries.set(key, preview);
+                }
+                if (preview.length <= 128) {
+                    prefix = "with hits as materialized (select value as rowid from json_each(?)) ";
+                    params.unshift(JSON.stringify(preview.map(hit => hit.rowid)));
+                    from = "hits cross join records r on r.key=hits.rowid";
+                }
+                else {
+                    clauses.push("r.key in (select rowid from record_fts where record_fts match ?)");
+                    params.push(match);
+                }
+            }
+            clauses.push(`${hits}>0`);
+            params.push(...terms);
+            order = `case r.category when 'promoted' then 0 else 1 end,${hits} desc,r.time1 desc,r.time2 desc,r.tie`;
+            orderParams.push(...terms);
+        }
+        else if (query) {
             const trigram = [...query].length >= 3 && !query.includes("\0");
             const match = `"${query.replaceAll('"', '""')}"`;
             let cache = candidates.get(root);
@@ -648,9 +711,12 @@ export function readPublishedMemories(root: string, input: RetrievalInput = {}):
             clauses.push("instr(r.text,?)>0");
             params.push(query);
         }
-        const sql = `${prefix}select ${input.summaryOnly ? "r.brief" : "r.payload"} from ${from} where ${clauses.join(" and ")} order by case r.category when 'promoted' then 0 else 1 end,r.time1 desc,r.time2 desc,r.tie limit ? offset ?`;
-        const rows = prepare(sql).all(...params, limit + 1, offset) as unknown as StoredRow[];
-        const items = rows.slice(0, limit).map(row => refreshFileCitations(root, JSON.parse(input.summaryOnly ? row.brief : row.payload) as MemorySearchResult)).filter(memory => matchesLayerFilter(memory.layer, input.layer));
+        const sql = `${prefix}select ${input.summaryOnly ? "r.brief" : "r.payload"}${terms ? ",r.text" : ""} from ${from} where ${clauses.join(" and ")} order by ${order} limit ? offset ?`;
+        const rows = prepare(sql).all(...params, ...orderParams, limit + 1, offset) as unknown as Array<StoredRow & { text?: string }>;
+        const items = rows.slice(0, limit).map(row => {
+            const memory = refreshFileCitations(root, JSON.parse(input.summaryOnly ? row.brief : row.payload) as MemorySearchResult);
+            return terms ? { ...memory, match: { terms: terms.length, matched: countMatchedTerms(row.text ?? "", terms) } } : memory;
+        }).filter(memory => matchesLayerFilter(memory.layer, input.layer));
         return { items: withApplicability(items, input.targetEnvironment), freshness: freshness(root, p), ...(rows.length > limit ? { nextCursor: Buffer.from(JSON.stringify({ revision: p.revision, digest, offset: offset + limit })).toString("base64url") } : {}) };
     }));
 }

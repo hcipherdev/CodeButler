@@ -12,6 +12,7 @@ function matchesLayerOwner(
   return owner === "peer" ? peer : !peer;
 }
 import type { MemoryLayerFilter, MemoryLayerOwner, TargetEnvironment } from "../types.js";
+import type { MemoryQueryMatch } from "./query-terms.js";
 import { createProviderFingerprint, createProviderKey, createEmbeddingEndpointHash } from "../embeddings/fingerprint.js";
 import { createOpenAICompatibleEmbeddingProvider, isLoopbackEmbeddingEndpoint } from "../embeddings/provider.js";
 import { redactSensitiveText } from "../privacy/redaction.js";
@@ -34,6 +35,7 @@ export interface SearchServiceOptions {
 export interface MemorySearchInput {
   targetEnvironment?: TargetEnvironment;
   query?: string;
+  match?: MemoryQueryMatch;
   type?: MemoryType;
   status?: "promoted" | "candidate";
   qualityStatus?: MemoryQualityStatusFilter;
@@ -46,11 +48,12 @@ export interface MemorySearchInput {
 export async function searchProjectMemory(
   store: MemoryStore,
   config: ProjectConfig,
-  input: { query: string; sourceTypes?: SourceType[]; limit?: number; targetEnvironment?: TargetEnvironment },
+  input: { query: string; match?: MemoryQueryMatch; sourceTypes?: SourceType[]; limit?: number; targetEnvironment?: TargetEnvironment },
   options: SearchServiceOptions = {}
 ): Promise<{ memories: MemorySearchResult[]; results: SearchResult[] }> {
   const memoryInput: MemorySearchInput = {
     query: input.query,
+    ...(input.match === undefined ? {} : { match: input.match }),
     ...(input.limit === undefined ? {} : { limit: input.limit })
   };
   const lexical = {

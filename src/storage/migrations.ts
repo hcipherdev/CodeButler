@@ -1062,7 +1062,7 @@ function createDatabaseBackup(databasePath: string): string {
     const source = new DatabaseSync(process.argv[1], { readOnly: true });
     backup(source, process.argv[2]).then(() => source.close());
   `;
-  execFileSync(process.execPath, ["-e", script, databasePath, backupPath], { stdio: "ignore" });
+  execFileSync(process.execPath, ["-e", script, databasePath, backupPath], { stdio: "ignore", windowsHide: true });
   return backupPath;
 }
 

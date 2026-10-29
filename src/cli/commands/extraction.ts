@@ -1,5 +1,6 @@
 import { loadProjectConfig } from "../../config.js";
 import { countReasons, listExtractionRuns, rejectionKey } from "../../extract/runs.js";
+import { resetExtractionCursors } from "../../extract/cursor.js";
 import { assessMemoryQuality } from "../../memory/quality.js";
 import { openConfiguredMemoryStore } from "../../storage/open-configured-store.js";
 import type { ExtractionJob } from "../../storage/store.js";
@@ -22,14 +23,14 @@ export async function runExtractionCommand(args: string[], cwd: string, stdout: 
   try {
     if (subcommand === "report") {
       const runs = listExtractionRuns(store.paths.localDatabasePath, options.since);
-      const totals = runs.reduce((sum, run) => ({ returned: sum.returned + run.returned, candidates: sum.candidates + run.candidates, promoted: sum.promoted + run.promoted, failed: sum.failed + (run.error ? 1 : 0) }), { returned: 0, candidates: 0, promoted: 0, failed: 0 });
+      const totals = runs.reduce((sum, run) => ({ returned: sum.returned + run.returned, candidates: sum.candidates + run.candidates, merged: sum.merged + (run.merged ?? 0), promoted: sum.promoted + run.promoted, failed: sum.failed + (run.error ? 1 : 0) }), { returned: 0, candidates: 0, merged: 0, promoted: 0, failed: 0 });
       const rejections = countReasons(runs.flatMap(run => Object.entries(run.rejections).flatMap(([reason, count]) => Array<string>(count).fill(reason))));
       if (options.json) { stdout(JSON.stringify({ runs, totals, rejections }, null, 2)); return 0; }
       stdout("Extraction Runs");
-      stdout(`runs=${runs.length} failed=${totals.failed} returned=${totals.returned} candidates=${totals.candidates} promoted=${totals.promoted}`);
+      stdout(`runs=${runs.length} failed=${totals.failed} returned=${totals.returned} candidates=${totals.candidates} merged=${totals.merged} promoted=${totals.promoted}`);
       for (const [reason, count] of Object.entries(rejections).sort((a, b) => b[1] - a[1])) stdout(`rejected ${reason}=${count}`);
       for (const run of runs.slice(-options.limit)) {
-        stdout(`${run.startedAt} ${run.channel} sources=${run.sourceIds.length} returned=${run.returned} candidates=${run.candidates} promoted=${run.promoted}${run.error ? ` error=${run.error}` : ""}`);
+        stdout(`${run.startedAt} ${run.channel} sources=${run.sourceIds.length} returned=${run.returned} candidates=${run.candidates} merged=${run.merged ?? 0} promoted=${run.promoted}${run.error ? ` error=${run.error}` : ""}`);
       }
       return 0;
     }
@@ -45,6 +46,8 @@ export async function runExtractionCommand(args: string[], cwd: string, stdout: 
         if (!adapter) continue;
         store.enqueueExtractionEvidence(adapter, source.type, source.id); queued++;
       }
+      // Requeueing asks for a full re-read, e.g. after an extractor fix, not just the newest messages.
+      resetExtractionCursors(store, sources.filter(source => source.type === "conversation").map(source => source.id));
       if (options.json) { stdout(JSON.stringify({ queued }, null, 2)); return 0; }
       stdout(`Queued ${queued} source(s) since ${options.since} for extraction on the next sync.`);
       return 0;

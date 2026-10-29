@@ -26,6 +26,7 @@ import {
   type PrivacyExportDocument
 } from "./export-format.js";
 import type { MemoryStore } from "../storage/store.js";
+import { forgetExtractionCursors } from "../extract/cursor.js";
 import { listStoredEmbeddingProviders } from "../storage/embedding-store.js";
 import { retractedLifecycleValues } from "../storage/lifecycle-store.js";
 import {
@@ -1222,6 +1223,7 @@ function deleteSourceData(
   }
   store.db.prepare("delete from source_failures where path = ?").run(input.sourceOrigin);
   store.db.prepare("delete from sync_cursors where cursor_key = ?").run(input.sourceOrigin);
+  if (input.sourceType === "conversation") forgetExtractionCursors(store, [input.sourceId]);
   if (input.sourceType === "commit") store.db.prepare("delete from commits where hash = ?").run(input.sourceId);
   if (input.sourceType === "decision") store.db.prepare("delete from decisions where id = ?").run(input.sourceId);
   store.db.prepare("delete from sources where id = ?").run(input.sourceId);

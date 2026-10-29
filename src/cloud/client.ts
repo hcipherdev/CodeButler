@@ -18,6 +18,7 @@ import { recordCompletedOperation } from "../operations/log.js";
 import { withTransaction } from "../storage/transactions.js";
 import { withProjectGate } from "./gate.js";
 import { assertCheckoutReady } from "./checkout-path.js";
+import { adoptNewerNarrative } from "../project-summary/service.js";
 import { DatabaseSync } from "node:sqlite";
 import { rmSync, writeFileSync } from "node:fs";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -36,6 +37,7 @@ import {
   missingBlocks,
   partitionSegments,
   recoverApply,
+  snapshotFile,
   verifyAndMigrateSnapshotDatabase,
   type CaptureResult,
   type Snapshot,
@@ -468,11 +470,12 @@ export function applyCoreMerge(root: string, remote: SnapshotBundle, ancestor?: 
   const remoteDb = new DatabaseSync(remotePath, { readOnly: true });
   const ancestorDb = new DatabaseSync(ancestorPath, { readOnly: true });
   const backup = createRecoveryBackup(store.paths.databasePath, new Date());
-  let forgotten = 0;
+  let forgotten = 0, merging = false, committed = false;
   try {
     store.init();
     const now = new Date().toISOString();
     const shared = options.hold ? sharedMemoryCount(store.db) : 0;
+    merging = true;
     const result = withTransaction(store.db, () => {
       const merged = mergeCore(store.db, remoteDb, ancestorDb);
       // Adopted temporary memories carry the masked path; they belong to this checkout now.
@@ -497,6 +500,8 @@ export function applyCoreMerge(root: string, remote: SnapshotBundle, ancestor?: 
       }, now);
       return merged;
     });
+    committed = true;
+    adoptRemoteNarrative(root, remote);
     if (forgotten) { purgeRetrieval(root); invalidateHandbookExport(root); }
     if (!options.keepBackup) { removeRecoveryBackup(backup); return result; }
     // The merge is committed; failing to rename or prune its backup only leaves the plain recovery copy.
@@ -504,12 +509,30 @@ export function applyCoreMerge(root: string, remote: SnapshotBundle, ancestor?: 
   } catch (error) {
     // A held merge rolled back before writing; there is nothing to recover.
     if (error instanceof MergeHeldError) { removeRecoveryBackup(backup); throw error; }
+    // A merge that failed and rolled back left memory as it was. Retried merges would otherwise
+    // keep a full copy of the database for every attempt.
+    if (merging && !committed && !store.db.isTransaction) {
+      removeRecoveryBackup(backup);
+      throw new Error(`Cloud merge failed and was rolled back: ${error instanceof Error ? error.message : String(error)}`);
+    }
     // The backup is the only way back from a half-applied merge, so it is retained.
     throw new Error(`Cloud merge failed; recovery backup retained at ${backup}: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     remoteDb.close(); ancestorDb.close(); store.close();
     for (const path of [remotePath, ancestorPath]) for (const suffix of ["", "-wal", "-shm"]) rmSync(`${path}${suffix}`, { force: true });
   }
+}
+
+/**
+ * Only the database is merged; the files published after a merge are this device's own, so a narrative the
+ * other device wrote later is taken first. The merge is already saved, so failing here only leaves the older
+ * narrative, which the next daily refresh rewrites.
+ */
+function adoptRemoteNarrative(root: string, remote: SnapshotBundle): void {
+  try {
+    const file = (path: string) => snapshotFile(remote.manifest, bundleResolver(remote.blocks), path);
+    adoptNewerNarrative(root, { summary: file("project-summary.md"), meta: file("project-summary.meta.json") });
+  } catch { /* See above. */ }
 }
 
 function stateDirectoryRoot(root: string): string {
@@ -534,7 +557,9 @@ export function localCloudChangeStamp(root: string): string {
       const path = prefix ? `${prefix}/${name}` : name;
       // Include WAL as a change signal, although it never travels in snapshots.
       if (excluded(path) && path !== "memory.sqlite-wal") return [];
-      const stat = lstatSync(join(dir, name));
+      // A WAL or shm file can vanish between readdir and lstat when its store closes; absent is no change.
+      const stat = lstatSync(join(dir, name), { throwIfNoEntry: false });
+      if (!stat) return [];
       if (stat.isSymbolicLink()) throw new Error("Cloud sync does not follow project symlinks");
       // Closing a read-only store can truncate and recreate an empty WAL. Its
       // mtime is noise; only a WAL with frames represents unsnapshotted writes.

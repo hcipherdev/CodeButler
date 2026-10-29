@@ -67,9 +67,9 @@ describe("memory review resolution", () => {
       const original = candidate(store);
       const context = createMemoryReviewContext(store, "candidate", original);
       resolveMemoryReview(store, { memoryId: original.id, category: "candidate", action: "verify", reason: "Confirmed by reviewer", reviewToken: context.reviewToken }, "desktop");
-      store.db.prepare("update memory_review_resolutions set context_fingerprint=? where memory_id=?").run(context.legacyReviewToken, original.id);
+      store.db.prepare("update memory_review_resolutions set context_fingerprint=? where memory_id=?").run(context.acceptedTokens.at(-1)!, original.id);
       expect(result(store, original.id).trust?.displayStatus).toBe("human_verified");
-      expect(() => resolveMemoryReview(store, { memoryId: original.id, category: "candidate", action: "discard", reason: "Old client submission", reviewToken: context.legacyReviewToken }, "desktop")).toThrow(StaleMemoryReviewError);
+      expect(() => resolveMemoryReview(store, { memoryId: original.id, category: "candidate", action: "discard", reason: "Old client submission", reviewToken: context.acceptedTokens.at(-1)! }, "desktop")).toThrow(StaleMemoryReviewError);
     } finally { store.close(); }
   });
 

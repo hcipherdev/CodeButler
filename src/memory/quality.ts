@@ -10,11 +10,17 @@ import type {
 import {
   currentMemoryReview,
   effectiveTerminalMemoryReview,
+  inheritedCandidateVerification,
   matchingMemoryVerification,
   type MemoryReviewCategory
 } from "./review-state.js";
 import { hasExactLegacyV1Signature } from "./legacy.js";
 import { assessClaim, claimText } from "./statement.js";
+import { evidenceTimes } from "./evidence-time.js";
+import { relevantCommitsAfter } from "./related-change.js";
+
+/** Reviews a person made; their stale verifications still ask for a fresh look. */
+const HUMAN_REVIEW_ACTORS = new Set(["desktop", "cli"]);
 
 export interface MemoryQualityAssessment {
   status: MemoryQualityStatus;
@@ -75,6 +81,9 @@ const PRESERVED_QUALITY_REASONS = new Set([
   "layer_retention_archived",
   "automatic_promotion_conflict",
   "cloud_merge_conflict",
+  // Set by src/memory/invalidation.ts when newer evidence doubts or replaces a memory.
+  "invalidated_by_newer_evidence",
+  "possibly_outdated",
   // v19 recorded this assessment before v20 moved quality device-local. Keep
   // near-matches reviewable, while legacy-v1 retirement still requires the
   // complete exact structural signature.
@@ -142,8 +151,14 @@ export function assessMemoryQuality(
     if (terminal?.action === "discard") reasons.add("manual_review_discarded");
     const verification = category !== undefined && latestReview?.action === "verify" && latestReview.current
       ? matchingMemoryVerification(store, category, memory)
-      : undefined;
-    if ((latestReview?.action === "verify" && !latestReview.current) || latestReview?.action === "accept_wording") reasons.add("review_context_changed");
+      : category === "promoted" && latestReview === undefined
+        ? inheritedCandidateVerification(store, memory as DurableMemory)
+        : undefined;
+    // A stale AI verify on a candidate only means "not verified": flagging it would leave
+    // every AI-checked candidate that later gains evidence unable to promote.
+    const staleVerify = latestReview?.action === "verify" && !latestReview.current &&
+      (category !== "candidate" || HUMAN_REVIEW_ACTORS.has(latestReview.actor));
+    if (staleVerify || latestReview?.action === "accept_wording") reasons.add("review_context_changed");
     for (const reason of verification?.resolvedReasons ?? []) reasons.delete(reason);
   }
 
@@ -366,20 +381,14 @@ function hasNewerRelatedCommits(
   if (memory.confidence >= 1 && memory.dedupeKey.startsWith("deterministic:conversation:")) return false;
   if (memory.relatedFiles.length === 0) return false;
 
-  const evidenceCommitTimes = memory.evidence
-    .filter((evidence) => evidence.sourceType === "commit")
-    .map((evidence) => store.readCommit(evidence.sourceId)?.authoredAt)
-    .filter((value): value is string => typeof value === "string")
-    .map((value) => Date.parse(value))
-    .filter(Number.isFinite);
-  if (evidenceCommitTimes.length === 0) return false;
-  const latestEvidenceCommit = Math.max(...evidenceCommitTimes);
+  const times = evidenceTimes(store, memory.evidence);
+  if (times.commits.length === 0) return false;
+  // A conversation that restates the fact after the later commits shows it still held then.
+  const latestEvidenceCommit = Math.max(...times.commits, ...times.conversations);
 
+  // Only a later commit whose changed lines touch what the memory names makes it stale.
   return memory.relatedFiles.some((filePath) =>
-    store.findCommits({ filePath, limit: 100 }).some((commit) => {
-      const authoredAt = Date.parse(commit.authoredAt);
-      return Number.isFinite(authoredAt) && authoredAt > latestEvidenceCommit;
-    })
+    relevantCommitsAfter(store, memory, filePath, latestEvidenceCommit).length > 0
   );
 }
 

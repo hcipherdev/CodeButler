@@ -11,10 +11,17 @@ export interface AnthropicAwsMessageRequest {
   baseUrl?: string | undefined;
   timeoutMs?: number | undefined;
   signal?: AbortSignal | undefined;
+  /** "anthropic" calls api.anthropic.com directly; the default is Claude Platform on AWS. */
+  kind?: "anthropic" | "anthropic-aws" | undefined;
+  /** Already-resolved credentials; when absent they are read from the named environment variables. */
+  apiKey?: string | undefined;
+  workspaceId?: string | undefined;
+  region?: string | undefined;
 }
 
 export interface AnthropicAwsMessageResponse {
   content?: unknown;
+  usage?: { input_tokens?: number; output_tokens?: number } | undefined;
 }
 
 export interface AnthropicAwsHttpResponse {
@@ -44,13 +51,15 @@ export async function runAnthropicAwsMessage(
   request: AnthropicAwsMessageRequest,
   httpClient: AnthropicAwsHttpClient = nodeHttpsRequest
 ): Promise<AnthropicAwsMessageResponse> {
-  const apiKey = readRequiredEnv(request.apiKeyEnv, "Anthropic AWS API key");
-  const workspaceId = readRequiredEnv(request.workspaceIdEnv, "Anthropic AWS workspace ID");
-  const region = readRequiredEnv(request.regionEnv, "AWS region");
-  const baseUrl =
-    request.baseUrl?.trim() ||
-    process.env.ANTHROPIC_AWS_BASE_URL?.trim() ||
-    `https://aws-external-anthropic.${region}.api.aws`;
+  const direct = request.kind === "anthropic";
+  const apiKey = request.apiKey ?? readRequiredEnv(request.apiKeyEnv, direct ? "Anthropic API key" : "Anthropic AWS API key");
+  const workspaceId = direct ? undefined : request.workspaceId ?? readRequiredEnv(request.workspaceIdEnv, "Anthropic AWS workspace ID");
+  const region = direct ? undefined : request.region ?? readRequiredEnv(request.regionEnv, "AWS region");
+  const baseUrl = direct
+    ? request.baseUrl?.trim() || "https://api.anthropic.com"
+    : request.baseUrl?.trim() ||
+      process.env.ANTHROPIC_AWS_BASE_URL?.trim() ||
+      `https://aws-external-anthropic.${region}.api.aws`;
 
   const body = JSON.stringify({
     model: request.model,
@@ -66,8 +75,8 @@ export async function runAnthropicAwsMessage(
       "content-type": "application/json",
       "content-length": Buffer.byteLength(body).toString(),
       "anthropic-version": "2023-06-01",
-      "anthropic-workspace-id": workspaceId,
-      "user-agent": "AnthropicAWS/CodeButler",
+      ...(workspaceId ? { "anthropic-workspace-id": workspaceId } : {}),
+      "user-agent": direct ? "CodeButler" : "AnthropicAWS/CodeButler",
       "X-Api-Key": apiKey
     },
     body,
@@ -77,7 +86,7 @@ export async function runAnthropicAwsMessage(
 
   if (!response.ok) {
     const body = await readErrorBody(response);
-    throw new Error(`AnthropicAWS request failed with status ${response.status}${body ? `: ${body}` : ""}`);
+    throw new Error(`${direct ? "Anthropic" : "AnthropicAWS"} request failed with status ${response.status}${body ? `: ${body}` : ""}`);
   }
   return (await response.json()) as AnthropicAwsMessageResponse;
 }

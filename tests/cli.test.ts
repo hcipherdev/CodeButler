@@ -38,10 +38,11 @@ describe("CLI", () => {
 
     expect(lines.join("\n").split("\n").filter((line) => line.startsWith("  code-butler "))).toEqual([
       "  code-butler rules path|list|show <id>|match|conflicts|resolve <id>|attestations|attest <id>|revoke <id>|sync status|enable|disable|now",
-      "  code-butler init",
+      "  code-butler init [--allow-remote-models]",
       "  code-butler config init",
       "  code-butler config global init",
       "  code-butler config migrate-local <--dry-run|--apply> [--json]",
+      "  code-butler config remote-models <on|off|status>",
       "  code-butler cloud <register|login> --server <https-origin> --email <email>",
       "  code-butler cloud logout",
       "  code-butler cloud init --recovery-file <path> [--label <name>] [--recovery-code-file <path>]",
@@ -296,6 +297,45 @@ describe("CLI", () => {
       }
     };
   }
+
+  it("asks for the remote-model opt-in during init and records it per device", async () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, globalHome, launchdHomeDir);
+    process.env.CODE_BUTLER_HOME = globalHome;
+    vi.stubEnv("OPENAI_API_KEY", "sk-exported-for-another-tool");
+    const init = (args: string[], output: string[], confirm?: (question: string) => Promise<boolean>) => runCli(["init", ...args], {
+      cwd: rootDir,
+      stdout: (line) => output.push(line),
+      confirm,
+      projectSummaryGenerator: unavailableSummaryGenerator,
+      watchServiceHomeDir: launchdHomeDir,
+      watchServicePlatform: "darwin",
+      watchServiceCommandRunner: recordCommands().runner
+    });
+    try {
+      const notice: string[] = [];
+      await expect(init([], notice)).resolves.toBe(0);
+      expect(notice.join("\n")).toContain("OPENAI_API_KEY is set, but LLM extraction stays off until you opt in");
+      expect(loadProjectConfig(rootDir).extractor.requiresConsent).toBe(true);
+
+      const questions: string[] = [];
+      await expect(init([], [], async (question) => { questions.push(question); return true; })).resolves.toBe(0);
+      expect(questions).toEqual([expect.stringContaining("api.openai.com")]);
+      expect(loadProjectConfig(rootDir).extractor.requiresConsent).toBeUndefined();
+
+      const status: string[] = [];
+      await expect(runCli(["config", "remote-models", "off"], { cwd: rootDir, stdout: () => undefined })).resolves.toBe(0);
+      await expect(runCli(["config", "remote-models", "status"], { cwd: rootDir, stdout: (line) => status.push(line) })).resolves.toBe(0);
+      expect(status).toEqual(["allowRemoteModels=false defaultModelWaiting=true"]);
+      await expect(init(["--allow-remote-models"], [], async () => { throw new Error("must not ask"); })).resolves.toBe(0);
+      expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.local.json"), "utf8")).privacy).toEqual({ allowRemoteModels: true });
+      expect(JSON.parse(readFileSync(join(rootDir, ".code-butler", "config.json"), "utf8")).privacy).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 
   it("initializes local storage and imports a conversation", async () => {
     const rootDir = makeTempDir();

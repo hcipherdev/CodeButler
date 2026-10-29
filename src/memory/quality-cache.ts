@@ -1,5 +1,6 @@
 import type { MemoryStore } from "../storage/store.js";
 import { measured } from "../retrieval/metrics.js";
+import { prepareCached } from "../storage/statements.js";
 import {
   localContentHash,
   readLocalMemoryQuality,
@@ -13,7 +14,7 @@ import type {
 import { assessMemoryQuality } from "./quality.js";
 import { createMemoryReviewContext, type MemoryReviewCategory } from "./review-state.js";
 
-export const MEMORY_QUALITY_POLICY_VERSION = 4;
+export const MEMORY_QUALITY_POLICY_VERSION = 7;
 
 export interface ResolvedMemoryQuality {
   qualityStatus: MemoryQualityStatus;
@@ -121,6 +122,15 @@ export function createQualityAssessmentFingerprint(
         left join memory_review_resolution_compensations c on c.resolution_id = r.id
        where r.memory_id = ? and r.category = ?
        order by r.reviewed_at, r.id`, memory.id, category),
+    // A durable memory can carry over the verification of the candidate it was made from.
+    candidateReviews: category === "promoted" ? safeRows(store, `
+      select r.id, r.memory_id, r.action, r.reviewed_at,
+             case when c.id is null then 0 else 1 end as reverted
+        from memory_review_resolutions r
+        join memory_candidates m on m.id = r.memory_id and r.category = 'candidate'
+        left join memory_review_resolution_compensations c on c.resolution_id = r.id
+       where m.promoted_memory_id = ?
+       order by r.reviewed_at, r.id`, memory.id) : [],
     branchTriage: safeRows(store, `
       select memory_version, action, reviewed_at from branch_triage_reviews
        where memory_id = ? and category = ? order by reviewed_at, id`, memory.id, category),
@@ -153,7 +163,7 @@ function memoryVersionFor(category: MemoryReviewCategory, memory: QualityMemory)
 
 function safeRows(store: MemoryStore, sql: string, ...parameters: string[]): unknown[] {
   try {
-    return store.db.prepare(sql).all(...parameters);
+    return prepareCached(store.db, sql).all(...parameters);
   } catch {
     return [];
   }

@@ -14,22 +14,16 @@ The desktop installer preserves this command across upgrades, refreshes older ex
 CLI compatibility paths, and stops stale managed MCP processes so clients can reconnect
 to the new build. No separate npm upgrade is required.
 
-Until Code Butler 2.0 is published to npm, the `npx` and `npm install` commands
-below install the earlier 1.x release, whose cloud sync has been retired. Without
-the desktop app, an MCP client can launch it with `npx`:
+Without the desktop app, install the CLI from source (see the
+[quickstart](quickstart.md)) and point the MCP client at it. The npm registry
+still has the retired 1.x release, so do not use `npx code-butler` or
+`npm install -g code-butler` until 2.0 is published there.
 
 ```bash
-npx -y code-butler mcp --project-root /absolute/path/to/project
-```
-
-Or install the CLI globally:
-
-```bash
-npm install -g code-butler
 code-butler mcp --project-root /absolute/path/to/project
 ```
 
-The MCP server resolves the target Git repository and completes project setup automatically after the connection handshake. It creates internal memory storage, a local project summary, `AGENTS.md`, and `CLAUDE.md`, without requiring the desktop app or an API key. Existing agent files are backed up and replaced on first completion; later reconnects preserve user edits and recreate missing files. An existing summary is preserved. A configured provider enriches an unedited local summary in the background, with failures retried no sooner than once per day.
+The MCP server resolves the target Git repository and completes project setup automatically after the connection handshake. It creates internal memory storage, a local project summary, `AGENTS.md`, and `CLAUDE.md`, without requiring the desktop app or an API key. Existing agent files are backed up and replaced on first completion; later reconnects preserve user edits and recreate missing files. An existing summary is preserved. A provider you configured enriches an unedited local summary in the background, with failures retried no sooner than once per day. The built-in default model does this only after you opt in with `code-butler config remote-models on`; see [privacy](privacy.md#remote-ai-models).
 
 Call `current_project` to inspect its `setup` field for progress, missing artifacts, summary quality, backups, and errors. Desktop readiness and `code-butler doctor` also check both agent files. `code-butler init` remains available for explicit setup; `code-butler mcp --no-auto-init` retains storage-only startup. Automatic setup respects deliberate project-memory removal and does not re-enable it. Restart existing MCP connections after installing a new runtime.
 
@@ -113,29 +107,61 @@ rights. The Startup entry restarts the watcher at login; unlike Task Scheduler i
 does not automatically restart a crashed process. Git is resolved from PATH or a
 standard Git for Windows installation; `CODE_BUTLER_GIT` can specify another executable.
 
-## Common Tools
+## MCP Tools
 
-The MCP server exposes 29 tools. Lifecycle and operations calls include:
+The MCP server exposes 34 tools. `tests/docs/mcp-tool-docs.test.ts` keeps this list in step with the registered tools.
 
-- `sync_project_memory`
-- `list_source_failures`
-- `summarize_project_brief`
-- `summarize_active_context`
-- `search_temporary_memory`
-- `search_project_memory`
-- `find_memories`
-- `remember_project_memory`
+Project, sync and health:
+
+- `current_project()`
+- `sync_project_memory({ source? })`
+- `summarize_project_state()`
+- `list_source_failures({ adapter?, resolved?, limit? })`
+- `run_doctor()`
+- `summarize_project_brief()`
+- `refresh_project_summary({ force? })`
+
+Search and reading:
+
+- `search_project_memory({ query, sourceTypes?, limit?, targetEnvironment? })`
+- `find_memories({ query?, type?, status?, qualityStatus?, lifecycleStatus?, layer?, owner?, limit?, targetEnvironment? })`
+- `find_decisions({ topic?, limit?, targetEnvironment? })`
+- `find_related_commits({ query?, filePath?, limit? })`
+- `read_memory_source({ sourceId })`
+- `get_memory_history({ id, category, offset?, limit? })`
+- `read_project_handbook({ topicId?, reach?, owner?, offset?, limit? })`
+- `summarize_memory_movement({ reach?, owner? })`
+- `summarize_memory_health()`
+
+Writing and lifecycle:
+
+- `remember_project_memory({ type, text, title?, reason?, relatedFiles?, promote?, supersedesMemoryId?, scope?, layer? })`
 - `update_memory_scope({ memoryId, category, scope, reason })`
 - `update_memory_layer({ memoryId, category, layer, reason })`
+- `update_memory_status({ memoryId, status, reason, replacementMemoryId? })`
+- `resolve_memory_review({ memoryId, category, action, reason?, reviewToken?, correction? })`
 - `suggest_memory_layer_promotions({ layer?, includeCandidates?, minConfidence?, minScore?, limit? })`
 - `suggest_branch_memory_triage({ branch?, includeActive?, staleDays?, includeReviewed?, limit? })`
 - `resolve_branch_memory_triage({ memoryId, category, action, reason, supersedesMemoryId? })`
-- `resolve_memory_review({ memoryId, category, action, reason?, reviewToken?, correction? })`
 - `explain_memory_promotions({ memoryId?, limit? })`
-- `update_memory_status`
-- `explain_code_change`
-- `investigate_project_history`
-- `summarize_recent_activity`
+- `explain_layer_retention({ memoryId?, limit? })`
+
+History and investigation:
+
+- `explain_code_change({ filePath, lineNumber?, question?, targetEnvironment? })`
+- `investigate_project_history({ question, limit?, targetEnvironment? })`
+- `summarize_recent_activity({ since?, until?, includeWorkingTree? })`
+
+Temporary working context:
+
+- `search_temporary_memory({ query, threadId?, sessionId?, limit?, targetEnvironment? })`
+- `summarize_active_context({ threadId?, sessionId?, projectOnly?, limit?, targetEnvironment? })`
+- `cleanup_temporary_memory({ expiredOnly? })`
+
+Global rules:
+
+- `get_applicable_rules({ mode?, actions?, paths?, task?, ids?, targetEnvironment?, subjects?, cursor? })`
+- `record_rule_attestation({ ruleId, ruleBodyHash, subject, outcome, evidence })`
 
 `find_memories` accepts optional `lifecycleStatus: "current" | "superseded" | "retracted" | "all"`. When omitted, promoted results remain current-only; candidates are unchanged. It also accepts optional `layer: "core" | "device" | "branch" | "all"` and reports each memory's layer; when omitted, every layer is returned. Results include `reviewToken`, the latest `review`, `trust.displayStatus`, and `confidenceBasis`. Pass that token to `resolve_memory_review`; stale tokens are rejected when the memory, evidence, related-file commits, or conflicts changed. Verify preserves numeric extraction confidence and candidate/promotion state, Correct creates a human-authored replacement, and Discard retains the original for audit. `remember_project_memory` accepts optional `layer`; promoted writes default to shared `core`, while `promote: false` defaults to `branch:<name>:device:<installation-id>` when the configured Git repo is on a non-default branch. `suggest_memory_layer_promotions` is read-only and returns suggested promotion actions for non-core durable memories that pass conservative confidence and scope checks; branch candidate suggestions use `resolve_branch_memory_triage` because that path promotes the candidate into a durable `core` memory. `suggest_branch_memory_triage` groups branch-layer memories by Git branch state and hides unchanged reviewed items by default. `explain_memory_promotions` is read-only and reports both what automatic promotion would do now and what it already decided, with privacy-safe reason codes; after each sync Butler applies only unambiguous promotions, converges exact duplicates onto the existing core fact, defers contradictions as `needs_review`, and honours an explicit `retain_branch` or `discard` review over its own policy. Candidates already in `core` are promoted when a person verified them (desktop or CLI, no confidence bar), their evidence spans two independent sources (confidence ≥ `promotion.confidenceThreshold`), or an AI review judged them current, excluding replacements that review wrote itself (confidence ≥ `promotion.automatic.singleSourceMinConfidence`, default 0.90); `resolve_memory_review` verification from MCP does not count, and MCP can still verify only memories that need review. Turn that off with `promotion.automatic.coreCandidates: false`. Disable it with `promotion.automatic.enabled: false`. `resolve_branch_memory_triage` explicitly `promote_to_core`, `discard`, or `retain_branch` for reviewed branch memories. `update_memory_layer` moves an existing memory between layers and accepts `device` as an alias for this installation's device layer. `remember_project_memory` accepts `supersedesMemoryId` for promoted replacements. `update_memory_status` requires a nonempty `memoryId`, lifecycle `status`, and `reason`; `superseded` also requires `replacementMemoryId`.
 

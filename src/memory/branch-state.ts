@@ -1,5 +1,6 @@
 import { gitExecutable } from "../git-executable.js";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 import { readMemoryBranchContext } from "./branch.js";
 
@@ -28,6 +29,18 @@ export function readGitBranchFacts(repoPath: string | undefined): GitBranchFacts
     currentBranch: context.branch,
     ...(defaultBranch === undefined ? {} : { defaultBranch })
   };
+}
+
+/**
+ * Changes whenever a local branch is created, deleted or moved, or HEAD switches: everything
+ * classifyBranch can observe. "unavailable" when git cannot answer, which is itself stable.
+ */
+export function readGitRefsFingerprint(repoPath: string | undefined): string {
+  if (!repoPath?.trim()) return "unavailable";
+  const refs = gitOutput(repoPath, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"]);
+  if (refs === undefined) return "unavailable";
+  const head = gitOutput(repoPath, ["symbolic-ref", "-q", "HEAD"]) ?? gitOutput(repoPath, ["rev-parse", "HEAD"]) ?? "";
+  return createHash("sha256").update(JSON.stringify([refs, head])).digest("hex");
 }
 
 export function classifyBranch(
@@ -72,10 +85,21 @@ function gitStatusForFacts(git: GitBranchFacts, args: string[]): number | undefi
   return git.repoPath === undefined ? undefined : gitStatus(git.repoPath, args);
 }
 
+function gitOutput(repoPath: string, args: string[]): string | undefined {
+  const result = spawnSync(gitExecutable(), ["-C", repoPath, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    windowsHide: true
+  });
+  if (result.error || result.status !== 0) return undefined;
+  return result.stdout;
+}
+
 function gitStatus(repoPath: string, args: string[]): number | undefined {
   const result = spawnSync(gitExecutable(), ["-C", repoPath, ...args], {
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"]
+    stdio: ["ignore", "pipe", "ignore"],
+    windowsHide: true
   });
   if (result.error) return undefined;
   return result.status ?? undefined;

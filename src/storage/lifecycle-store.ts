@@ -9,6 +9,7 @@ import type {
 } from "../types.js";
 import type { StorageContentPolicy } from "./content-policy.js";
 import { withTransaction } from "./transactions.js";
+import { prepareCached } from "./statements.js";
 import { recordMemoryEvent } from "../memory/events.js";
 import type { OperationActor } from "../types.js";
 
@@ -170,7 +171,7 @@ export function listMemoryRelations(
     parameters.push(input.relationType);
   }
   const where = predicates.length > 0 ? `where ${predicates.join(" and ")}` : "";
-  const rows = db.prepare(
+  const rows = prepareCached(db,
     `select id, from_memory_id, to_memory_id, relation_type, created_at, reason
      from memory_relations ${where}
      order by created_at asc, id asc`

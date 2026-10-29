@@ -63,6 +63,10 @@ function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
+interface AsyncGateHold { lock: string; owner: string; token: string; background: boolean; releasedMs: number }
+/** Async holds this context owns, so a holder can step aside during a long model call. */
+const asyncHolds = new AsyncLocalStorage<Map<string, AsyncGateHold>>();
+
 export async function withProjectGate<T>(root: string, work: () => Promise<T> | T, options: { allowRemoved?: boolean; waitMs?: number; name?: string; background?: boolean } = {}): Promise<T> {
   root = canonicalRoot(root);
   if (!options.allowRemoved) assertProjectNotRemoved(root);
@@ -73,58 +77,108 @@ export async function withProjectGate<T>(root: string, work: () => Promise<T> | 
   const processStart = processStartIdentity(process.pid);
   writeFileSync(owner, JSON.stringify({ pid: process.pid, ...(processStart ? { processStart } : {}), token, name: options.name ?? "Other local operation", startedAt: new Date().toISOString(),
     ...(process.env.CODE_BUTLER_WATCH_TOKEN ? { watcherToken: process.env.CODE_BUTLER_WATCH_TOKEN } : {}) }), { flag: "wx", mode: 0o600 });
-  const deadline = Date.now() + (options.waitMs ?? 15000);
   const background = options.background ?? Boolean(process.env.CODE_BUTLER_WATCH_TOKEN);
+  const hold: AsyncGateHold = { lock, owner, token, background, releasedMs: 0 };
   const waitStarted=performance.now();
   try {
-    while (true) {
-      if (background && activeForegroundIntent(root)) {
-        if (Date.now() > deadline) throw new OperationDeferredError("Background operation deferred for foreground review");
-        await delay(50);
-        continue;
-      }
-      try { linkSync(owner, lock); break; }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        try {
-          const value = JSON.parse(readFileSync(lock, "utf8")) as GateOwner;
-          if (Number.isSafeInteger(value.pid) && typeof value.token === "string" && !lockOwnerAlive(value)) {
-            // Only one contender may reap this exact dead owner's lock.
-            const reaping = `${lock}.reap-${value.token}`;
-            try {
-              linkSync(lock, reaping);
-              try { if (JSON.parse(readFileSync(lock, "utf8")).token === value.token) unlinkSync(lock); }
-              finally { unlinkSync(reaping); }
-              continue;
-            } catch (error) { if (!["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
-          }
-        } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; }
-        if (Date.now() > deadline) throw new OperationDeferredError("Cloud operation deferred: another local Butler operation is active");
-        await delay(50);
-      }
-    }
-    if (background && activeForegroundIntent(root)) {
-      try { if (JSON.parse(readFileSync(lock, "utf8")).token === token) unlinkSync(lock); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      throw new OperationDeferredError("Background operation deferred for foreground review");
-    }
+    await acquireGate(root, hold, Date.now() + (options.waitMs ?? 15000));
     const holdStarted = performance.now();
     try {
       recordRetrievalDuration("gateWait",performance.now()-waitStarted);
       if (!options.allowRemoved) assertProjectNotRemoved(root);
-      return await held.run(new Set([...(held.getStore() ?? []), root]), work);
+      return await held.run(new Set([...(held.getStore() ?? []), root]), () =>
+        asyncHolds.run(new Map([...(asyncHolds.getStore() ?? []), [root, hold]]), work));
     }
     finally {
-      try { if (JSON.parse(readFileSync(lock, "utf8")).token === token) unlinkSync(lock); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      try { if (existsSync(dir)) atomicJson(join(dir, "gate-timing.json"), {
-        recordedAt: new Date().toISOString(), operation: options.name ?? "Other local operation",
-        waitMs: Math.round(holdStarted - waitStarted), holdMs: Math.round(performance.now() - holdStarted)
-      }); } catch { /* Diagnostic writes must not mask an operation. */ }
+      releaseGate(hold);
+      recordGateTiming(dir, options.name ?? "Other local operation", Math.round(holdStarted - waitStarted), Math.round(performance.now() - holdStarted - hold.releasedMs));
     }
   } finally {
     try { unlinkSync(owner); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   }
+}
+
+/**
+ * Lets an async gate holder give the project up while `work` waits on a model or the network, then
+ * takes it back. The caller's open database handle stays registered, so a cloud restore still defers;
+ * ordinary writers may run meanwhile, so data read after this returns can be newer than before it.
+ */
+export async function releaseProjectGateDuring<T>(root: string, work: () => Promise<T>, options: { waitMs?: number } = {}): Promise<T> {
+  root = canonicalRoot(root);
+  const hold = asyncHolds.getStore()?.get(root);
+  // Synchronous watcher steps and callers outside the gate have nothing to give up.
+  if (!hold || !held.getStore()?.has(root)) return work();
+  releaseGate(hold);
+  const released = performance.now();
+  try {
+    return await held.run(new Set([...(held.getStore() ?? [])].filter(item => item !== root)), () =>
+      asyncHolds.run(new Map([...(asyncHolds.getStore() ?? [])].filter(([item]) => item !== root)), work));
+  } finally {
+    // Another operation may hold the project now; wait for it rather than failing the caller's work.
+    await acquireGate(root, hold, Date.now() + (options.waitMs ?? 120_000));
+    hold.releasedMs += performance.now() - released;
+  }
+}
+
+async function acquireGate(root: string, hold: AsyncGateHold, deadline: number): Promise<void> {
+  const { lock, owner } = hold;
+  while (true) {
+    if (hold.background && activeForegroundIntent(root)) {
+      if (Date.now() > deadline) throw new OperationDeferredError("Background operation deferred for foreground review");
+      await delay(50);
+      continue;
+    }
+    try { linkSync(owner, lock); break; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      try {
+        const value = JSON.parse(readFileSync(lock, "utf8")) as GateOwner;
+        if (Number.isSafeInteger(value.pid) && typeof value.token === "string" && !lockOwnerAlive(value)) {
+          // Only one contender may reap this exact dead owner's lock.
+          const reaping = `${lock}.reap-${value.token}`;
+          try {
+            linkSync(lock, reaping);
+            try { if (JSON.parse(readFileSync(lock, "utf8")).token === value.token) unlinkSync(lock); }
+            finally { unlinkSync(reaping); }
+            continue;
+          } catch (error) { if (!["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; }
+      if (Date.now() > deadline) throw new OperationDeferredError("Cloud operation deferred: another local Butler operation is active");
+      await delay(50);
+    }
+  }
+  if (hold.background && activeForegroundIntent(root)) {
+    releaseGate(hold);
+    throw new OperationDeferredError("Background operation deferred for foreground review");
+  }
+}
+
+function releaseGate(hold: AsyncGateHold): void {
+  try { if (JSON.parse(readFileSync(hold.lock, "utf8")).token === hold.token) unlinkSync(hold.lock); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+}
+
+interface GateTiming { recordedAt: string; operation: string; waitMs: number; holdMs: number }
+const LONGEST_HOLDS_KEPT = 10;
+const LONGEST_HOLDS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+/** The latest hold plus the longest recent ones, so a slow lock holder can be found after the fact. */
+function recordGateTiming(dir: string, operation: string, waitMs: number, holdMs: number): void {
+  try {
+    if (!existsSync(dir)) return;
+    const path = join(dir, "gate-timing.json");
+    const entry: GateTiming = { recordedAt: new Date().toISOString(), operation, waitMs, holdMs };
+    let previous: GateTiming[] = [];
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8")) as { longest?: unknown };
+      if (Array.isArray(parsed.longest)) previous = parsed.longest.filter((item): item is GateTiming =>
+        typeof item?.operation === "string" && typeof item?.recordedAt === "string" && Number.isFinite(item?.holdMs) && Number.isFinite(item?.waitMs));
+    } catch { /* A missing or unreadable file starts a new list. */ }
+    const cutoff = Date.now() - LONGEST_HOLDS_WINDOW_MS;
+    const longest = [...previous.filter(item => Date.parse(item.recordedAt) >= cutoff), entry]
+      .sort((left, right) => right.holdMs - left.holdMs).slice(0, LONGEST_HOLDS_KEPT);
+    atomicJson(path, { ...entry, longest });
+  } catch { /* Diagnostic writes must not mask an operation. */ }
 }
 
 /** Short synchronous database steps used by a watcher between asynchronous model calls. */
@@ -170,9 +224,7 @@ export function withProjectGateSync<T>(root: string, work: () => T, name: string
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     }
     try { unlinkSync(owner); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    if (acquired) try { if (existsSync(dir)) atomicJson(join(dir, "gate-timing.json"), {
-      recordedAt: new Date().toISOString(), operation: name, waitMs: 0, holdMs: Math.round(performance.now() - started)
-    }); } catch { /* Diagnostic writes must not mask an operation. */ }
+    if (acquired) recordGateTiming(dir, name, 0, Math.round(performance.now() - started));
   }
 }
 // Track even local-only MCP processes so enabling sync cannot replace their open DB.

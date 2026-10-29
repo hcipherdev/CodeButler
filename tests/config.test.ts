@@ -96,7 +96,7 @@ describe("project config", () => {
       model: "nomic-embed-text",
       batchSize: 16
     });
-    expect(defaults.privacy).toEqual({ allowRemoteEmbeddings: false, redactionPatterns: [] });
+    expect(defaults.privacy).toEqual({ allowRemoteEmbeddings: false, allowRemoteModels: false, redactionPatterns: [] });
     expect(defaults.retention!.migrationBackups).toBe(2);
     expect(defaults.retention!.sources.manual.maxAgeDays).toBeNull();
     expect(defaults.retention!.artifacts.logs.maxBytes).toBe(5 * 1024 * 1024);
@@ -370,6 +370,7 @@ describe("project config", () => {
     ]);
     expect(config.privacy).toEqual({
       allowRemoteEmbeddings: true,
+      allowRemoteModels: false,
       redactionPatterns: [{ name: "tenant token", pattern: "TENANT-[0-9]+", kind: "regex" }]
     });
     expect(config.retention).toMatchObject({
@@ -396,7 +397,7 @@ describe("project config", () => {
       model: "nomic-embed-text",
       batchSize: 16
     });
-    expect(config.privacy).toEqual({ allowRemoteEmbeddings: false, redactionPatterns: [] });
+    expect(config.privacy).toEqual({ allowRemoteEmbeddings: false, allowRemoteModels: false, redactionPatterns: [] });
     expect(config.retention!.migrationBackups).toBe(2);
   });
 

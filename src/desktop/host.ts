@@ -18,7 +18,7 @@ async function main(): Promise<void> {
     const input = await readBoundedInput();
     const request=JSON.parse(input) as {root?:string;action?:string};
     const result = await handleDesktopRequest(request);
-    if(retrievalEnabled() && request.root && /^(memory\.review\.|memory\.ai\.(apply|revert)|memory\.working\.(keep|candidate)|memory\.promote-project|memory\.topic\.(save|membership)|project\.summary\.)/.test(request.action ?? "")) await requestRetrievalRefresh(request.root,true);
+    if(retrievalEnabled() && request.root && /^(memory\.review\.|memory\.ai\.(apply|revert)|memory\.working\.(keep|candidate)|memory\.promote-project|memory\.topic\.(save|membership)|project\.summary\.|project\.sources\.check$)/.test(request.action ?? "")) await requestRetrievalRefresh(request.root,true);
     stdout.write(`${JSON.stringify(desktopSuccess(result))}\n`);
   } catch (error) {
     const diagnosticId = error instanceof DesktopServiceError || error instanceof SyntaxError || error instanceof CheckoutRepairRequiredError || error instanceof LinkReviewRequiredError

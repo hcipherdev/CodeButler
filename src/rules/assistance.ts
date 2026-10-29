@@ -15,7 +15,7 @@ export interface RuleAssistanceDependencies { ruleDraftProvider?: () => MemoryRe
 export function ruleAssistanceStatus() {
   try {
     const config = loadGlobalReviewerConfig();
-    try { assertReconciliationProviderConfigured(config); return { available: true, provider: config.provider, model: config.model }; }
+    try { assertReconciliationProviderConfigured(config); return { available: true, provider: config.provider, model: config.model, ...(config.connectionLabel ? { connectionLabel: config.connectionLabel } : {}) }; }
     catch (error) { return { available: false, provider: config.provider, model: config.model, reason: error instanceof Error ? error.message : "Configure the global reviewer first" }; }
   } catch { return { available: false, reason: "Check the global reviewer configuration in Code Butler's global config.json and .env files." }; }
 }
@@ -31,7 +31,7 @@ Markers are optional project-relative file paths, matching ANY listed file. They
 export async function draftGlobalRule(description: string, dependencies: RuleAssistanceDependencies = {}) {
   const source = descriptionSchema.parse(description);
   if (redactSensitiveText(source).redactions.length) throw new Error("Description contains a recognized secret. Describe its location instead.");
-  const provider = dependencies.ruleDraftProvider?.() ?? createMemoryReconciliationProvider(loadGlobalReviewerConfig());
+  const provider = dependencies.ruleDraftProvider?.() ?? createMemoryReconciliationProvider(loadGlobalReviewerConfig(), { job: "rules" });
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 60_000);
   let response: Awaited<ReturnType<MemoryReconciliationProvider["request"]>>;

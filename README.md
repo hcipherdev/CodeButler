@@ -17,9 +17,13 @@ Ask questions like:
 
 In short: Git tells an agent what changed; Code Butler helps it recover why it
 changed, what was decided, and which constraints still apply. Project memory
-stays local by default in each repository's `.code-butler/` directory, and
-optional [end-to-end encrypted cloud sync](#encrypted-cloud-sync-optional) with
-quantum-resistant key exchange carries it between your computers.
+stays local in each repository's `.code-butler/` directory. An experimental,
+invite-only [encrypted cloud sync](#encrypted-cloud-sync-experimental) can carry
+it between your computers.
+
+> **Requires Node.js 24 or newer and Git** on macOS, Windows, or Linux. Install
+> from source for now (see [Quick Start](#quick-start)); the npm package is
+> still the retired 1.x release.
 
 ## Why Use It
 
@@ -37,9 +41,8 @@ Use it to:
 - Keep a generated project narrative summary available for future agents.
 - Search temporary working context separately from durable project memory.
 - Audit memory quality and diagnose setup issues with `code-butler doctor`.
-- Sync memory across your computers with end-to-end encryption and hybrid
-  post-quantum key exchange (X25519 + ML-KEM-768). The server never sees your
-  memories.
+- Optionally, sync memory across your computers with experimental end-to-end
+  encrypted cloud sync (invite-only, not yet independently audited).
 
 ## What It Looks Like
 
@@ -92,25 +95,25 @@ Memory can come from:
 - Claude logs from `~/.claude/projects`.
 - Manual conversation imports.
 - Manual decision records.
-- Optional LLM extraction when a provider API key is configured.
+- Optional LLM extraction, off until you choose a provider or opt in.
 - Deterministic directives such as `remember this decision: ...` or
   `remember this constraint: ...`, which work without an LLM.
 
 ## Requirements
 
 - macOS, Windows, or Linux
-- Node.js 24 or newer. Code Butler uses Node's built-in SQLite support.
+- Node.js 24 or newer. Code Butler uses Node's built-in SQLite support, so
+  older Node versions cannot run it. Some earlier Node 24 releases print a
+  harmless SQLite `ExperimentalWarning`; updating Node removes it.
 - Git
 - For encrypted cloud sync only: macOS or Windows, and a Rust toolchain to build
   the native crypto helper (see Quick Start)
 
 ## Quick Start
 
-> **Version note:** this repository is Code Butler 2.0. The npm registry still
-> serves the earlier 1.x release, whose cloud sync has been retired. Until 2.0
-> is published to npm, build from source to get the current version. The
-> `npx -y code-butler` and `npm install -g code-butler` examples below install
-> 1.x; with a source build, use the `code-butler` command instead.
+> **Install from source.** This repository is Code Butler 2.0. The npm registry
+> still has the retired 1.x release, so do not use `npx code-butler` or
+> `npm install -g code-butler` until 2.0 is published there.
 
 Install from source on macOS, Windows, or Linux. Local project memory works on
 all three. Encrypted cloud sync needs the native crypto helper, which builds on
@@ -285,19 +288,11 @@ code-butler doctor
 
 ## MCP Setup
 
-The `npx -y code-butler` examples in this section run the 1.x release from npm.
-If you installed 2.0 from source (see Quick Start), use the `code-butler`
-command variants instead.
+These examples use the `code-butler` command installed in Quick Start.
 
 MCP is how Codex, Claude Code, VS Code, and other agents call Code Butler's
 memory tools. The safest setup is to point the client at one project
 explicitly:
-
-```bash
-npx -y code-butler mcp --project-root /absolute/path/to/project
-```
-
-If you installed the CLI globally, use:
 
 ```bash
 code-butler mcp --project-root /absolute/path/to/project
@@ -313,20 +308,6 @@ for that explicit setup.
 ### Add to Codex
 
 Edit `~/.codex/config.toml` and add a server entry:
-
-```toml
-[mcp_servers.code-butler]
-command = "npx"
-args = [
-  "-y",
-  "code-butler",
-  "mcp",
-  "--project-root",
-  "/absolute/path/to/project"
-]
-```
-
-If you installed Code Butler globally, use:
 
 ```toml
 [mcp_servers.code-butler]
@@ -365,20 +346,13 @@ Add Code Butler as a user-scoped Claude Code MCP server:
 
 ```bash
 claude mcp add --scope user code-butler -- \
-  npx -y code-butler mcp --project-root /absolute/path/to/project
+  code-butler mcp --project-root /absolute/path/to/project
 ```
 
 If your Claude Code version uses the short scope flag:
 
 ```bash
 claude mcp add -s user code-butler -- \
-  npx -y code-butler mcp --project-root /absolute/path/to/project
-```
-
-With a global Code Butler install, replace the command after `--`:
-
-```bash
-claude mcp add --scope user code-butler -- \
   code-butler mcp --project-root /absolute/path/to/project
 ```
 
@@ -403,14 +377,8 @@ above is enough. To use Code Butler from VS Code, create or edit
   "servers": {
     "code-butler": {
       "type": "stdio",
-      "command": "npx",
-      "args": [
-        "-y",
-        "code-butler",
-        "mcp",
-        "--project-root",
-        "/absolute/path/to/project"
-      ]
+      "command": "code-butler",
+      "args": ["mcp", "--project-root", "/absolute/path/to/project"]
     }
   }
 }
@@ -420,8 +388,8 @@ Reload VS Code, or run **MCP: Restart Server** from the command palette.
 
 ### Source Builds and Older Configs
 
-If you built Code Butler from source, point clients at the built CLI instead of
-the npm package:
+If you built Code Butler from source without installing the package globally,
+point clients at the built CLI instead:
 
 ```bash
 node /absolute/path/to/code-butler/dist/cli.js mcp --project-root /absolute/path/to/project
@@ -460,6 +428,9 @@ Once connected, agents can call tools such as:
 - `explain_code_change`
 - `investigate_project_history`
 - `summarize_recent_activity`
+
+All 34 tools and their inputs are listed in
+[MCP setup](docs/mcp-setup.md#mcp-tools).
 
 ## Build From Source
 
@@ -604,34 +575,41 @@ For durable instructions, keep `AGENTS.md` and `CLAUDE.md` short. They should
 tell agents how to consult Code Butler, not try to store the project's memory
 themselves.
 
-## Encrypted Cloud Sync (Optional)
+## Encrypted Cloud Sync (Experimental)
+
+> **Experimental and invite-only.** Public registration is closed. The
+> cryptography and protocol have not been independently audited, and release
+> qualification (clean-device recovery, lost-device revocation, cross-platform
+> pairing, backup restore) is still in progress. Local memory is the supported
+> product; do not rely on cloud sync as your only copy.
 
 Cloud sync is an opt-in way to carry a project's Code Butler memory between
 your computers. It does not run your agent or MCP tools in the cloud, and local
 MCP and offline use keep working when cloud sync is unavailable.
 
-Your memory is end-to-end encrypted on your own computer before it ever leaves
-it. The server only stores ciphertext and a signed device registry, so it
-cannot read your project memory, and neither can anyone who breaches it.
+Memory content is encrypted on your own computer before upload. The server
+stores ciphertext and a signed device registry; it still sees metadata such as
+opaque identifiers, object sizes, timing, and device labels. The design goal is
+that neither the operator nor someone who breaches the server can read memory
+content; that goal has not yet been verified by an outside review.
 
-**Quantum-resistant by design.** The keys that unlock your projects travel
-between your computers using hybrid post-quantum key exchange: classic X25519
-combined with ML-KEM-768, the NIST-standardized post-quantum algorithm. Traffic
-recorded today stays protected against tomorrow's quantum computers, and the
-data itself is sealed with 256-bit ChaCha20-Poly1305. Device signatures use
-Ed25519.
+Project keys travel between your computers with hybrid X25519 + ML-KEM-768 key
+delivery, and data is sealed with ChaCha20-Poly1305. Device signatures and
+authentication use classical Ed25519, so the system as a whole is not
+post-quantum secure.
 
 A native helper (`butler-crypto`, built from `native/` in this repository)
 keeps private keys out of JavaScript and stores them in Windows DPAPI or the
-macOS Keychain. Everything is open source, so you can audit it yourself. Cloud
-sync currently runs on macOS and Windows. See the
-[encrypted sync protocol](docs/encrypted-sync-protocol.md) for exactly what the
-server can and cannot observe.
+macOS Keychain. Cloud sync currently runs on macOS and Windows. The
+[encrypted sync protocol](docs/encrypted-sync-protocol.md) lists what the
+server can and cannot observe and the known limitations; security reports are
+welcome through [SECURITY.md](SECURITY.md).
 
 Cloud sync needs a source build that includes the native helper
 (`npm run package:crypto`, see Quick Start). A desktop app for managing
-accounts, passkeys, and new computers is not publicly released yet. From the
-CLI, on your first computer:
+accounts, passkeys, and new computers is not publicly released yet. While cloud
+sync is experimental, registration on the hosted service is closed; open an
+issue if you want to take part in testing. From the CLI, on your first computer:
 
 ```bash
 code-butler cloud register --server https://cloud.codebutler.dev --email you@example.com
@@ -724,8 +702,14 @@ Keep real local state private:
   backups, or imported conversation logs.
 - Use generated example config files as references only.
 
-LLM extraction is optional. Raw sync, deterministic directives, manual
-decisions, and MCP search still work without a provider API key.
+LLM extraction is optional and opt-in. Code Butler sends redacted transcripts
+and diffs only to a provider you chose: a connection saved in the desktop app,
+a provider block in a config file, or a local model server. A key that merely
+sits in your shell environment, such as an exported `OPENAI_API_KEY`, does not
+switch it on. To use the built-in default model, run
+`code-butler config remote-models on` (or `code-butler init --allow-remote-models`).
+Raw sync, deterministic directives, manual decisions, and MCP search work
+without any model. See [privacy](docs/privacy.md#remote-ai-models).
 
 ## Testing
 

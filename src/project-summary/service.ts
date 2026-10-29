@@ -3,7 +3,9 @@ import { GLOBAL_RULES_INSTRUCTIONS, LEGACY_GLOBAL_RULES_INSTRUCTIONS } from "../
 import { atomicWrite } from "../cloud/state.js";
 import type { ProjectSetupStatus } from "../project-setup.js";
 import { runArtifactMaintenance } from "../maintenance/artifacts.js";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { gitExecutable } from "../git-executable.js";
 import {
   chmodSync,
   closeSync,
@@ -40,6 +42,8 @@ import type { CommitRecord, MemorySearchResult, ProjectConfig } from "../types.j
 const SUMMARY_VERSION = 1;
 const SUMMARY_FORMAT = 2;
 const DAILY_REFRESH_MS = 24 * 60 * 60 * 1000;
+/** Memory-only changes keep the prose until it is this old; then the next refresh rewrites it. */
+const MEMORY_ONLY_PROSE_MAX_AGE_MS = 7 * DAILY_REFRESH_MS;
 const MAX_INVENTORY_ENTRIES = 200;
 const MAX_MANIFEST_FILES = 100;
 const MAX_MANIFEST_CONTENT_CHARS = 120_000;
@@ -113,6 +117,36 @@ export interface ProjectSummaryMeta {
   lastGeneratedAt?: string;
   lastCheckedAt?: string;
   provider?: string;
+  /** Set when the current file was adopted rather than generated: who authored it and when. */
+  contentSource?: "git" | "edited";
+  contentUpdatedAt?: string;
+  contentCommit?: string;
+  /** What a generated narrative was built from, so later checks can say what changed since. */
+  inputDigest?: ProjectSummaryInputDigest;
+  /** The newest commit a generated narrative was built from; decides which of two devices' narratives is current. */
+  basis?: ProjectSummaryBasis;
+  /** When the memory sections were last re-rendered around unchanged prose; `lastGeneratedAt` still dates the prose. */
+  memorySectionsUpdatedAt?: string;
+}
+
+export interface ProjectSummaryBasis {
+  commit: string;
+  committedAt: string;
+}
+
+export interface ProjectSummaryInputDigest {
+  commits: string[];
+  /** Short hash per narrative memory, over the same fields the fingerprint uses. */
+  memories: Record<string, string>;
+  files: string;
+}
+
+/** Counted against the inputs the narrative was written from; `memories` and `files` are unknown without a digest. */
+export interface ProjectSummaryChanges {
+  commits: number;
+  commitsCapped: boolean;
+  memories?: number;
+  files?: boolean;
 }
 
 export interface ProjectBrief {
@@ -136,6 +170,14 @@ export interface ProjectSummaryStatus {
   lastGeneratedAt?: string;
   lastCheckedAt?: string;
   provider?: string;
+  contentSource?: "git" | "edited";
+  contentUpdatedAt?: string;
+  contentCommit?: string;
+  /** When the text in the file was written: the adopted commit or edit, otherwise the generation. */
+  writtenAt?: string;
+  changesSince?: ProjectSummaryChanges;
+  /** Stale and not rewritten for a day, which the daily refresh would normally have done. */
+  refreshRecommended: boolean;
 }
 
 export interface ProjectSummaryRefreshResult {
@@ -147,6 +189,8 @@ export interface ProjectSummaryRefreshResult {
   skippedReason?: string;
   manualEditsDetected?: boolean;
   backupPath?: string;
+  /** Only memories changed, so the memory sections were re-rendered and the prose kept. */
+  memorySectionsOnly?: boolean;
 }
 
 export interface ProjectSummaryInstallResult extends ProjectSummaryRefreshResult {
@@ -165,6 +209,8 @@ export interface ProjectSummaryOperationOptions {
   summaryBeforeCommit?: (destinationPath: string) => void;
   /** Repair missing bootstrap files without replacing later user edits. */
   preserveExistingAgentFiles?: boolean;
+  /** Wraps the model call, e.g. so the MCP server can release the project lock while it waits. */
+  aroundModelCall?: <T>(call: () => Promise<T>) => Promise<T>;
 }
 
 interface ProjectSummaryInputOptions {
@@ -199,22 +245,24 @@ export function getProjectSummaryStatus(
   const paths = projectSummaryPaths(rootDir);
   const meta = readProjectSummaryMeta(rootDir);
   const now = (options.now ?? (() => new Date()))();
-  let currentFingerprint: string | undefined;
+  let currentInput: ProjectSummaryGeneratorInput | undefined;
   if (options.store && options.config) {
-    currentFingerprint = collectProjectSummaryInputInternal(options.store, options.config, {
+    currentInput = collectProjectSummaryInputInternal(options.store, options.config, {
       ...(options.projectState ? { projectState: options.projectState } : {})
-    }).fingerprint;
+    });
   }
+  const currentFingerprint = currentInput?.fingerprint;
   const stale =
     !existsSync(paths.summaryPath) ||
     meta === undefined || meta.format !== SUMMARY_FORMAT ||
     (currentFingerprint !== undefined && meta.fingerprint !== currentFingerprint);
   const outputHash = existsSync(paths.summaryPath) ? hashFile(paths.summaryPath) : undefined;
   const outputBaselineMissing = existsSync(paths.summaryPath) && meta?.outputContentHash === undefined;
+  // Adopted uncommitted edits stay protected; content adopted from a git commit may be replaced.
   const manualEditsDetected =
     outputHash !== undefined &&
     meta?.outputContentHash !== undefined &&
-    outputHash !== meta.outputContentHash;
+    (outputHash !== meta.outputContentHash || meta.contentSource === "edited");
   const status: ProjectSummaryStatus = {
     exists: existsSync(paths.summaryPath),
     summaryPath: paths.summaryPath,
@@ -222,14 +270,43 @@ export function getProjectSummaryStatus(
     due: isSummaryRefreshDue(meta, now),
     stale,
     manualEditsDetected,
-    outputBaselineMissing
+    outputBaselineMissing,
+    refreshRecommended: false
   };
   if (meta?.fingerprint !== undefined) status.fingerprint = meta.fingerprint;
   if (currentFingerprint !== undefined) status.currentFingerprint = currentFingerprint;
   if (meta?.lastGeneratedAt !== undefined) status.lastGeneratedAt = meta.lastGeneratedAt;
   if (meta?.lastCheckedAt !== undefined) status.lastCheckedAt = meta.lastCheckedAt;
   if (meta?.provider !== undefined) status.provider = meta.provider;
+  if (meta?.contentSource !== undefined && outputHash === meta.outputContentHash) {
+    status.contentSource = meta.contentSource;
+    if (meta.contentUpdatedAt !== undefined) status.contentUpdatedAt = meta.contentUpdatedAt;
+    if (meta.contentCommit !== undefined) status.contentCommit = meta.contentCommit;
+  }
+  const writtenAt = status.contentUpdatedAt ?? meta?.lastGeneratedAt;
+  if (writtenAt !== undefined) status.writtenAt = writtenAt;
+  // The digest describes generated content only; adopted or edited text is dated, not diffed.
+  if (currentInput) status.changesSince = summaryChangesSince(currentInput, status.contentSource ? undefined : meta?.inputDigest, writtenAt);
+  const writtenMs = Date.parse(writtenAt ?? "");
+  status.refreshRecommended = status.exists && stale && (!Number.isFinite(writtenMs) || now.getTime() - writtenMs >= DAILY_REFRESH_MS);
   return status;
+}
+
+/** Commits, narrative memories and project files that differ from what the narrative was written from. */
+function summaryChangesSince(input: ProjectSummaryGeneratorInput, digest: ProjectSummaryInputDigest | undefined, writtenAt: string | undefined): ProjectSummaryChanges {
+  const commits = input.codeContext.commits;
+  const capped = (count: number) => ({ commits: count, commitsCapped: count >= commits.length && commits.length >= SUMMARY_INPUT_COMMITS });
+  if (!digest) {
+    const since = Date.parse(writtenAt ?? "");
+    return capped(Number.isFinite(since) ? commits.filter(commit => Date.parse(commit.authoredAt) > since).length : 0);
+  }
+  const known = new Set(digest.commits), current = summaryInputDigest(input);
+  const ids = new Set([...Object.keys(digest.memories), ...Object.keys(current.memories)]);
+  return {
+    ...capped(commits.filter(commit => !known.has(commit.hash)).length),
+    memories: [...ids].filter(id => digest.memories[id] !== current.memories[id]).length,
+    files: digest.files !== current.files
+  };
 }
 
 export async function installProjectSummary(
@@ -343,46 +420,40 @@ async function refreshProjectSummaryInternal(
   const input = collectProjectSummaryInputInternal(store, config, inputOptions);
   const existing = readProjectBrief(rootDir);
   const existingOutputHash = existing.exists ? hashFile(paths.summaryPath) : undefined;
-  const manualEditsDetected =
+  const contentChanged =
     Boolean(existing.summary.trim()) &&
     existingOutputHash !== undefined &&
     existing.meta?.outputContentHash !== undefined &&
     existingOutputHash !== existing.meta.outputContentHash;
-  const outputBaselineMissing = Boolean(existing.summary.trim()) && existing.meta?.outputContentHash === undefined;
+  const hasContent = Boolean(existing.summary.trim());
+  const outputBaselineMissing = hasContent && existing.meta?.outputContentHash === undefined;
+  // The file on disk wins: record unrecognized content as the new baseline before deciding whether it may be replaced.
+  const unrecorded = contentChanged || (outputBaselineMissing && existing.meta?.fingerprint !== input.fingerprint);
+  const baseline = !options.force && unrecorded ? adoptExistingSummary(rootDir, existing.meta, existingOutputHash!, now) : existing.meta;
+  // Only uncommitted edits are protected; a committed summary stays recoverable from git, so it is replaced with a backup.
+  const replacingCommitted = hasContent && baseline?.contentSource === "git";
 
-  if (!options.force && manualEditsDetected) {
+  if (!options.force && hasContent && baseline?.contentSource === "edited") {
     return {
       checked: true,
       generated: false,
       summaryPath: paths.summaryPath,
       fingerprint: input.fingerprint,
-      ...(existing.meta ? { meta: existing.meta } : {}),
-      skippedReason: "manual_edits_detected",
-      manualEditsDetected: true
-    };
-  }
-
-  if (
-    !options.force &&
-    outputBaselineMissing &&
-    existing.meta?.fingerprint !== input.fingerprint
-  ) {
-    return {
-      checked: true,
-      generated: false,
-      summaryPath: paths.summaryPath,
-      fingerprint: input.fingerprint,
-      ...(existing.meta ? { meta: existing.meta } : {}),
-      skippedReason: "output_baseline_missing"
+      ...(baseline ? { meta: baseline } : {}),
+      ...(outputBaselineMissing
+        ? { skippedReason: "output_baseline_missing" }
+        : { skippedReason: "manual_edits_detected", manualEditsDetected: true })
     };
   }
 
   if (!options.force && existing.summary.trim() && existing.meta?.fingerprint === input.fingerprint && existing.meta.format === SUMMARY_FORMAT) {
+    // Unchanged inputs are exactly what the narrative was built from, so an older meta gains its digest here.
     const meta = normalizeMeta({
       ...existing.meta,
       summaryPath: paths.summaryPath,
       ...(existingOutputHash ? { outputContentHash: existingOutputHash } : {}),
-      lastCheckedAt: now.toISOString()
+      lastCheckedAt: now.toISOString(),
+      ...(existing.meta.contentSource === undefined ? { inputDigest: summaryInputDigest(input), ...summaryBasis(input) } : {})
     });
     writeProjectSummaryMeta(rootDir, meta);
     return {
@@ -394,13 +465,72 @@ async function refreshProjectSummaryInternal(
     };
   }
 
+  // A concurrent edit wins over either write; the caller reports it as a manual edit.
+  const commitOutputs = (content: string, meta: ProjectSummaryMeta, expected: ExpectedProjectSummaryOutput): boolean => {
+    try {
+      writeProjectSummaryOutputsAtomically(
+        rootDir,
+        [
+          { path: paths.summaryPath, content },
+          { path: paths.metaPath, content: serializeProjectSummaryMeta(meta) }
+        ],
+        options,
+        expected
+      );
+      return true;
+    } catch (error) {
+      if (!(error instanceof ConcurrentProjectSummaryEditError)) throw error;
+      return false;
+    }
+  };
+  const editedDuringRefresh = (backupPath?: string): ProjectSummaryRefreshResult => ({
+    checked: true,
+    generated: false,
+    summaryPath: paths.summaryPath,
+    fingerprint: input.fingerprint,
+    ...(existing.meta ? { meta: existing.meta } : {}),
+    skippedReason: "manual_edits_detected",
+    manualEditsDetected: true,
+    ...(backupPath ? { backupPath } : {})
+  });
+
+  // Memories alone moved: re-render the sections built from them and keep the prose, unless it is a week old.
+  const digest = summaryInputDigest(input);
+  const proseWrittenMs = Date.parse(existing.meta?.lastGeneratedAt ?? "");
+  if (!options.force && hasContent && existingOutputHash !== undefined && existing.meta !== undefined &&
+    baseline === existing.meta && existing.meta.contentSource === undefined && existing.meta.format === SUMMARY_FORMAT &&
+    isMemoryOnlyChange(existing.meta.inputDigest, digest) &&
+    Number.isFinite(proseWrittenMs) && now.getTime() - proseWrittenMs < MEMORY_ONLY_PROSE_MAX_AGE_MS) {
+    const content = `${store.contentPolicy.text(assembleHumanSummary(input.codeContext.memories, existing.summary)).trim()}\n`;
+    const meta = normalizeMeta({
+      ...existing.meta,
+      summaryPath: paths.summaryPath,
+      fingerprint: input.fingerprint,
+      outputContentHash: hashBytes(Buffer.from(content)),
+      lastCheckedAt: now.toISOString(),
+      inputDigest: digest,
+      memorySectionsUpdatedAt: now.toISOString()
+    });
+    if (!commitOutputs(content, meta, { exists: true, contentHash: existingOutputHash })) return editedDuringRefresh();
+    return {
+      checked: true,
+      generated: true,
+      memorySectionsOnly: true,
+      summaryPath: paths.summaryPath,
+      fingerprint: input.fingerprint,
+      meta
+    };
+  }
+
   let backupPath: string | undefined;
-  if (options.force && existing.exists && (manualEditsDetected || outputBaselineMissing)) {
+  if (existing.exists && (replacingCommitted ||
+    (options.force && (contentChanged || outputBaselineMissing || existing.meta?.contentSource !== undefined)))) {
     backupPath = backupProjectSummary(paths.summaryPath, paths.dataDir, now);
   }
 
   const generator = options.generator ?? createConfiguredProjectSummaryGenerator(config);
-  const generated = (await generator.generate(input)).trim();
+  const generate = () => generator.generate(input);
+  const generated = (await (options.aroundModelCall ? options.aroundModelCall(generate) : generate())).trim();
   const summary = generated ? store.contentPolicy.text(assembleHumanSummary(input.codeContext.memories, generated)).trim() : "";
   if (!summary) {
     throw new Error("Project summary generator returned empty content");
@@ -429,43 +559,25 @@ async function refreshProjectSummaryInternal(
   }
 
   const summaryContent = `${summary}\n`;
+  // Stamp the write, not the start of the refresh: generation can take minutes.
+  const generatedAt = nowDate(options).toISOString();
   const metaInput: ProjectSummaryMeta = {
     version: SUMMARY_VERSION,
     format: SUMMARY_FORMAT,
     summaryPath: paths.summaryPath,
     fingerprint: input.fingerprint,
     outputContentHash: hashBytes(Buffer.from(summaryContent)),
-    lastGeneratedAt: now.toISOString(),
-    lastCheckedAt: now.toISOString()
+    lastGeneratedAt: generatedAt,
+    lastCheckedAt: generatedAt,
+    inputDigest: digest,
+    ...summaryBasis(input)
   };
   if (generator.name !== undefined) metaInput.provider = generator.name;
   const meta = normalizeMeta(metaInput);
-  try {
-    writeProjectSummaryOutputsAtomically(
-      rootDir,
-      [
-        { path: paths.summaryPath, content: `${summary}\n` },
-        { path: paths.metaPath, content: serializeProjectSummaryMeta(meta) }
-      ],
-      options,
-      {
-        exists: outputExistsBeforeCommit,
-        ...(outputHashBeforeCommit ? { contentHash: outputHashBeforeCommit } : {})
-      }
-    );
-  } catch (error) {
-    if (!(error instanceof ConcurrentProjectSummaryEditError)) throw error;
-    return {
-      checked: true,
-      generated: false,
-      summaryPath: paths.summaryPath,
-      fingerprint: input.fingerprint,
-      ...(existing.meta ? { meta: existing.meta } : {}),
-      skippedReason: "manual_edits_detected",
-      manualEditsDetected: true,
-      ...(backupPath ? { backupPath } : {})
-    };
-  }
+  if (!commitOutputs(summaryContent, meta, {
+    exists: outputExistsBeforeCommit,
+    ...(outputHashBeforeCommit ? { contentHash: outputHashBeforeCommit } : {})
+  })) return editedDuringRefresh(backupPath);
   try {
     runArtifactMaintenance(rootDir, config.retention!.artifacts, { apply: true, now });
   } catch {
@@ -503,6 +615,20 @@ export async function refreshProjectSummaryIfDue(
   return refreshProjectSummary(store, config, options);
 }
 
+const SUMMARY_OUTPUT_PATHS = new Set([".code-butler/project-summary.md", ".code-butler/project-summary.meta.json"]);
+
+/**
+ * The recent commits a summary is built from. Commits that only record the summary itself are left out:
+ * they say nothing about the project, and counting them would make every committed summary stale.
+ */
+const SUMMARY_INPUT_COMMITS = 20;
+export function findSummaryInputCommits(store: Pick<MemoryStore, "findCommits">, limit = SUMMARY_INPUT_COMMITS): CommitRecord[] {
+  return store.findCommits({ limit: limit * 5 })
+    .filter(commit => !(commit.changedFiles.length > 0 &&
+      commit.changedFiles.every(path => SUMMARY_OUTPUT_PATHS.has(path.replaceAll("\\", "/").replace(/^\.\//, "")))))
+    .slice(0, limit);
+}
+
 export function collectProjectSummaryInput(
   store: MemoryStore,
   config: ProjectConfig
@@ -523,7 +649,7 @@ function collectProjectSummaryInputInternal(
   // File selection can use other current memories without publishing their claims
   // in the project-wide decision and constraint sections.
   const codeMemories = store.listMemories({ lifecycleStatus: "current", layer: "all", owner: "self", qualityStatus: "all", limit: null });
-  const commits = store.findCommits({ limit: 20 });
+  const commits = findSummaryInputCommits(store);
   const agentHints = options.omitAgentHints ? [] : readAgentHints(rootDir, trackedPaths);
   const notes = readProjectSummaryNotes(rootDir);
   const codeContext: ProjectSummaryCodeContext = {
@@ -603,6 +729,119 @@ function readProjectSummaryMeta(rootDir: string): ProjectSummaryMeta | undefined
   }
 }
 
+/**
+ * Whether another device's narrative should replace this one, and the metadata to store with it. The one built
+ * from later commits wins; the write time only settles narratives built from the same commit, or one without a
+ * recorded basis. Text edited here by hand, or a pair whose text does not match its own record, never wins.
+ */
+export function preferIncomingNarrative(
+  rootDir: string,
+  incoming: { summary?: Buffer | undefined; meta?: Buffer | undefined }
+): { take: false } | { take: true; meta: ProjectSummaryMeta } {
+  if (!incoming.summary || !incoming.meta) return { take: false };
+  let theirs: ProjectSummaryMeta;
+  try { theirs = normalizeMeta(JSON.parse(incoming.meta.toString("utf8")) as Partial<ProjectSummaryMeta>); } catch { return { take: false }; }
+  // A pair whose text does not match its own record was edited without one, so its date says nothing.
+  if (theirs.outputContentHash !== hashBytes(incoming.summary)) return { take: false };
+  const paths = projectSummaryPaths(rootDir);
+  const take = { take: true as const, meta: normalizeMeta({ ...theirs, summaryPath: paths.summaryPath }) };
+  const writtenAt = (meta: ProjectSummaryMeta) => Date.parse(meta.contentUpdatedAt ?? meta.lastGeneratedAt ?? "");
+  const theirTime = writtenAt(theirs);
+  if (!existsSync(paths.summaryPath)) return Number.isFinite(theirTime) ? take : { take: false };
+  const ours = readProjectSummaryMeta(rootDir);
+  if (ours?.contentSource === "edited" || hashFile(paths.summaryPath) !== ours?.outputContentHash) return { take: false };
+  const order = basisOrder(rootDir, ours.basis, theirs.basis);
+  if (order !== 0) return order > 0 ? take : { take: false };
+  const ourTime = writtenAt(ours);
+  if (!Number.isFinite(theirTime) || theirTime <= (Number.isFinite(ourTime) ? ourTime : Number.NEGATIVE_INFINITY)) return { take: false };
+  return take;
+}
+
+/** Positive when `theirs` was built from later commits, negative when `ours` was, 0 when unknown or the same. */
+function basisOrder(rootDir: string, ours: ProjectSummaryBasis | undefined, theirs: ProjectSummaryBasis | undefined): number {
+  if (!ours || !theirs || ours.commit === theirs.commit) return 0;
+  if (isAncestorCommit(rootDir, ours.commit, theirs.commit)) return 1;
+  if (isAncestorCommit(rootDir, theirs.commit, ours.commit)) return -1;
+  // Diverged, or a commit this checkout has not fetched: the later commit is the better guess.
+  const difference = Date.parse(theirs.committedAt) - Date.parse(ours.committedAt);
+  return Number.isFinite(difference) ? Math.sign(difference) : 0;
+}
+
+function isAncestorCommit(rootDir: string, ancestor: string, descendant: string): boolean {
+  try {
+    execFileSync(gitExecutable(), ["-C", rootDir, "merge-base", "--is-ancestor", ancestor, descendant], {
+      stdio: "ignore", timeout: 5000, windowsHide: true
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A cloud merge republishes this device's files, so a narrative another device wrote more recently would be
+ * replaced by an older one. Takes the other side's narrative and metadata as one pair when
+ * preferIncomingNarrative() says so. Returns whether the pair was taken.
+ */
+export function adoptNewerNarrative(rootDir: string, incoming: { summary?: Buffer | undefined; meta?: Buffer | undefined }): boolean {
+  const decision = preferIncomingNarrative(rootDir, incoming);
+  if (!decision.take) return false;
+  const paths = projectSummaryPaths(rootDir);
+  const localHash = existsSync(paths.summaryPath) ? hashFile(paths.summaryPath) : undefined;
+  try {
+    writeProjectSummaryOutputsAtomically(rootDir, [
+      { path: paths.summaryPath, content: incoming.summary!.toString("utf8") },
+      { path: paths.metaPath, content: serializeProjectSummaryMeta(decision.meta) }
+    ], {}, { exists: localHash !== undefined, ...(localHash ? { contentHash: localHash } : {}) });
+    return true;
+  } catch (error) {
+    // Edited while merging: the edit wins, as it would anywhere else.
+    if (error instanceof ConcurrentProjectSummaryEditError) return false;
+    throw error;
+  }
+}
+
+/**
+ * Records a summary that Code Butler did not generate as the current baseline. The fingerprint is
+ * cleared because the content was never produced from the current inputs, so the summary stays stale.
+ */
+function adoptExistingSummary(rootDir: string, previous: ProjectSummaryMeta | undefined, contentHash: string, now: Date): ProjectSummaryMeta {
+  const paths = projectSummaryPaths(rootDir);
+  const meta = normalizeMeta({
+    ...(previous?.lastGeneratedAt !== undefined ? { lastGeneratedAt: previous.lastGeneratedAt } : {}),
+    ...(previous?.provider !== undefined ? { provider: previous.provider } : {}),
+    version: SUMMARY_VERSION,
+    format: SUMMARY_FORMAT,
+    summaryPath: paths.summaryPath,
+    fingerprint: "",
+    outputContentHash: contentHash,
+    lastCheckedAt: now.toISOString(),
+    ...summaryContentOrigin(rootDir, paths.summaryPath, now)
+  });
+  writeProjectSummaryMeta(rootDir, meta);
+  return meta;
+}
+
+/** Dates adopted content by its last commit when the file matches it, otherwise by when the edit was noticed. */
+function summaryContentOrigin(rootDir: string, summaryPath: string, now: Date): Pick<ProjectSummaryMeta, "contentSource" | "contentUpdatedAt" | "contentCommit"> {
+  const path = relative(rootDir, summaryPath).split(sep).join("/");
+  const git = (args: string[]) => execFileSync(gitExecutable(), ["-C", rootDir, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000, windowsHide: true
+  }).trim();
+  try {
+    git(["ls-files", "--error-unmatch", "--", path]);
+    git(["diff", "--quiet", "HEAD", "--", path]);
+    const [commit, committedAt] = git(["log", "-1", "--format=%h%n%cI", "--", path]).split("\n");
+    const date = committedAt ? new Date(committedAt) : undefined;
+    if (commit && date && Number.isFinite(date.getTime())) {
+      return { contentSource: "git", contentUpdatedAt: date.toISOString(), contentCommit: commit };
+    }
+  } catch {
+    // Untracked, changed since the last commit, or Git unavailable.
+  }
+  return { contentSource: "edited", contentUpdatedAt: now.toISOString() };
+}
+
 function writeProjectSummaryMeta(rootDir: string, meta: ProjectSummaryMeta): void {
   const paths = projectSummaryPaths(rootDir);
   writeProjectSummaryOutputsAtomically(rootDir, [
@@ -610,7 +849,7 @@ function writeProjectSummaryMeta(rootDir: string, meta: ProjectSummaryMeta): voi
   ]);
 }
 
-function serializeProjectSummaryMeta(meta: ProjectSummaryMeta): string {
+export function serializeProjectSummaryMeta(meta: ProjectSummaryMeta): string {
   return `${JSON.stringify(meta, null, 2)}\n`;
 }
 
@@ -789,10 +1028,24 @@ function normalizeMeta(input: Partial<ProjectSummaryMeta>): ProjectSummaryMeta {
   if (input.lastGeneratedAt !== undefined) meta.lastGeneratedAt = input.lastGeneratedAt;
   if (input.lastCheckedAt !== undefined) meta.lastCheckedAt = input.lastCheckedAt;
   if (input.provider !== undefined) meta.provider = input.provider;
+  if (input.contentSource === "git" || input.contentSource === "edited") meta.contentSource = input.contentSource;
+  if (typeof input.contentUpdatedAt === "string") meta.contentUpdatedAt = input.contentUpdatedAt;
+  if (typeof input.contentCommit === "string") meta.contentCommit = input.contentCommit;
   if (typeof input.outputContentHash === "string" && /^[a-f0-9]{64}$/.test(input.outputContentHash)) {
     meta.outputContentHash = input.outputContentHash;
   }
+  if (typeof input.memorySectionsUpdatedAt === "string") meta.memorySectionsUpdatedAt = input.memorySectionsUpdatedAt;
+  if (isInputDigest(input.inputDigest)) meta.inputDigest = input.inputDigest;
+  const basis = input.basis as Partial<ProjectSummaryBasis> | null | undefined;
+  if (basis && typeof basis.commit === "string" && typeof basis.committedAt === "string") meta.basis = { commit: basis.commit, committedAt: basis.committedAt };
   return meta;
+}
+
+function isInputDigest(value: unknown): value is ProjectSummaryInputDigest {
+  const digest = value as Partial<ProjectSummaryInputDigest> | null | undefined;
+  return !!digest && typeof digest === "object" && typeof digest.files === "string" &&
+    Array.isArray(digest.commits) && digest.commits.every(hash => typeof hash === "string") &&
+    !!digest.memories && typeof digest.memories === "object" && Object.values(digest.memories).every(hash => typeof hash === "string");
 }
 
 function isSummaryRefreshDue(meta: ProjectSummaryMeta | undefined, now: Date): boolean {
@@ -1059,7 +1312,7 @@ export function commitPreparedProjectSummary(
   const meta: ProjectSummaryMeta = {
     version: 1, format: SUMMARY_FORMAT, summaryPath: paths.summaryPath, fingerprint: input.fingerprint,
     outputContentHash: hashBytes(Buffer.from(content)), lastGeneratedAt: now,
-    lastCheckedAt: now, provider
+    lastCheckedAt: now, provider, inputDigest: summaryInputDigest(input), ...summaryBasis(input)
   };
   writeProjectSummaryOutputsAtomically(root, [
     { path: paths.summaryPath, content },
@@ -1173,6 +1426,52 @@ function discoverManifestPaths(trackedPaths: ReadonlySet<string>): string[] {
   return [...fixedPaths, ...nestedPaths.sort()];
 }
 
+/** The parts of a memory the narrative is written from; the fingerprint and the digest both use exactly these. */
+function summaryMemoryFields(memory: MemorySearchResult) {
+  return {
+    kind: memory.kind,
+    id: memory.id,
+    type: memory.type,
+    title: memory.title,
+    scope: memory.scope,
+    applicability: memory.applicability,
+    summary: memory.summary,
+    statement: memory.statement,
+    layer: memory.layer,
+    reason: memory.reason,
+    relatedFiles: memory.relatedFiles
+  };
+}
+
+function shortHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
+}
+
+/** Same commits and files, different memories: the prose was written from everything that still matches. */
+function isMemoryOnlyChange(previous: ProjectSummaryInputDigest | undefined, current: ProjectSummaryInputDigest): boolean {
+  if (!previous || previous.files !== current.files || previous.commits.length !== current.commits.length ||
+    previous.commits.some((hash, index) => hash !== current.commits[index])) return false;
+  const ids = new Set([...Object.keys(previous.memories), ...Object.keys(current.memories)]);
+  return [...ids].some(id => previous.memories[id] !== current.memories[id]);
+}
+
+export function summaryInputDigest(input: Omit<ProjectSummaryGeneratorInput, "fingerprint">): ProjectSummaryInputDigest {
+  return {
+    commits: input.codeContext.commits.map(commit => commit.hash),
+    memories: Object.fromEntries(input.codeContext.memories.map(memory => [memory.id, shortHash(summaryMemoryFields(memory))])),
+    files: shortHash({
+      agentHints: input.agentHints, notes: input.notes, manifests: input.codeContext.manifests, docs: input.codeContext.docs,
+      codeFiles: input.codeContext.codeFiles, inventory: input.codeContext.inventory
+    })
+  };
+}
+
+/** The newest commit the inputs hold; commits arrive newest first, with summary-only commits already left out. */
+function summaryBasis(input: Omit<ProjectSummaryGeneratorInput, "fingerprint">): { basis?: ProjectSummaryBasis } {
+  const newest = input.codeContext.commits[0];
+  return newest ? { basis: { commit: newest.hash, committedAt: newest.authoredAt } } : {};
+}
+
 function fingerprintProjectSummaryInputs(input: Omit<ProjectSummaryGeneratorInput, "fingerprint">): string {
   // Operational counters and temporary expiry do not change narrative content.
   return createHash("sha256")
@@ -1186,19 +1485,7 @@ function fingerprintProjectSummaryInputs(input: Omit<ProjectSummaryGeneratorInpu
         docs: input.codeContext.docs,
         codeFiles: input.codeContext.codeFiles,
         inventory: input.codeContext.inventory,
-        memories: input.codeContext.memories.map((memory) => ({
-          kind: memory.kind,
-          id: memory.id,
-          type: memory.type,
-          title: memory.title,
-          scope: memory.scope,
-          applicability: memory.applicability,
-          summary: memory.summary,
-          statement: memory.statement,
-          layer: memory.layer,
-          reason: memory.reason,
-          relatedFiles: memory.relatedFiles
-        })),
+        memories: input.codeContext.memories.map(summaryMemoryFields),
         commits: input.codeContext.commits.map((commit) => ({
           hash: commit.hash,
           authoredAt: commit.authoredAt,

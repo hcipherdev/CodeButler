@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { hasCredentials } from "./ai/credentials.js";
+import { jobModel } from "./ai/models.js";
 import { loadProjectConfig, validateProjectConfigFile } from "./config.js";
 import type { ProjectConfig } from "./types.js";
 import { projectOperation } from "./cloud/client.js";
@@ -202,10 +204,7 @@ export async function enrichLocalProjectSummary(root: string, options: Automatic
     if (last?.status === "running" && alive(last.pid)) return undefined;
     if (last?.status !== "running" && last?.lastAttemptAt && now.getTime() - Date.parse(last.lastAttemptAt) < RETRY_MS) return undefined;
     const config = setupConfig(root);
-    const provider = config.investigator.enabled ? config.investigator : config.extractor;
-    if (!options.enrichmentGenerator && (!process.env[provider.apiKeyEnv]?.trim() ||
-      (provider.provider === "anthropic-aws" && (!process.env[provider.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID"]?.trim() ||
-        !process.env[provider.regionEnv ?? "AWS_REGION"]?.trim())))) return undefined;
+    if (!options.enrichmentGenerator && !hasCredentials(jobModel(config, "summary"))) return undefined;
     const store = openConfiguredMemoryStore(root);
     try {
       store.init();

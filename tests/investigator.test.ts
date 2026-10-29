@@ -280,6 +280,30 @@ describe("native RLM investigation", () => {
     store.close();
   });
 
+  it("routes every planner and synthesis call through aroundModelCall", async () => {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    const store = seedStore(rootDir);
+    const calls: string[] = [];
+    const provider: InvestigatorProvider = {
+      async planNextAction() { calls.push("plan"); return { action: { type: "finalize_answer" }, rationale: "Enough." }; },
+      async synthesizeAnswer() { calls.push("synthesize"); return { answer: "Done.", evidenceScore: 0.8 }; }
+    };
+    const result = await investigateProjectHistory(store, { question: "Why did we change src/cache.ts?" }, {
+      config: createProjectConfig(rootDir),
+      investigatorProvider: provider,
+      aroundModelCall: async call => { calls.push("around"); return call(); }
+    });
+    expect(result.answer).toBe("Done.");
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    // Each model call is wrapped, and the wrapper runs before the call it wraps.
+    for (let index = 0; index < calls.length; index += 2) {
+      expect(calls[index]).toBe("around");
+      expect(["plan", "synthesize"]).toContain(calls[index + 1]);
+    }
+    store.close();
+  });
+
   it("retries invalid planner output and then finalizes from existing evidence", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);

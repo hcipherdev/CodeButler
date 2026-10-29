@@ -56,7 +56,7 @@ import {
   type ProjectSummaryRefreshResult
 } from "../project-summary/service.js";
 import type { MemoryStore, ProjectSummary } from "../storage/store.js";
-import { syncProjectMemory } from "../sync/service.js";
+import { importNewGitCommits, syncProjectMemory } from "../sync/service.js";
 import type {
   EvidenceRef,
   MemoryLifecycleStatus,
@@ -181,6 +181,8 @@ export interface ProjectMemoryToolHandlers {
     results: ReturnType<MemoryStore["search"]>;
   }>;
   read_memory_source(input: { sourceId: string }): ReturnType<MemoryStore["readSource"]>;
+  read_memory_chunk(input: { sourceId: string; chunkId: string }):
+    { sourceId: string; chunkId: string; text: string; metadata: SearchResult["metadata"] } | undefined;
   find_memories(input: {
     targetEnvironment?: TargetEnvironment;
     layer?: MemoryLayerFilter;
@@ -311,12 +313,15 @@ export function createProjectMemoryToolHandlers(
     clientInfo?: () => { name: string; version: string } | undefined;
     startupMetadata?: ProjectStartupMetadata | undefined;
     searchService?: SearchServiceOptions | undefined;
+    /** Wraps model calls made by investigation and summary tools; the MCP server releases the project lock here. */
+    aroundModelCall?: <T>(call: () => Promise<T>) => Promise<T>;
   } = {}
 ): ProjectMemoryToolHandlers {
   const rootDir = options.rootDir ?? store.paths.rootDir;
   assertOrdinaryProject(rootDir);
   const config = loadProjectConfig(rootDir);
   const startupMetadata = options.startupMetadata ?? { configCreated: false, databaseCreated: false };
+  const investigationOptions = { config, ...(options.aroundModelCall === undefined ? {} : { aroundModelCall: options.aroundModelCall }) };
   return {
     get_applicable_rules(input) { return getApplicableRules(rootDir, input); },
     record_rule_attestation(input) { return recordAttestation(input, { by: "agent", projectRoot: rootDir }); },
@@ -332,7 +337,8 @@ export function createProjectMemoryToolHandlers(
       };
     },
     async search_project_memory(input) {
-      const result = withApplicability(await searchProjectMemory(store, config, normalizeSearchInput(input), options.searchService), input.targetEnvironment);
+      // Agents phrase queries as loose keywords, so memory matching is by term, not exact phrase.
+      const result = withApplicability(await searchProjectMemory(store, config, { ...normalizeSearchInput(input), match: "terms" }, options.searchService), input.targetEnvironment);
       return {
         memories: result.memories,
         results: result.results.map((item) => decorateSearchResult(store, item))
@@ -341,13 +347,18 @@ export function createProjectMemoryToolHandlers(
     read_memory_source(input) {
       return store.readSource(input.sourceId);
     },
+    read_memory_chunk(input) {
+      // A single chunk lets agents expand a search excerpt without loading a whole conversation.
+      const chunk = store.readSearchResultsByChunkIds([input.chunkId]).find((item) => item.sourceId === input.sourceId);
+      return chunk ? { sourceId: chunk.sourceId, chunkId: chunk.chunkId, text: chunk.text, metadata: chunk.metadata } : undefined;
+    },
     get_memory_history(input){return memoryHistory(readMemoryKnowledge(store),input.id,input.category,input);},
     read_project_handbook(input={}){const data=readMemoryKnowledge(store),filter={...input,reach:input.reach??"project"};return input.topicId?readHandbookTopic(data,input.topicId,filter,input.offset,input.limit):readHandbook(data,filter);},
     summarize_memory_movement(input={}){return memoryMovement(readMemoryKnowledge(store),input);},
     async find_memories(input) {
       // The layer filter now travels into storage retrieval, so the result limit
       // applies to matching rows instead of hiding them behind newer core memories.
-      const found = await findProjectMemories(store, config, normalizeMemorySearchInput(input), options.searchService);
+      const found = await findProjectMemories(store, config, { ...normalizeMemorySearchInput(input), match: "terms" }, options.searchService);
       return { results: withApplicability(found, input.targetEnvironment) };
     },
     update_memory_scope(input) { return updateMemoryScope(store, input, "mcp"); },
@@ -446,10 +457,10 @@ export function createProjectMemoryToolHandlers(
       return store.findCommits(normalizeCommitInput(input));
     },
     async explain_code_change(input) {
-      return explainCodeChange(store, { ...normalizeExplainInput(input), ...(input.targetEnvironment === undefined ? {} : { targetEnvironment: input.targetEnvironment }) }, { config });
+      return explainCodeChange(store, { ...normalizeExplainInput(input), ...(input.targetEnvironment === undefined ? {} : { targetEnvironment: input.targetEnvironment }) }, investigationOptions);
     },
     async investigate_project_history(input) {
-      return investigateProjectHistory(store, { ...normalizeInvestigationInput(input), ...(input.targetEnvironment === undefined ? {} : { targetEnvironment: input.targetEnvironment }) }, { config });
+      return investigateProjectHistory(store, { ...normalizeInvestigationInput(input), ...(input.targetEnvironment === undefined ? {} : { targetEnvironment: input.targetEnvironment }) }, investigationOptions);
     },
     summarize_recent_activity(input) {
       return summarizeRecentActivity(store, rootDir, normalizeRecentActivityInput(input), options.now);
@@ -498,6 +509,8 @@ export function createProjectMemoryToolHandlers(
       if (options.projectSummaryGenerator !== undefined) refreshOptions.generator = options.projectSummaryGenerator;
       if (options.now !== undefined) refreshOptions.now = options.now;
       if (input.force !== undefined) refreshOptions.force = input.force;
+      if (options.aroundModelCall !== undefined) refreshOptions.aroundModelCall = options.aroundModelCall;
+      importNewGitCommits(store, config);
       return refreshProjectSummary(store, config, refreshOptions);
     }
   };
@@ -1013,7 +1026,8 @@ function readWorkingTree(rootDir: string): RecentActivitySummary["workingTree"] 
 function execGit(rootDir: string, args: string[]): string {
   return execFileSync(gitExecutable(), ["-C", rootDir, ...args], {
     encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
   }).trim();
 }
 

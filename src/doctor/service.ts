@@ -1,6 +1,8 @@
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { credentialStatus, REMOTE_MODEL_CONSENT } from "../ai/credentials.js";
+import { jobModel } from "../ai/models.js";
 import { DatabaseSync } from "node:sqlite";
 
 import { analyzeSharedConfigPortability, globalConfigDir, loadExistingProjectConfig } from "../config.js";
@@ -918,10 +920,26 @@ function addExtractorChecks(
   addCheck: (check: DoctorCheck) => void,
   addAction: (action: DoctorNextAction) => void
 ): void {
+  const models = [config.extractor, ...(config.investigator.enabled ? [config.investigator] : [])];
+  if (models.some(model => model.requiresConsent)) {
+    addCheck({
+      id: "extractor:remote-consent",
+      category: "extractor",
+      status: "warning",
+      title: "LLM extraction is off until you opt in",
+      detail: "The built-in default model sends coding-agent transcripts and Git diffs to a remote provider, so it runs only after this device opts in. Providers chosen in config or the desktop app need no opt-in.",
+      metadata: { setting: REMOTE_MODEL_CONSENT }
+    });
+    addAction({
+      priority: "low",
+      command: "code-butler config remote-models on",
+      reason: "Allow the built-in default model for this project on this device, or choose a provider in the desktop app. Deterministic mode still works without it."
+    });
+  }
   const missing = [
     ...missingProviderEnvVars("extractor", config.extractor),
     ...(config.investigator.enabled ? missingProviderEnvVars("investigator", config.investigator) : [])
-  ];
+  ].filter(item => !item.endsWith(`:${REMOTE_MODEL_CONSENT}`));
   if (missing.length === 0) {
     addCheck({
       id: "extractor:credentials",
@@ -1056,19 +1074,12 @@ function readSyncStatuses(storage: DoctorStorageState): Partial<Record<SyncSourc
 }
 
 function projectSummaryProviderConfig(config: ProjectConfig): ExtractorConfig | InvestigatorConfig {
-  return config.investigator.enabled ? config.investigator : config.extractor;
+  return jobModel(config, "summary");
 }
 
+/** Missing credentials as `label:NAME`; a key saved in the app's keychain counts as present. */
 function missingProviderEnvVars(label: string, config: ExtractorConfig | InvestigatorConfig): string[] {
-  const vars = [config.apiKeyEnv];
-  if (config.provider === "anthropic-aws") {
-    vars.push(config.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID");
-    vars.push(config.regionEnv ?? "AWS_REGION");
-  }
-  return vars
-    .filter((envVar): envVar is string => typeof envVar === "string" && envVar.length > 0)
-    .filter((envVar) => process.env[envVar] === undefined || process.env[envVar] === "")
-    .map((envVar) => `${label}:${envVar}`);
+  return credentialStatus(config).missing.map((envVar) => `${label}:${envVar}`);
 }
 
 function isSourceEnabled(config: ProjectConfig, source: SyncSourceName): boolean {

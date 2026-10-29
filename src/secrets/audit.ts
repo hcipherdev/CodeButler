@@ -7,7 +7,7 @@ export function auditSecretsExposure(root: string): string[] {
   const warnings: string[] = [];
   try {
     const history = execFileSync(gitExecutable(), ["log", "--all", "--max-count=1", "--format=%H", "--", "secrets"],
-      { cwd: root, encoding: "utf8", maxBuffer: 1024, stdio: ["ignore", "pipe", "ignore"] });
+      { cwd: root, encoding: "utf8", maxBuffer: 1024, stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     if (history.trim()) warnings.push("Git history contains files from secrets/. Rotate any credentials exposed through Git and review remote clones.");
   } catch (error) {
     if ((error as { status?: number }).status !== 128) warnings.push("Could not audit Git history for earlier secrets/ exposure.");

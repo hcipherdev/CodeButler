@@ -1,5 +1,9 @@
 # Encrypted Butler sync protocol
 
+> **Status:** experimental and invite-only. This protocol and its implementation
+> have not been independently audited; release qualification is tracked
+> separately.
+
 User-facing CLI and MCP sync use this protocol for memory bindings marked
 `encryptionVersion: 2`. There is no migration from beta memory cloud storage.
 Existing encrypted secrets vaults have the preservation and migration path

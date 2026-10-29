@@ -33,8 +33,12 @@ export function revokeRetrieval(root: string): void {
     mkdirSync(paths.directory, { recursive: true });
     writeFileSync(paths.epoch, randomUUID(), { mode: 0o600 });
 }
-export function retrievalPolicy(root: string, qualityVersion = MEMORY_QUALITY_POLICY_VERSION): string {
+/** Bump when published index contents change shape, forcing one full republication. 2: generated-only commits leave raw search. */
+export const RETRIEVAL_INDEX_VERSION = 2;
+export function retrievalPolicy(root: string, qualityVersion = MEMORY_QUALITY_POLICY_VERSION, indexVersion = RETRIEVAL_INDEX_VERSION): string {
     const config = loadProjectConfig(root);
-    return createHash("sha256").update(JSON.stringify([qualityVersion, config.privacy])).digest("hex");
+    // Version 1 predates the index version and hashed only quality and privacy.
+    const parts = indexVersion === 1 ? [qualityVersion, config.privacy] : [qualityVersion, config.privacy, indexVersion];
+    return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
 }
 export function retrievalPrivacyPolicy(root: string): string { return createHash("sha256").update(JSON.stringify(loadProjectConfig(root).privacy)).digest("hex"); }

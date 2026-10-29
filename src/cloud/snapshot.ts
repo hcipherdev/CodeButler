@@ -13,6 +13,7 @@ import { verifyDatabaseFile } from "../privacy/backup.js";
 import { rebuildSearchIndexes } from "../storage/privacy-maintenance.js";
 import { buildDatabaseFromRowStream, encodeRowStream } from "./row-stream.js";
 import { installationDeviceId } from "../memory/origin.js";
+import { preferIncomingNarrative, serializeProjectSummaryMeta } from "../project-summary/service.js";
 import { EncryptionError } from "./crypto-helper.js";
 import {
   decodePartition,
@@ -168,6 +169,11 @@ export function partitionSegments(manifest: Snapshot): SnapshotSegment[] {
 }
 export function fileSegments(manifest: Snapshot): SnapshotSegment[] {
   return manifest.segments.filter(segment => segment.kind !== "partition");
+}
+/** One small project file from a snapshot, without rebuilding the memory database. */
+export function snapshotFile(manifest: Snapshot, resolve: (checksum: string) => Buffer, path: string): Buffer | undefined {
+  const segment = fileSegments(manifest).find(item => item.kind !== "core" && segmentPath(item) === path);
+  return segment ? joinBlocks(segment, resolve) : undefined;
 }
 export function coreSegment(manifest: Snapshot): SnapshotSegment {
   const segment = manifest.segments.find(item => item.kind === "core");
@@ -776,15 +782,18 @@ export function applySnapshot(root: string, materialized: MaterializedSnapshot):
       // A v4 snapshot carries no search index, and a v3 one indexed another checkout's rows; rebuild from what was restored.
       rebuildSearchIndexes(target);
     } finally { original.close(); target.close(); }
+    const narrative = incomingNarrative(root, materialized.files);
+    const incoming = materialized.files.filter(file => !narrative.keepLocal || !NARRATIVE_FILES.has(file.path))
+      .map(file => file.path === NARRATIVE_META && narrative.meta ? { ...file, data: narrative.meta } : file);
     const existing = filesIn(dir);
     const previousBinding = binding(root);
-    const journal: Journal = { ...(previousBinding ? { previousBinding } : {}), files: existing.map(path => ({ path, data: readFileSync(join(dir, path)).toString("base64") })), incoming: materialized.files.map(f => f.path) };
+    const journal: Journal = { ...(previousBinding ? { previousBinding } : {}), files: existing.map(path => ({ path, data: readFileSync(join(dir, path)).toString("base64") })), incoming: incoming.map(f => f.path) };
     atomicJson(join(state, "recovery.json"), journal);
     atomicJson(join(state, "apply-journal.json"), journal);
     const local = readJson<Config>(join(dir, "config.json")) ?? {};
     try {
-      for (const path of existing) rmSync(join(dir, path), { force: true });
-      for (const file of materialized.files) {
+      for (const path of existing) if (!narrative.keepLocal || !NARRATIVE_FILES.has(path)) rmSync(join(dir, path), { force: true });
+      for (const file of incoming) {
         mkdirSync(join(dir, file.path, ".."), { recursive: true });
         const data = file.path === "memory.sqlite" ? readFileSync(staged) : file.data;
         atomicWrite(join(dir, file.path), data);
@@ -795,6 +804,26 @@ export function applySnapshot(root: string, materialized: MaterializedSnapshot):
       verifyDatabaseFile(join(dir, "memory.sqlite")); rmSync(join(state, "apply-journal.json")); syncDirectory(state);
     } catch (error) { recoverApply(root); throw error; }
   } finally { rmSync(staged, { force: true }); }
+}
+
+const NARRATIVE_SUMMARY = "project-summary.md", NARRATIVE_META = "project-summary.meta.json";
+const NARRATIVE_FILES = new Set([NARRATIVE_SUMMARY, NARRATIVE_META]);
+
+/**
+ * The narrative is not replaced wholesale like the rest: this device's own is kept, check time included,
+ * unless the incoming one was built from later commits. A taken pair gets this checkout's summary path.
+ */
+function incomingNarrative(root: string, files: MaterializedSnapshot["files"]): { keepLocal: boolean; meta?: Buffer } {
+  const file = (path: string) => files.find(item => item.path === path)?.data;
+  // With nothing local to keep, the incoming files land as they are unless they can be taken properly.
+  const hasLocal = existsSync(join(root, ".code-butler", NARRATIVE_SUMMARY));
+  try {
+    const decision = preferIncomingNarrative(root, { summary: file(NARRATIVE_SUMMARY), meta: file(NARRATIVE_META) });
+    return decision.take ? { keepLocal: false, meta: Buffer.from(serializeProjectSummaryMeta(decision.meta)) } : { keepLocal: hasLocal };
+  } catch {
+    // Failing to decide leaves the local narrative, which the next daily refresh rewrites if it is stale.
+    return { keepLocal: hasLocal };
+  }
 }
 
 /** Verify the authored bytes first, then upgrade only the private staged copy. */

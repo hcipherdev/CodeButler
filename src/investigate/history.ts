@@ -1,4 +1,5 @@
 import { withApplicability, scopeLabel } from "../memory/scope.js";
+import { hasCredentials } from "../ai/credentials.js";
 import type { TargetEnvironment } from "../types.js";
 import { findDecisions } from "../decisions/store.js";
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
@@ -808,22 +809,24 @@ function budgetFromConfig(config: InvestigatorConfig): InvestigationBudget {
 }
 
 function resolveInvestigatorProvider(options: InvestigationRunOptions): InvestigatorProvider | undefined {
+  const provider = configuredInvestigatorProvider(options);
+  const around = options.aroundModelCall;
+  if (!provider || !around) return provider;
+  return {
+    planNextAction: (state, retry) => around(() => provider.planNextAction(state, retry)),
+    synthesizeAnswer: (state) => around(() => provider.synthesizeAnswer(state))
+  };
+}
+
+function configuredInvestigatorProvider(options: InvestigationRunOptions): InvestigatorProvider | undefined {
   if (options.investigatorProvider) return options.investigatorProvider;
   const config = options.config?.investigator;
   if (!config?.enabled) return undefined;
-  if (!hasProviderCredentials(config)) return undefined;
-  if (config.provider === "anthropic-aws") {
+  if (!hasCredentials(config)) return undefined;
+  if (config.provider === "anthropic-aws" || config.provider === "anthropic") {
     return createAnthropicAwsInvestigator(config);
   }
   return createOpenAICompatibleInvestigator(config);
-}
-
-function hasProviderCredentials(config: InvestigatorConfig): boolean {
-  if (!process.env[config.apiKeyEnv]?.trim()) return false;
-  if (config.provider !== "anthropic-aws") return true;
-  const workspaceIdEnv = config.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID";
-  const regionEnv = config.regionEnv ?? "AWS_REGION";
-  return Boolean(process.env[workspaceIdEnv]?.trim() && process.env[regionEnv]?.trim());
 }
 
 function appendStep(

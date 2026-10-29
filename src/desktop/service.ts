@@ -4,6 +4,7 @@ import { assertOrdinaryProject } from "../rules/identity.js";
 import { retrievalEnabled } from "../retrieval/paths.js";
 import { readPublishedMemories, readPublishedDetail, readPublishedSummary, withPublishedIndex } from "../retrieval/index.js";
 import { scheduleRetrieval, requestRetrievalRefresh } from "../retrieval/worker.js";
+import { withReadCache } from "../retrieval/read-cache.js";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -11,7 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { projectOperation } from "../cloud/client.js";
 import { automaticSyncStatus, requestAutomaticSync } from "../cloud/sync-owner.js";
-import { OperationDeferredError } from "../cloud/outcome.js";
+import { OperationDeferredError, errorOutcome, type OperationOutcome } from "../cloud/outcome.js";
 import { readProjectOperationStatus, withProjectGate, type ProjectOperationStatus } from "../cloud/gate.js";
 import { beginForegroundIntent, releaseForegroundIntent, renewForegroundIntent } from "../cloud/foreground.js";
 import { binding, canonicalRoot, stateDirectory, type Binding } from "../cloud/state.js";
@@ -27,11 +28,13 @@ import { selectedCloudClient } from "../cloud/project-connections.js";
 import { encryptedSecretsSync, setSecretsSyncEnabled, secretsSyncStatus, linkSecretsVault, prepareSecretsRecovery, confirmSecretsRecovery, resolveSecretsConflict } from "../secrets/sync.js";
 import { requestAllSecretsAccess, approveAllSecretsAccess, completeAllSecretsAccess, revokeSecretsDevice, restoreSecretsProject, listSecretsVaults, listSecretsDevices, secretsAccessStatus } from "../secrets/access.js";
 import { EncryptionError } from "../cloud/crypto-helper.js";
-import { globalConfigDir, loadProjectConfig } from "../config.js";
+import { automaticReviewPolicy, globalConfigDir, loadProjectConfig } from "../config.js";
+import { assertJobConfigured } from "../memory/reconciliation-provider.js";
 import { buildInfo, runtimeDiagnostics } from "../runtime.js";
 import {
   globalWatchStatus,
   listWatchedProjectStatuses,
+  recordManualWatchRun,
   listWatchedProjects,
   registerWatchedProject,
   recordWatchedCloudConnection,
@@ -39,6 +42,11 @@ import {
   type WatchedProject
 } from "../global-watch.js";
 import { getProjectSummaryStatus, readProjectBrief, refreshProjectSummary } from "../project-summary/service.js";
+import { aiClientStatus, connectAiClient } from "./ai-clients.js";
+import { listConnectionModels, readAiSettings, removeConnectionKey, saveAiSettings, setConnectionKey, testConnection } from "./ai-settings.js";
+import { checkForUpdate, downloadUpdate } from "./updater.js";
+import type { AiSettings, ProjectConfig } from "../types.js";
+import { importNewGitCommits, ingestionOutcomes, syncWatchedProjectMemory, type SyncRunResult } from "../sync/service.js";
 import { memoryScopeSchema } from "../memory/scope.js";
 import { isPeerLayer } from "../memory/peer-layer.js";
 import { memoryStatementSchema } from "../memory/statement.js";
@@ -59,8 +67,7 @@ import {
   planMemoryReconciliation,
   previewDesktopMemoryReconciliation,
   readDesktopMemoryReconciliationStatus,
-  readMemoryReconciliationCitations,
-  readMemoryReconciliationRun,
+  readDesktopMemoryReconciliationResults,
   revertMemoryReconciliation,
   type MemoryReconciliationDependencies,
   type ReconciliationProgress
@@ -77,6 +84,7 @@ import {
   type DesktopProjectInspection,
   type DesktopProjectList,
   type DesktopProjectOverview,
+  type DesktopSourceCheck,
   type DesktopMemory,
   type DesktopRequest,
   type DesktopResult,
@@ -90,6 +98,27 @@ import { accountCapabilities, accountChallenge, accountLogout, accountSummary, a
 import type { MemorySearchResult } from "../types.js";
 
 const rootSchema = z.string().trim().min(1).max(32_767);
+const aiIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{0,39}$/);
+const aiChoiceSchema = z.object({ connection: aiIdSchema, model: z.string().trim().min(1).max(200), maxTokens: z.number().int().positive().max(200_000).optional() }).strict();
+const envNameSchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/);
+const aiSettingsSchema = z.object({
+  connections: z.record(aiIdSchema, z.object({
+    kind: z.string().max(40), label: z.string().max(80).optional(), baseUrl: z.string().max(500).optional(),
+    apiKeyEnv: envNameSchema.optional(), workspaceIdEnv: envNameSchema.optional(), regionEnv: envNameSchema.optional(),
+    workspaceId: z.string().max(200).optional(), region: z.string().max(200).optional(),
+    dataCollection: z.enum(["allow", "deny"]).optional(), keyUpdatedAt: z.string().max(64).optional(), keySavedToEnv: z.literal(true).optional()
+  }).strict()).optional(),
+  tiers: z.object({ fast: aiChoiceSchema.optional(), smart: aiChoiceSchema.optional() }).strict().optional(),
+  jobs: z.record(z.enum(["extraction", "review", "wording", "summary", "investigator", "rules", "consolidation"]),
+    z.union([aiChoiceSchema, z.object({ tier: z.enum(["fast", "smart"]) }).strict()])).optional(),
+  budgets: z.object({ backgroundDailyTokens: z.number().int().positive().max(10_000_000_000).nullable().optional() }).strict().optional()
+}).strict();
+
+/** Settings errors are written for people (validation, keychain, network), so they reach the page as-is. */
+async function aiSettingsAction<T>(work: () => Promise<T> | T): Promise<T> {
+  try { return await work(); }
+  catch (error) { throw new DesktopServiceError("invalid-request", error instanceof Error ? error.message.replace(/^global /, "") : "The AI settings could not be changed."); }
+}
 const accountServerSchema = z.string().trim().min(1).max(2048);
 const accountEmailSchema = z.string().trim().max(254).email();
 const accountCodeSchema = z.string().regex(/^\d{8}$/);
@@ -152,11 +181,24 @@ const requestSchema = z.discriminatedUnion("action", [
   z.object({version:z.literal(2),action:z.literal("memory.freshness"),root:rootSchema}).strict(),
   z.object({ version: z.literal(1), action: z.literal("projects.list") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("watcher.status") }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("watcher.install") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("watcher.runtime-details") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("projects.inspect"), root: rootSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("projects.add"), root: rootSchema, initialize: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("projects.remove"), root: rootSchema, mode: z.enum(["list", "local", "everywhere"]).optional(), confirmed: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("project.overview"), root: rootSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("project.sources"), root: rootSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("project.sources.check"), root: rootSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.clients.status"), root: rootSchema.optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.clients.connect"), client: z.enum(["claude", "codex"]) }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.settings.read"), root: rootSchema.optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.settings.save"), root: rootSchema.optional(), settings: aiSettingsSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.connection.setKey"), root: rootSchema.optional(), connectionId: aiIdSchema, key: z.string().min(1).max(4096), saveToEnv: z.boolean().optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.connection.removeKey"), root: rootSchema.optional(), connectionId: aiIdSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.connection.test"), connectionId: aiIdSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.models.list"), connectionId: aiIdSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("update.check") }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("update.download"), updateVersion: z.string().regex(/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/) }).strict(),
   z.object({ version: z.literal(1), action: z.literal("cloud.sync.status"), root: rootSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("cloud.projects.list"), refresh: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("cloud.project.inspect"), root: rootSchema, refresh: z.boolean().optional() }).strict(),
@@ -314,6 +356,13 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
       const status = globalWatchStatus();
       return options.watcherServiceStatus?.() ?? watcherServiceStatus(status.running, status.pid, status.build);
     }
+    case "watcher.install": {
+      // The same per-user watcher Add Project installs; a no-op when it is already installed.
+      try { (options.ensureGlobalWatcher ?? ensureDesktopGlobalWatcher)(); }
+      catch (error) { throw new DesktopServiceError("invalid-request", `The shared watcher could not be installed: ${error instanceof Error ? error.message : "unknown error"}`); }
+      const status = globalWatchStatus();
+      return options.watcherServiceStatus?.() ?? watcherServiceStatus(status.running, status.pid, status.build);
+    }
     case "watcher.runtime-details":
       return { processes: runtimeDiagnostics() };
     case "projects.inspect":
@@ -330,6 +379,35 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
     }
     case "project.overview":
       return projectOverview(requireRegisteredProject(request.root));
+    case "project.sources":
+      return canonicalDesktopRead(requireRegisteredProject(request.root).root, store => ({
+        byType: store.countSourcesByType(),
+        adapters: store.listSyncStatuses().map(({ metadata: _metadata, ...status }) => status),
+        failures: store.listSourceFailures({ resolved: false, limit: 20 })
+      }));
+    case "project.sources.check":
+      return checkProjectSources(requireRegisteredProject(request.root).root);
+    case "ai.clients.status":
+      return aiClientStatus(request.root ? { root: requireRegisteredProject(request.root).root } : {});
+    case "ai.settings.read":
+      return readAiSettings(request.root ? requireRegisteredProject(request.root).root : undefined);
+    case "ai.settings.save":
+      return aiSettingsAction(() => saveAiSettings(request.settings as AiSettings, request.root ? requireRegisteredProject(request.root).root : undefined));
+    case "ai.connection.setKey":
+      return aiSettingsAction(() => setConnectionKey(request.connectionId, request.key, request.saveToEnv === true, request.root ? requireRegisteredProject(request.root).root : undefined));
+    case "ai.connection.removeKey":
+      return aiSettingsAction(() => removeConnectionKey(request.connectionId, request.root ? requireRegisteredProject(request.root).root : undefined));
+    case "ai.connection.test":
+      return aiSettingsAction(() => testConnection(request.connectionId));
+    case "update.check":
+      return aiSettingsAction(() => checkForUpdate());
+    case "update.download":
+      return aiSettingsAction(() => downloadUpdate(request.updateVersion));
+    case "ai.models.list":
+      return aiSettingsAction(() => listConnectionModels(request.connectionId));
+    case "ai.clients.connect":
+      try { return connectAiClient(request.client); }
+      catch (error) { throw new DesktopServiceError("invalid-request", error instanceof Error ? error.message : "The connection could not be set up."); }
     case "cloud.sync.status": {
       const project = requireRegisteredProject(request.root);
       return cloudStatusForProject(project);
@@ -447,22 +525,25 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
     case "memory.ai.results": {
       try {
         const root = requireRegisteredProject(request.root).root;
-        return await projectOperation(root, () => {
-          if(request.mode==="wording") {const run=readMemoryWording(root,request.runId);if(!run)throw new Error("Unknown wording run");return {run,citations:{},memories:{}};}
-          const run = readMemoryReconciliationRun(root, request.runId);
-          const store = openConfiguredMemoryStore(root);
-          store.init();
-          try {
-            const memories = store.readMemorySearchResultsByIds(run.items.map((item) => item.memoryId), {
-              lifecycleStatus: "all", includeCandidates: true
-            });
-            return {
-              run,
-              citations: readMemoryReconciliationCitations(root, request.runId),
-              memories: Object.fromEntries(memories.map((memory) => [memory.id, { title: memory.title, summary: memory.summary }]))
-            };
-          } finally { store.close(); }
+        if (request.mode === "wording") return await projectOperation(root, () => {
+          const run = readMemoryWording(root, request.runId);
+          if (!run) throw new Error("Unknown wording run");
+          return { run, citations: {}, memories: {} };
         });
+        const { run, citations } = readDesktopMemoryReconciliationResults(root, request.runId);
+        let memories: Record<string, { title: string; summary: string }> | undefined;
+        try {
+          // Titles live in the shared database, so take them only if the project is free right now.
+          memories = await projectOperation(root, () => {
+            const store = openConfiguredMemoryStore(root);
+            store.init();
+            try {
+              const found = store.readMemorySearchResultsByIds(run.items.map((item) => item.memoryId), { lifecycleStatus: "all", includeCandidates: true });
+              return Object.fromEntries(found.map((memory) => [memory.id, { title: memory.title, summary: memory.summary }]));
+            } finally { store.close(); }
+          }, { waitMs: 0, name: "Load AI review titles" });
+        } catch (error) { if (!(error instanceof OperationDeferredError)) throw error; }
+        return { run, citations, memories: memories ?? {}, ...(memories ? {} : { memoriesPending: true }) };
       } catch (error) { throw desktopAiError(error, "Could not load AI review results"); }
     }
     case "memory.ai.apply": {
@@ -767,13 +848,19 @@ function desktopProject(project: WatchedProject & { lastRun?: DesktopProject["la
   };
 }
 
+/** Consecutive failed cloud runs before the desktop reports the sync as failing rather than retrying. */
+const FAILING_SYNC_RETRIES = 3;
+
 function cloudStatusForProject(project: WatchedProject & { lastRun?: DesktopProject["lastRun"]; lastCloudRun?: DesktopProject["lastCloudRun"] }, cloud: Binding | undefined = binding(project.root)) {
   const sync = automaticSyncStatus(project.root);
   const latest = [project.lastCloudRun, project.lastRun].filter(run => run?.stage === "cloud")
     .sort((a, b) => b!.checkedAt.localeCompare(a!.checkedAt))[0];
-  const deferredReason = sync.pending && latest?.outcome === "deferred" && (!sync.lastCompletedAt || latest.checkedAt > sync.lastCompletedAt)
-    ? latest.error : undefined;
-  return desktopCloudStatus(cloud, sync, deferredReason);
+  const sinceCompleted = !!latest && (!sync.lastCompletedAt || latest.checkedAt > sync.lastCompletedAt);
+  const deferredReason = sync.pending && latest?.outcome === "deferred" && sinceCompleted ? latest.error : undefined;
+  // One failed attempt is usually a dropped connection that the next retry recovers from; repeated ones are not.
+  const failedReason = latest?.outcome === "failed" && sinceCompleted && (latest.retryCount ?? 0) >= FAILING_SYNC_RETRIES
+    ? latest.error ?? "The last cloud sync failed." : undefined;
+  return desktopCloudStatus(cloud, sync, deferredReason, failedReason);
 }
 
 function requireRegisteredProject(root: string, allowUnavailable = false): WatchedProject & { lastRun?: DesktopProject["lastRun"]; lastCloudRun?: DesktopProject["lastCloudRun"] } {
@@ -791,6 +878,45 @@ function requireRegisteredProject(root: string, allowUnavailable = false): Watch
   return { ...project, root: canonical };
 }
 
+/**
+ * Run one watcher-style ingestion pass now. It holds the project gate only for short database steps
+ * and leaves sessions that are still being written for later, exactly like the background watcher.
+ */
+async function checkProjectSources(root: string): Promise<DesktopSourceCheck> {
+  let result: SyncRunResult | undefined;
+  let outcomes: OperationOutcome[];
+  try {
+    result = await syncWatchedProjectMemory(root, loadProjectConfig(root));
+    outcomes = ingestionOutcomes(result);
+  } catch (error) {
+    outcomes = [errorOutcome(error, "ingestion")];
+  }
+  const status = recordManualWatchRun(root, outcomes);
+  return {
+    outcome: status.outcome ?? (status.ok ? "success" : "failed"),
+    ...(status.error ? { reason: status.error } : {}),
+    checkedAt: status.checkedAt,
+    imported: { git: result?.sources.git.imported ?? 0, codex: result?.sources.codex.imported ?? 0, claude: result?.sources.claude.imported ?? 0 },
+    promoted: result?.memories.promoted ?? 0,
+    pending: result?.memories.pending ?? 0,
+    waiting: result?.memories.waiting ?? 0
+  };
+}
+
+/**
+ * The daily AI review re-checks some flagged memories and automatic promotion makes corroborated
+ * candidates durable; each runs only when enabled, and the review only with a review model set up.
+ */
+function overviewAutomation(root: string, config?: ProjectConfig): Pick<DesktopProjectOverview, "automation"> {
+  try {
+    const project = config ?? loadProjectConfig(root);
+    let reviewModel = true;
+    try { assertJobConfigured(project, "review"); } catch { reviewModel = false; }
+    const promotion = project.promotion.automatic;
+    return { automation: { aiReview: reviewModel && automaticReviewPolicy(project).enabled, promotion: promotion.enabled && promotion.coreCandidates } };
+  } catch { return {}; }
+}
+
 async function projectOverview(project: WatchedProject & { lastRun?: DesktopProject["lastRun"]; lastCloudRun?: DesktopProject["lastCloudRun"] }): Promise<DesktopProjectOverview> {
   if(retrievalEnabled()) {
     scheduleRetrieval(project.root);
@@ -798,7 +924,7 @@ async function projectOverview(project: WatchedProject & { lastRun?: DesktopProj
       const {summary:memory,status}=readPublishedSummary(project.root); const brief=readProjectBrief(project.root);
       const {counts:tiers,freshness}=readPublishedTiers(project.root);
       const working=readPublishedTierPage(project.root,{tier:"working",limit:3}).items as import("../retrieval/tiers.js").WorkingMemory[];
-      return {project:desktopProject(project),narrative:{exists:brief.exists,summary:brief.summary,status:status ?? getProjectSummaryStatus(project.root)},memory,tiers,working,freshness,cloud:cloudStatusForProject(project)};
+      return {project:desktopProject(project),narrative:{exists:brief.exists,summary:brief.summary,status:status ?? getProjectSummaryStatus(project.root)},memory,tiers,working,freshness,cloud:cloudStatusForProject(project),...overviewAutomation(project.root)};
     });
   }
   const requestStarted = performance.now();
@@ -806,7 +932,7 @@ async function projectOverview(project: WatchedProject & { lastRun?: DesktopProj
     const workStarted = performance.now();
     const store = openConfiguredMemoryStore(project.root);
     store.init();
-    try {
+    try { return withReadCache(() => {
       const config = loadProjectConfig(project.root);
       const brief = readProjectBrief(project.root);
       const memory = store.getProjectSummary();
@@ -823,10 +949,11 @@ async function projectOverview(project: WatchedProject & { lastRun?: DesktopProj
         narrative: { exists: brief.exists, summary: brief.summary, status },
         memory,
         tiers:workingPage.counts,working:workingPage.items as import("../retrieval/tiers.js").WorkingMemory[],freshness:workingPage.freshness,
-        cloud: cloudStatusForProject(project)
+        cloud: cloudStatusForProject(project),
+        ...overviewAutomation(project.root, config)
       };
       return result;
-    } finally {
+    }); } finally {
       try { store.close(); }
       finally { recordDesktopTiming("overview", workStarted - requestStarted, performance.now() - workStarted); }
     }
@@ -844,6 +971,7 @@ async function refreshProjectNarrative(
       store.init();
       try {
         const config = loadProjectConfig(project.root);
+        importNewGitCommits(store, config);
         const status = getProjectSummaryStatus(project.root, { store, config });
         if (!status.stale) {
           return {
@@ -989,14 +1117,20 @@ export function desktopSuccess(result: DesktopResult) {
   return { version: DESKTOP_PROTOCOL_VERSION, ok: true as const, result };
 }
 
+/** Reads share one read-cache scope, so per-file and per-source lookups run once per request. */
 function canonicalDesktopRead<T extends DesktopResult>(root:string,read:(store:ReturnType<typeof openConfiguredMemoryStore>)=>T):Promise<T>{
-  return projectOperation(root,()=>{const store=openConfiguredMemoryStore(root);store.init();try{return read(store);}finally{store.close();}});
+  return canonicalDesktopStore(root,store=>withReadCache(()=>read(store)));
+}
+
+function canonicalDesktopStore<T extends DesktopResult>(root:string,work:(store:ReturnType<typeof openConfiguredMemoryStore>)=>T):Promise<T>{
+  return projectOperation(root,()=>{const store=openConfiguredMemoryStore(root);store.init();try{return work(store);}finally{store.close();}});
 }
 
 async function desktopKnowledgeMutation<T extends DesktopResult>(root:string,write:(store:ReturnType<typeof openConfiguredMemoryStore>)=>T):Promise<T>{
   const intent=beginForegroundIntent(root);
   try {
-    const result=await canonicalDesktopRead(root,write);
+    // Writes stay outside the read cache: it must never span a canonical mutation.
+    const result=await canonicalDesktopStore(root,write);
     if(retrievalEnabled()) scheduleRetrieval(root);
     try { if(binding(root)?.enabled) requestAutomaticSync(root); }
     catch(error) { recordUnexpectedDesktopError(error,"topic-sync-request"); }

@@ -13,6 +13,7 @@ import { resolveBranchMemoryTriage, suggestBranchMemoryTriage } from "../../memo
 import { updateMemoryScope } from "../../memory/scope-service.js";
 import { formatMemoryOrigin } from "../../memory/origin.js";
 import { auditMemoryConflicts } from "../../memory/conflicts.js";
+import { listPendingInvalidations } from "../../memory/invalidation.js";
 import { updateMemoryStatus } from "../../memory/lifecycle-service.js";
 import { auditMemoryQuality } from "../../memory/quality.js";
 import { memoryStatementSchema, memoryStatementInputSchema } from "../../memory/statement.js";
@@ -22,6 +23,8 @@ import { loadProjectConfig } from "../../config.js";
 import { openConfiguredMemoryStore } from "../../storage/open-configured-store.js";
 import type { MemoryLayerFilter, MemoryLifecycleStatus, MemoryType } from "../../types.js";
 import { runMemoryReconcileCommand } from "./memory-reconcile.js";
+import { runMemoryConsolidateCommand } from "./memory-consolidate.js";
+import { runAutomaticReview } from "../../memory/auto-review.js";
 import { exportMemoryHandbook } from "../../memory/export.js";
 import { projectOperation } from "../../cloud/client.js";
 
@@ -40,8 +43,42 @@ export async function runMemoryCommand(
       return result.blocked.length?1:0;
     }finally{store.close();}},{name:"Export handbook",waitMs:0});
   }
-  if (subcommand !== "audit" && subcommand !== "review" && subcommand !== "reconcile" && subcommand !== "remember" && subcommand !== "status" && subcommand !== "conflicts" && subcommand !== "scope" && subcommand !== "layer" && subcommand !== "promotions" && subcommand !== "retention" && subcommand !== "branch-triage" && subcommand !== "branch-resolve") {
-    throw new Error("Usage: code-butler memory <export|audit|review|reconcile|remember|scope|layer|promotions|retention|branch-triage|branch-resolve|status|conflicts> ...");
+  if (subcommand !== "audit" && subcommand !== "review" && subcommand !== "reconcile" && subcommand !== "remember" && subcommand !== "status" && subcommand !== "conflicts" && subcommand !== "scope" && subcommand !== "layer" && subcommand !== "promotions" && subcommand !== "retention" && subcommand !== "branch-triage" && subcommand !== "branch-resolve" && subcommand !== "invalidations" && subcommand !== "consolidate" && subcommand !== "review-auto") {
+    throw new Error("Usage: code-butler memory <export|audit|review|reconcile|remember|scope|layer|promotions|retention|branch-triage|branch-resolve|status|conflicts|invalidations|consolidate|review-auto> ...");
+  }
+  if (subcommand === "review-auto") {
+    const unknownFlag = rest.find((arg) => arg !== "--if-due" && arg !== "--json");
+    if (unknownFlag) throw new Error("Usage: code-butler memory review-auto [--if-due] [--json]");
+    const result = await runAutomaticReview(cwd, loadProjectConfig(cwd), { ifDue: rest.includes("--if-due"), now: options.now });
+    if (rest.includes("--json")) { stdout(JSON.stringify(result, null, 2)); return 0; }
+    if (result.skipped) { stdout(`Automatic review skipped: ${result.skipped}`); return 0; }
+    const state = result.state!;
+    const counts = state.counts;
+    stdout(`Automatic review ${state.outcome}${state.runId ? ` (${state.runId})` : ""}${state.error ? `: ${state.error}` : ""}`);
+    if (counts) stdout(`  checked=${counts.checked} verified=${counts.verified} retired=${counts.retired} left-for-review=${counts.leftForReview} uncertain=${counts.uncertain} failed=${counts.failed}`);
+    if (state.runId) stdout(`  Revert with: code-butler memory reconcile revert --run ${state.runId}`);
+    return state.outcome === "failed" ? 1 : 0;
+  }
+  if (subcommand === "consolidate") return runMemoryConsolidateCommand(rest, cwd, stdout, options);
+  if (subcommand === "invalidations") {
+    const allowedFlags = new Set(["--all", "--json"]);
+    const unknownFlag = rest.find((arg) => !allowedFlags.has(arg));
+    if (unknownFlag) throw new Error("Usage: code-butler memory invalidations [--all] [--json]");
+    const store = openConfiguredMemoryStore(cwd);
+    store.init();
+    try {
+      const records = listPendingInvalidations(store, { includeResolved: rest.includes("--all") });
+      if (rest.includes("--json")) { stdout(JSON.stringify({ invalidations: records }, null, 2)); return 0; }
+      stdout("Memory Invalidations");
+      if (records.length === 0) stdout(rest.includes("--all") ? "none recorded" : "none pending");
+      for (const record of records) {
+        stdout(`${record.createdAt} ${record.outcome ?? "pending"} target=${record.targetId} replacement=${record.replacementId} confidence=${record.confidence.toFixed(2)} source=${record.source}`);
+        stdout(`    ${record.reason}`);
+      }
+      return 0;
+    } finally {
+      store.close();
+    }
   }
   if (subcommand === "reconcile") return runMemoryReconcileCommand(rest, cwd, stdout, options);
   if (subcommand === "review") {

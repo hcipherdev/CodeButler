@@ -5,7 +5,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { ProjectMemoryToolHandlers } from "../tools.js";
-import { asJsonContent, compactOptionalInput } from "./shared.js";
+import { asCompactJsonContent, asJsonContent, compactOptionalInput, searchMaxCharsSchema } from "./shared.js";
+import { shapeFindMemories } from "../search-response.js";
 
 const memoryType = z.enum(["decision", "bug_fix", "constraint", "rejected_approach"]);
 const branchTriageCategory = z.enum(["candidate", "promoted"]);
@@ -40,11 +41,12 @@ export function registerMemoryToolGroup(
       status: z.enum(["promoted", "candidate"]).optional(),
       qualityStatus: z.enum(["active", "needs_review", "quarantined", "all"]).optional(),
       lifecycleStatus: z.enum(["current", "superseded", "retracted", "all"]).optional(),
-      limit: z.number().int().positive().max(100).optional()
+      limit: z.number().int().positive().max(100).optional(),
+      maxChars: searchMaxCharsSchema
     }
-  }, async (input) => asJsonContent(await handlers.find_memories(
+  }, async ({ maxChars, ...input }) => asCompactJsonContent(shapeFindMemories(await handlers.find_memories(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["find_memories"]>[0]>(input)
-  )));
+  ), maxChars)));
 
   server.registerTool("remember_project_memory", {
     description: "Store an explicit user-requested durable project memory without inspecting local database internals. Promoted writes default to the shared core layer; unpromoted candidates default to the current branch/device layer off the default Git branch unless layer is explicit.",

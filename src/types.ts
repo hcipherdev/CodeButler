@@ -143,6 +143,8 @@ export interface MemoryChunk {
   chunkIndex?: number;
   text: string;
   metadata?: Record<string, unknown>;
+  /** Extractor input only: an already-extracted message sent so the new ones read in context. */
+  contextOnly?: boolean | undefined;
 }
 
 export interface SearchResult {
@@ -349,6 +351,8 @@ export interface MemorySearchResult {
   displayStatus?: MemoryTrustDisplayStatus | undefined;
   trust?: TrustSummary | undefined;
   ranking?: RankingMetadata | undefined;
+  /** Present only for multi-term queries in terms mode: how many query terms this memory contains. */
+  match?: { terms: number; matched: number } | undefined;
 }
 
 export interface TemporaryMemory {
@@ -461,9 +465,30 @@ export interface ExtractorConversationInput {
   metadata?: Record<string, unknown>;
 }
 
+/** An existing memory offered to the extractor so it can say a new one repeats or replaces it. */
+export interface ExistingMemoryInput {
+  /** Short handle such as "E1", valid within one extraction batch. */
+  ref: string;
+  type: MemoryType;
+  title: string;
+  summary: string;
+  status: "durable" | "candidate";
+  /** When the newest evidence behind it was observed, or when it was recorded. */
+  recordedAt: string;
+}
+
 export interface ExtractorContext {
   conversations: ExtractorConversationInput[];
   commits: CommitRecord[];
+  existingMemories?: ExistingMemoryInput[] | undefined;
+}
+
+/** An extracted memory plus what the model said about existing memories; never stored as such. */
+export interface ExtractorMemory extends ExtractedMemory {
+  /** Ref of an existing memory of the same type that states the same fact. */
+  sameAs?: string | undefined;
+  /** An existing memory this one shows no longer holds. */
+  invalidates?: { ref: string; confidence: number; why: string } | undefined;
 }
 
 export interface RejectedMemory {
@@ -474,7 +499,7 @@ export interface RejectedMemory {
 }
 
 export interface ExtractorResult {
-  memories: ExtractedMemory[];
+  memories: ExtractorMemory[];
   rejected: RejectedMemory[];
 }
 
@@ -500,7 +525,41 @@ export interface CodexLogSourceConfig extends ConversationLogSourceConfig {
   includeDefaultRoots: boolean;
 }
 
-export type LlmProviderName = "openai-compatible" | "anthropic-aws";
+export type LlmProviderName = "openai-compatible" | "anthropic-aws" | "anthropic";
+
+/** A named provider account in the global `ai.connections` settings. */
+export type AiConnectionKind = "openrouter" | "anthropic" | "anthropic-aws" | "openai" | "gemini" | "qwen" | "ollama" | "lmstudio" | "openai-compatible";
+/** Every purpose Code Butler calls a model for; each resolves to one connection and model. */
+export type AiJob = "extraction" | "review" | "wording" | "summary" | "investigator" | "rules" | "consolidation";
+export const AI_JOBS: readonly AiJob[] = ["extraction", "review", "wording", "summary", "investigator", "rules", "consolidation"];
+
+export interface AiConnectionConfig {
+  kind: AiConnectionKind;
+  label?: string | undefined;
+  baseUrl?: string | undefined;
+  apiKeyEnv?: string | undefined;
+  workspaceIdEnv?: string | undefined;
+  regionEnv?: string | undefined;
+  /** Not secret, so stored in config; the matching *Env variable wins when set. */
+  workspaceId?: string | undefined;
+  region?: string | undefined;
+  /** Set when a key was saved to the OS keychain; changing it invalidates cached keys. */
+  keyUpdatedAt?: string | undefined;
+  /** Set when the app wrote this connection's key to the global .env under apiKeyEnv. */
+  keySavedToEnv?: true | undefined;
+  /** OpenRouter only: refuse upstream providers that retain or train on prompts. Default deny. */
+  dataCollection?: "allow" | "deny" | undefined;
+}
+
+export interface AiModelChoice { connection: string; model: string; maxTokens?: number | undefined }
+export type AiJobChoice = AiModelChoice | { tier: "fast" | "smart" };
+
+export interface AiSettings {
+  connections?: Record<string, AiConnectionConfig> | undefined;
+  tiers?: { fast?: AiModelChoice | undefined; smart?: AiModelChoice | undefined } | undefined;
+  jobs?: Partial<Record<AiJob, AiJobChoice>> | undefined;
+  budgets?: { backgroundDailyTokens?: number | null | undefined } | undefined;
+}
 
 export interface ExtractorConfig {
   provider: LlmProviderName;
@@ -510,6 +569,24 @@ export interface ExtractorConfig {
   workspaceIdEnv?: string | undefined;
   regionEnv?: string | undefined;
   maxTokens?: number | undefined;
+  /** Set when the model comes from an `ai` connection rather than legacy profiles. */
+  connectionId?: string | undefined;
+  connectionLabel?: string | undefined;
+  connectionKind?: AiConnectionKind | undefined;
+  keyUpdatedAt?: string | undefined;
+  workspaceId?: string | undefined;
+  region?: string | undefined;
+  dataCollection?: "allow" | "deny" | undefined;
+  /** The built-in default would send project content to a remote model the person never chose. */
+  requiresConsent?: boolean | undefined;
+}
+
+/** One job's model after tiers, job overrides and project overrides are applied. */
+export interface ResolvedModel extends ExtractorConfig {
+  job: AiJob;
+  source: "ai" | "legacy" | "project-override";
+  /** False only when the legacy investigator is switched off. */
+  enabled?: boolean | undefined;
 }
 
 export interface ExtractorConfigInput extends Partial<ExtractorConfig> {
@@ -570,6 +647,8 @@ export interface EmbeddingConfig {
 
 export interface PrivacyConfig {
   allowRemoteEmbeddings: boolean;
+  /** Lets the built-in default model run on a key found only in the shell environment. */
+  allowRemoteModels?: boolean;
   redactionPatterns?: RedactionPatternConfig[];
 }
 
@@ -720,6 +799,14 @@ export interface InvestigatorConfig {
   workspaceIdEnv?: string | undefined;
   regionEnv?: string | undefined;
   maxTokens?: number | undefined;
+  connectionId?: string | undefined;
+  connectionLabel?: string | undefined;
+  connectionKind?: AiConnectionKind | undefined;
+  keyUpdatedAt?: string | undefined;
+  workspaceId?: string | undefined;
+  region?: string | undefined;
+  dataCollection?: "allow" | "deny" | undefined;
+  requiresConsent?: boolean | undefined;
   maxDepth: number;
   maxSteps: number;
   maxBranching: number;
@@ -730,6 +817,31 @@ export interface InvestigatorConfig {
 
 export interface InvestigatorConfigInput extends Partial<InvestigatorConfig> {
   profile?: string | undefined;
+}
+
+/** How conversation logs are fed to the extractor; see docs/operations.md#memory-extraction. */
+export interface ExtractionConfig {
+  /** The watcher waits this long after a session log last changed before extracting it. */
+  conversationQuietMinutes: number;
+  /** A session that never goes quiet is still extracted this long after its last extraction. */
+  conversationMaxWaitMinutes: number;
+  /** A session with this many unextracted messages is extracted without waiting. */
+  maxDeltaChunks: number;
+  /** Already-extracted messages sent before the new ones, read only for context. */
+  overlapChunks: number;
+  /** Existing memories offered to the extractor so it can reuse or invalidate them. */
+  relatedMemories: number;
+}
+
+/** The daily AI re-check of flagged memories; see docs/operations.md#automatic-review. */
+export interface AutomaticReviewConfig {
+  enabled: boolean;
+  /** Memories sent to the investigator model per day, one request each. */
+  dailyItems: number;
+  /** Estimated input plus output tokens one daily run may spend. */
+  tokenBudget: number;
+  /** Verdicts applied without asking; corrections always wait for a person. */
+  applyVerdicts: Array<"current" | "obsolete" | "low_value">;
 }
 
 export interface ProjectConfig {
@@ -749,6 +861,14 @@ export interface ProjectConfig {
   retention?: RetentionConfig;
   deterministic: DeterministicConfig;
   investigator: InvestigatorConfig;
+  /** Optional so hand-built configs keep working; read it through extractionPolicy(). */
+  extraction?: ExtractionConfig;
+  /** Optional for the same reason; read it through automaticReviewPolicy(). */
+  review?: { automatic: AutomaticReviewConfig };
+  /** Per-job models; optional so hand-built configs keep working. Read it through jobModel(). */
+  models?: Record<AiJob, ResolvedModel>;
+  /** Daily token cap for background AI work; null means no cap. */
+  aiBudget?: { backgroundDailyTokens: number | null };
 }
 
 export interface InvestigationEntityRef {
@@ -913,6 +1033,8 @@ export interface InvestigationEntityLink {
 export interface InvestigationRunOptions {
   config?: ProjectConfig;
   investigatorProvider?: InvestigatorProvider;
+  /** Wraps each model call, e.g. so the MCP server can release the project lock while it waits. */
+  aroundModelCall?: <T>(call: () => Promise<T>) => Promise<T>;
 }
 
 export interface InvestigationResult {

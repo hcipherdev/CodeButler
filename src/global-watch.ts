@@ -115,6 +115,23 @@ export function recordCloudRunSuccess(root: string): void {
   catch { /* The watcher's next run rewrites this status anyway. */ }
 }
 
+/**
+ * Record an ingestion pass the desktop ran on request, in the same status file the watcher writes,
+ * so the project shows when its sources were last checked. The worst outcome wins.
+ */
+export function recordManualWatchRun(root: string, outcomes: OperationOutcome[]): WatchRunStatus {
+  const statusPath = join(globalWatchDirectory(), "status", `${projectKey(root)}.json`);
+  const previous = readJson<WatchRunStatus>(statusPath);
+  const worst = outcomes.find(item => item.outcome === "failed") ?? outcomes.find(item => item.outcome === "deferred") ?? outcomes[0] ?? { outcome: "success", stage: "ingestion" };
+  const checkedAt = new Date().toISOString();
+  const lastSuccessAt = worst.outcome === "success" ? checkedAt : previous?.lastSuccessAt ?? (previous?.ok ? previous.checkedAt : undefined);
+  const status: WatchRunStatus = { root, checkedAt, ok: worst.outcome === "success", outcome: worst.outcome, stage: worst.stage,
+    stages: { ...previous?.stages, [worst.stage]: worst }, ...(worst.reason && worst.outcome !== "success" ? { error: worst.reason } : {}), ...(lastSuccessAt ? { lastSuccessAt } : {}) };
+  try { atomicJson(statusPath, status); }
+  catch { /* The watcher's next pass rewrites this status anyway. */ }
+  return status;
+}
+
 /** A cloud retry is obsolete once a later success was recorded or the binding synced after it failed. */
 function cloudRecoveredSince(root: string, failedAt: number, saved: WatchRunStatus | undefined): boolean {
   if (saved?.ok && Date.parse(saved.checkedAt) > failedAt) return true;

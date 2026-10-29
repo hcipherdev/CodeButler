@@ -73,7 +73,8 @@ function runGit(repoPath: string | undefined, args: string[]): string | undefine
   try {
     const output = execFileSync(gitExecutable(), ["-C", repoPath, ...args], {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"]
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true
     }).trim();
     return output.length > 0 ? output : undefined;
   } catch {

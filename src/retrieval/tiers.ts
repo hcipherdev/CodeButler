@@ -6,7 +6,8 @@ import { sharingLabel } from "../memory/presentation.js";
 import { memoryMovement, type KnowledgeSnapshot } from "../memory/events.js";
 import { readMemoryKnowledge } from "../memory/knowledge.js";
 import { isPeerLayer } from "../memory/peer-layer.js";
-import { retrievalPolicy } from "./paths.js";
+import { canonicalRevisionParts } from "./canonical-revision.js";
+import { withReadCache } from "./read-cache.js";
 import type { MemorySearchResult, TemporaryMemory, MemoryQualityStatus } from "../types.js";
 import { withPublishedIndex, freshness, RetrievalUnavailableError, type RetrievalFreshness, type Publication } from "./index.js";
 export type MemoryTier = "working" | "candidates" | "durable" | "verified";
@@ -172,6 +173,62 @@ export function readCanonicalTierPage(store: MemoryStore, input: TierInput = {},
     const ownsSnapshot = !store.db.isTransaction;
     if (ownsSnapshot)
         store.db.exec("begin");
+    try {
+        const publication = canonicalPublication(store, now);
+        const finish = (db: DatabaseSync): TierPage => {
+            const page = tierPage(db, store.paths.rootDir, publication, input, now);
+            return { ...page, freshness: { ...page.freshness, refreshing: false } };
+        };
+        // Inside a caller's transaction a rollback can reuse a change sequence for different rows,
+        // so only a snapshot this read owns may be served from or stored in the cache.
+        if (!ownsSnapshot) {
+            const db = withReadCache(() => buildCanonicalIndex(store, now));
+            try { return finish(db); }
+            finally { db.close(); }
+        }
+        return finish(cachedCanonicalIndex(store, publication.revision, now));
+    }
+    finally {
+        if (ownsSnapshot)
+            store.db.exec("rollback");
+    }
+}
+interface CanonicalIndex {
+    root: string;
+    revision: string;
+    db: DatabaseSync;
+}
+const CANONICAL_INDEX_LIMIT = 3;
+/** Most recently used last. Long-lived readers reuse an index until any journaled canonical change. */
+const canonicalIndexes: CanonicalIndex[] = [];
+/**
+ * Triggers journal every table the tier records and their quality depend on into retrieval_changes,
+ * and the revision also carries the quality and privacy policy, so an unchanged revision means an
+ * unchanged index. Expiry and movement windows are applied at query time against `now`.
+ */
+function cachedCanonicalIndex(store: MemoryStore, revision: string, now: string): DatabaseSync {
+    const root = store.paths.rootDir;
+    const at = canonicalIndexes.findIndex(entry => entry.root === root);
+    if (at >= 0) {
+        const [entry] = canonicalIndexes.splice(at, 1);
+        if (entry!.revision === revision) {
+            canonicalIndexes.push(entry!);
+            return entry!.db;
+        }
+        entry!.db.close();
+    }
+    const db = withReadCache(() => buildCanonicalIndex(store, now));
+    canonicalIndexes.push({ root, revision, db });
+    while (canonicalIndexes.length > CANONICAL_INDEX_LIMIT)
+        canonicalIndexes.shift()!.db.close();
+    return db;
+}
+/** Test hook: drop cached canonical indexes. */
+export function clearCanonicalIndexCache(): void {
+    while (canonicalIndexes.length)
+        canonicalIndexes.pop()!.db.close();
+}
+function buildCanonicalIndex(store: MemoryStore, now: string): DatabaseSync {
     const db = new DatabaseSync(":memory:");
     try {
         const promoted = store.listMemories({ qualityStatus: "all", lifecycleStatus: "all", layer: "all", owner: "any", limit: null });
@@ -195,23 +252,15 @@ export function readCanonicalTierPage(store: MemoryStore, input: TierInput = {},
             const payload = { ...memory, peer, sharing: sharingLabel(memory.layer, peer) };
             insert.run("temporary", id, [memory.title, memory.summary, memory.details, ...memory.relatedFiles].join(" ").toLowerCase(), memory.kind, "active", "current", memory.layer ?? "core", peer ? 1 : 0, 0, memory.updatedAt, memory.createdAt, JSON.stringify(payload), memory.expiresAt, 0);
         }
-        const page = tierPage(db, store.paths.rootDir, canonicalPublication(store, now), input, now);
-        return { ...page, freshness: { ...page.freshness, refreshing: false } };
+        return db;
     }
-    finally {
+    catch (error) {
         db.close();
-        if (ownsSnapshot)
-            store.db.exec("rollback");
+        throw error;
     }
 }
 function canonicalPublication(store: MemoryStore, now: string): Publication {
-    const identity = (store.db.prepare("select id from retrieval_identity").get() as {
-        id: string;
-    }).id;
-    const sequence = Number((store.db.prepare("select coalesce(max(sequence),0) n from retrieval_changes").get() as {
-        n: number;
-    }).n);
-    const policy = retrievalPolicy(store.paths.rootDir);
+    const { identity, sequence, policy } = canonicalRevisionParts(store);
     return { format: 3, identity, sequence, policy, epoch: "canonical", indexedAt: now, revision: identity + ":" + sequence + ":" + policy, health: {}, summary: {} };
 }
 export function readCanonicalFreshness(store: MemoryStore, now = new Date().toISOString()): RetrievalFreshness {

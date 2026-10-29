@@ -25,6 +25,26 @@ Project-specific rules can be added in `.code-butler/config.json`:
 
 Unsafe regular expressions are rejected when configuration loads. Code Butler never offers an unredacted remote-embedding mode.
 
+## Remote AI models
+
+LLM extraction, investigation, review and summary enrichment send redacted coding-agent transcripts, commit messages and diffs to a model provider. Code Butler does this only for a provider you chose:
+
+- a connection saved in the desktop app's AI models settings;
+- an `extractor`, `investigator` or profile block you wrote in a Code Butler config file;
+- a local server (`localhost` or a loopback address), which needs no opt-in.
+
+The built-in default (OpenAI, using `OPENAI_API_KEY`) stays off when its key merely sits in your shell environment, even though many developers export that variable for other tools. Putting the key in Code Butler's own `.env` file counts as choosing it. To allow the default for one project on this device:
+
+```bash
+code-butler config remote-models on    # or: code-butler init --allow-remote-models
+code-butler config remote-models off
+code-butler config remote-models status
+```
+
+The choice is stored as `privacy.allowRemoteModels` in `.code-butler/config.local.json`, which is never synced. `code-butler init` asks on a terminal; MCP auto-setup and the background watcher never turn it on. `code-butler doctor` reports when the default model is waiting for this opt-in. Projects where extraction already ran on this device before the opt-in existed are recorded as opted in once, on their next sync.
+
+Deterministic directives, manual decisions, Git and log import, and search work without any model.
+
 ## Administrative commands
 
 ```bash

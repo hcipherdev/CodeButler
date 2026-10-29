@@ -25,3 +25,19 @@ it.skipIf(!existsSync(executable) || !["win32", "darwin"].includes(process.platf
   expect((await security.status()).device!.id).toBe(deviceId); expect(await security.invoke("sync-read", { checkoutId })).toEqual(journal);
   expect(await security.invoke("tokens-read")).toMatchObject({ accountId: account });
 });
+it.skipIf(!existsSync(executable) || !["win32", "darwin"].includes(process.platform))("restores the stored account profile when logout separates two account sign-ins", async () => {
+  vi.stubEnv("CODE_BUTLER_HOME", temp()); const security = new NativeSecurity(temp(), executable), account = randomUUID(), other = randomUUID(), deviceId = randomUUID();
+  const tokens = (accountId: string) => ({ accountId, accessToken: "ephemeral-test-token", refreshToken: "ephemeral-test-refresh", accessExpiresAt: Date.now() + 60_000 });
+  await security.invoke("device-create", { accountId: account, deviceId, installationId: randomUUID(), label: "Logout profile test" });
+  await security.invoke("tokens-save", { tokens: tokens(account) });
+  await security.invoke("tokens-save", { tokens: tokens(other) });
+  await security.invoke("logout");
+  await security.invoke("tokens-save", { tokens: tokens(account) });
+  expect((await security.status()).device!.id).toBe(deviceId);
+  await security.invoke("logout");
+  await security.invoke("tokens-save", { tokens: tokens(other) });
+  expect((await security.status()).device).toBeNull();
+  await security.invoke("logout");
+  await security.invoke("tokens-save", { tokens: tokens(account) });
+  expect((await security.status()).device!.id).toBe(deviceId);
+});

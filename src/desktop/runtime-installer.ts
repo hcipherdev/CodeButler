@@ -277,10 +277,10 @@ function managedProcessInventory(roots: string[]): ManagedProcess[] {
     try {
       const executable = process.platform === "linux"
         ? realpathSync(`/proc/${record.pid}/exe`)
-        : execFileSync("ps", ["-ww", "-p", String(record.pid), "-o", "comm="], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+        : execFileSync("ps", ["-ww", "-p", String(record.pid), "-o", "comm="], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).trim();
       const commandLine = process.platform === "linux"
         ? readFileSync(`/proc/${record.pid}/cmdline`, "utf8").replaceAll("\0", " ")
-        : execFileSync("ps", ["-ww", "-p", String(record.pid), "-o", "args="], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+        : execFileSync("ps", ["-ww", "-p", String(record.pid), "-o", "args="], { encoding: "utf8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }).trim();
       if (realpathSync(executable) !== realpathSync(record.executable) ||
         !roots.some(root => containedBy(executable, root) && containedBy(record.entrypoint, root)) ||
         !commandLine.includes(record.entrypoint)) return [];
@@ -383,7 +383,7 @@ function isPidPresent(pid: number): boolean {
     // A Unix child remains visible until its parent reaps it, even though it
     // has already exited. In particular, kill(pid, 0) succeeds for zombies.
     if (process.platform === "linux") return readFileSync(`/proc/${pid}/stat`, "utf8").split(") ").at(-1)?.[0] !== "Z";
-    if (process.platform === "darwin") return !execFileSync("ps", ["-p", String(pid), "-o", "stat="], {encoding:"utf8", timeout:5000, stdio:["ignore", "pipe", "ignore"]}).trim().startsWith("Z");
+    if (process.platform === "darwin") return !execFileSync("ps", ["-p", String(pid), "-o", "stat="], {encoding:"utf8", timeout:5000, stdio:["ignore", "pipe", "ignore"], windowsHide:true}).trim().startsWith("Z");
   } catch { /* An unavailable query is not evidence that a process is dead. */ }
   return true;
 }

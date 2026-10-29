@@ -663,16 +663,23 @@ function decideCoreCandidate(
   // only an AI verdict on a memory it did not write corroborates.
   const aiWritten = memory.dedupeKey.startsWith(AI_REPLACEMENT_PREFIX);
   const aiVerified = verified?.actor === "ai" && !aiWritten;
+  // The correction itself is that review's verdict on the original's evidence. Without
+  // carrying it over, the original is quarantined and its replacement can never promote.
+  const aiCorrected = aiWritten && hasCurrentAiCorrection(store, memory.id);
   if (humanVerified) {
     reasonCodes.push("human_verified");
   } else if (independentSources && memory.confidence >= config.promotion.confidenceThreshold) {
     reasonCodes.push("independent_sources", "meets_confidence_threshold");
   } else if (aiVerified && memory.confidence >= (policy.singleSourceMinConfidence ?? 0.9)) {
     reasonCodes.push("ai_verified_current", "meets_single_source_confidence");
+  } else if (aiCorrected && memory.confidence >= (policy.singleSourceMinConfidence ?? 0.9)) {
+    reasonCodes.push("ai_corrected_replacement", "meets_single_source_confidence");
   } else if (independentSources) {
     return skip("independent_sources", "below_confidence_threshold");
   } else if (aiVerified) {
     return skip("ai_verified_current", "below_single_source_confidence");
+  } else if (aiCorrected) {
+    return skip("ai_corrected_replacement", "below_single_source_confidence");
   } else if (verified?.actor === "ai" && aiWritten) {
     return skip("ai_self_verified");
   } else {
@@ -804,6 +811,24 @@ function markNeedsReview(store: MemoryStore, decision: AutomaticPromotionDecisio
 
 function promotionReason(decision: AutomaticPromotionDecision): string {
   return `Automatic promotion to core (policy v${decision.policyVersion}): ${decision.reasonCodes.join(", ")}.`;
+}
+
+/**
+ * An AI correction, not reverted, that wrote this candidate as the replacement of
+ * another. A rewrite of a legacy docs-heading or config-key record is still that
+ * record's low-signal content in other words, so it does not count.
+ */
+function hasCurrentAiCorrection(store: MemoryStore, candidateId: string): boolean {
+  return store.db.prepare(
+    `select 1 from memory_review_resolutions r
+       join memory_candidates original on original.id = r.memory_id
+      where r.replacement_memory_id = ? and r.replacement_category = 'candidate'
+        and r.action = 'correct' and r.actor = 'ai' and r.category = 'candidate'
+        and original.dedupe_key not like 'deterministic:docs:%'
+        and original.dedupe_key not like 'deterministic:config:%'
+        and not exists (select 1 from memory_review_resolution_compensations c where c.resolution_id = r.id)
+      limit 1`
+  ).get(candidateId) !== undefined;
 }
 
 function findSuppressingReview(

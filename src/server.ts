@@ -1,9 +1,11 @@
 import { binding, readJson } from "./cloud/state.js";
+import { withAiTrigger } from "./ai/usage.js";
 import { buildRulesCatalog, getApplicableRules, GLOBAL_RULES_INSTRUCTIONS } from "./rules/match.js";
 import { recordAttestation, type RecordAttestationInput } from "./rules/attestations.js";
 import { retrievalEnabled } from "./retrieval/paths.js";
 import { createPublishedMemoryServer } from "./retrieval/mcp.js";
 import { localCloudChangeStamp, projectOperation, startCloudScheduler, type CloudScheduler } from "./cloud/client.js";
+import { releaseProjectGateDuring } from "./cloud/gate.js";
 import { automaticSyncStatus, requestLocalChangeSync } from "./cloud/sync-owner.js";
 import { buildInfo, newRuntimeRecord, registerRuntime } from "./runtime.js";
 import { createProjectMemoryToolHandlers, registerProjectMemoryHandlers, readCurrentProjectInfo, type ProjectMemoryToolHandlers } from "./mcp/tools.js";
@@ -146,7 +148,7 @@ export async function createProjectMemoryServer(
         try {
           bootstrap.init();
           const config = loadProjectConfig(rootDir);
-          if (config.sync.autoSyncOnServerStart) await syncProjectMemory(bootstrap, config);
+          if (config.sync.autoSyncOnServerStart) await withAiTrigger("background", () => syncProjectMemory(bootstrap, config));
         } finally { bootstrap.close(); }
       }, { name: "MCP startup sync" });
       if (automaticSyncStatus(rootDir).lastLocalStamp !== localCloudChangeStamp(rootDir)) requestLocalChangeSync(rootDir);
@@ -172,7 +174,9 @@ export async function createProjectMemoryServer(
           const current = openConfiguredMemoryStore(rootDir);
           try {
             current.init();
-            const live = createProjectMemoryToolHandlers(current, { rootDir, startupMetadata, clientInfo: () => server.server.getClientVersion() });
+            const live = createProjectMemoryToolHandlers(current, { rootDir, startupMetadata, clientInfo: () => server.server.getClientVersion(),
+              // Model calls can take minutes; other local work may use the project meanwhile.
+              aroundModelCall: call => releaseProjectGateDuring(rootDir, call) });
             const handler = Reflect.get(live, name) as (...values: unknown[]) => unknown;
             return await handler(...args);
           } finally { current.close(); }
@@ -193,7 +197,7 @@ export async function createProjectMemoryServer(
   store.init();
   const config = loadProjectConfig(rootDir);
   const runStartupSync = async (): Promise<void> => runStartup(async () => {
-    if (config.sync.autoSyncOnServerStart) await syncProjectMemory(store, config);
+    if (config.sync.autoSyncOnServerStart) await withAiTrigger("background", () => syncProjectMemory(store, config));
   });
   if (!options.deferStartupSync) await runStartupSync();
   const server = new McpServer({

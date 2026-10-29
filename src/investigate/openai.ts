@@ -1,3 +1,4 @@
+import { chatCompletion } from "../ai/chat.js";
 import { SCOPE_GUIDANCE } from "../memory/scope.js";
 import {
   investigationPlanDecisionSchema,
@@ -73,33 +74,14 @@ async function requestJsonContent(
   systemPrompt: string,
   payload: Record<string, unknown>
 ): Promise<string> {
-  const baseUrl = config.baseUrl ?? "https://api.openai.com/v1";
-  const response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${process.env[config.apiKeyEnv] ?? ""}`
-    },
-    body: JSON.stringify({
-      model: config.model,
-      temperature: 0,
-      messages: [
-        {
-          role: "system",
-          content: systemPrompt
-        },
-        {
-          role: "user",
-          content: JSON.stringify(payload)
-        }
-      ]
-    })
-  });
-  if (!response.ok) {
-    throw new Error(`Investigator request failed with status ${response.status}`);
-  }
-
-  return readCompletionContent(await response.json());
+  const { content } = await chatCompletion(config, {
+    job: "investigator",
+    system: systemPrompt,
+    user: JSON.stringify(payload),
+    errorLabel: "Investigator",
+    invalidResponseMessage: "Invalid investigator response"
+  }, { fetchImpl });
+  return content;
 }
 
 function summarizePlannerState(state: InvestigationPlannerState): Record<string, unknown> {
@@ -176,29 +158,4 @@ function summarizePlannerState(state: InvestigationPlannerState): Record<string,
       status: step.status
     }))
   };
-}
-
-function readCompletionContent(payload: unknown): string {
-  const record = asRecord(payload);
-  const choices = Array.isArray(record?.choices) ? record.choices : [];
-  const first = asRecord(choices[0]);
-  const message = asRecord(first?.message);
-  if (typeof message?.content === "string") return message.content;
-  if (Array.isArray(message?.content)) {
-    const joined = message.content
-      .map((item) => {
-        const part = asRecord(item);
-        return typeof part?.text === "string" ? part.text : "";
-      })
-      .join("\n")
-      .trim();
-    if (joined) return joined;
-  }
-  throw new Error("Invalid investigator response");
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }

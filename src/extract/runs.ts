@@ -16,6 +16,8 @@ export interface ExtractionRun {
   /** Memories the model returned, before any validation. */
   returned: number;
   candidates: number;
+  /** Of `candidates`, how many added evidence to a candidate that already held the fact. */
+  merged?: number | undefined;
   promoted: number;
   /** Rejection reason → count; extractor-format reasons are bare, quality reasons are `quality:` prefixed. */
   rejections: Record<string, number>;
@@ -38,9 +40,9 @@ export function recordExtractionRun(localDatabasePath: string, run: Omit<Extract
   try {
     const db = openLocalMemoryDatabase(localDatabasePath);
     try {
-      db.prepare(`insert into extraction_runs(id,started_at,finished_at,channel,provider,model,source_ids_json,returned,candidates,promoted,rejections_json,error)
-        values(?,?,?,?,?,?,?,?,?,?,?,?)`).run(randomUUID(), run.startedAt, run.finishedAt, run.channel, run.provider ?? null, run.model ?? null,
-        JSON.stringify(run.sourceIds), run.returned, run.candidates, run.promoted, JSON.stringify(run.rejections), run.error ?? null);
+      db.prepare(`insert into extraction_runs(id,started_at,finished_at,channel,provider,model,source_ids_json,returned,candidates,merged,promoted,rejections_json,error)
+        values(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(randomUUID(), run.startedAt, run.finishedAt, run.channel, run.provider ?? null, run.model ?? null,
+        JSON.stringify(run.sourceIds), run.returned, run.candidates, run.merged ?? 0, run.promoted, JSON.stringify(run.rejections), run.error ?? null);
     } finally { db.close(); }
   } catch { /* Diagnostic only. */ }
 }
@@ -54,7 +56,7 @@ export function listExtractionRuns(localDatabasePath: string, since?: string): E
       channel: row.channel as ExtractionRun["channel"],
       ...(row.provider ? { provider: String(row.provider) } : {}), ...(row.model ? { model: String(row.model) } : {}),
       sourceIds: JSON.parse(String(row.source_ids_json)) as string[],
-      returned: Number(row.returned), candidates: Number(row.candidates), promoted: Number(row.promoted),
+      returned: Number(row.returned), candidates: Number(row.candidates), merged: Number(row.merged ?? 0), promoted: Number(row.promoted),
       rejections: JSON.parse(String(row.rejections_json)) as Record<string, number>,
       ...(row.error ? { error: String(row.error) } : {})
     }));

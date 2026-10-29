@@ -1,10 +1,8 @@
-import type { InvestigatorConfig } from "../types.js";
-import {
-  anthropicAwsRequestConfig,
-  readAnthropicAwsText,
-  runAnthropicAwsMessage,
-  type AnthropicAwsHttpClient
-} from "../providers/anthropic-aws.js";
+import type { AiJob, ExtractorConfig, InvestigatorConfig, ProjectConfig } from "../types.js";
+import { jobModel } from "../ai/models.js";
+import { chatCompletion } from "../ai/chat.js";
+import { credentialStatus } from "../ai/credentials.js";
+import type { AnthropicAwsHttpClient } from "../providers/anthropic-aws.js";
 
 export interface ReconciliationModelRequest {
   signal?: AbortSignal;
@@ -23,91 +21,59 @@ export interface ReconciliationModelResponse {
 export interface MemoryReconciliationProvider {
   provider: string;
   model: string;
+  /** The AI settings connection name, for "Runs on" labels; absent for legacy settings. */
+  connectionLabel?: string | undefined;
+  connectionId?: string | undefined;
   request(input: ReconciliationModelRequest): Promise<ReconciliationModelResponse>;
 }
 
-export function assertReconciliationProviderConfigured(config: InvestigatorConfig): void {
-  if (!config.enabled) throw new Error("AI memory reconciliation requires an enabled investigator provider");
+type ReviewerConfig = (ExtractorConfig | InvestigatorConfig) & { enabled?: boolean | undefined };
+
+export function assertReconciliationProviderConfigured(config: ReviewerConfig): void {
+  if (config.enabled === false) throw new Error("AI memory reconciliation requires an enabled investigator provider");
   if (!config.model.trim()) throw new Error("AI memory reconciliation requires an investigator model");
-  requiredEnvironment(config.apiKeyEnv, "investigator API key");
-  if (config.provider === "anthropic-aws") {
-    requiredEnvironment(config.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID", "Anthropic AWS workspace ID");
-    requiredEnvironment(config.regionEnv ?? "AWS_REGION", "AWS region");
-  }
+  const status = credentialStatus(config);
+  if (!status.ok) throw new Error(`AI memory reconciliation credentials are missing; set ${status.missing.join(", ")} or add the key in Code Butler's AI models settings`);
 }
 
+/** The model a review-style job runs on, ready to use. */
+export function reviewProviderFor(config: Pick<ProjectConfig, "models" | "extractor" | "investigator">, job: AiJob): MemoryReconciliationProvider {
+  return createMemoryReconciliationProvider(jobModel(config, job), { job });
+}
+
+export function assertJobConfigured(config: Pick<ProjectConfig, "models" | "extractor" | "investigator">, job: AiJob): void {
+  assertReconciliationProviderConfigured(jobModel(config, job));
+}
+
+/** Review, wording, consolidation and rule drafting share this JSON request shape; `job` labels the usage. */
 export function createMemoryReconciliationProvider(
-  config: InvestigatorConfig,
-  options: { fetchImpl?: typeof fetch | undefined; anthropicHttpClient?: AnthropicAwsHttpClient | undefined } = {}
+  config: ReviewerConfig,
+  options: { fetchImpl?: typeof fetch | undefined; anthropicHttpClient?: AnthropicAwsHttpClient | undefined; job?: AiJob | undefined } = {}
 ): MemoryReconciliationProvider {
   assertReconciliationProviderConfigured(config);
-  if (config.provider === "anthropic-aws") {
-    return {
-      provider: config.provider,
-      model: config.model,
-      async request(input) {
-        const base = anthropicAwsRequestConfig({ ...config, maxTokens: input.maxTokens });
-        const response = await runAnthropicAwsMessage({
-          ...base,
-          maxTokens: input.maxTokens,
-          signal: input.signal,
-          system: input.system,
-          messages: [{ role: "user", content: JSON.stringify(input.payload) }]
-        }, options.anthropicHttpClient);
-        const content = readAnthropicAwsText(response);
-        return { content };
-      }
-    };
-  }
-
-  const fetchImpl = options.fetchImpl ?? fetch;
   return {
     provider: config.provider,
     model: config.model,
+    ...(config.connectionLabel ? { connectionLabel: config.connectionLabel } : {}),
+    ...(config.connectionId ? { connectionId: config.connectionId } : {}),
     async request(input) {
-      const baseUrl = config.baseUrl ?? "https://api.openai.com/v1";
-      const response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-        ...(input.signal ? { signal: input.signal } : {}),
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${process.env[config.apiKeyEnv] ?? ""}`
-        },
-        body: JSON.stringify({
-          model: config.model,
-          temperature: 0,
-          max_tokens: input.maxTokens,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: input.system },
-            { role: "user", content: JSON.stringify(input.payload) }
-          ]
-        })
-      });
-      if (!response.ok) throw new Error(`Memory reconciliation request failed with status ${response.status}`);
-      const body = asRecord(await response.json());
-      const choices = Array.isArray(body?.choices) ? body.choices : [];
-      const message = asRecord(asRecord(choices[0])?.message);
-      const content = typeof message?.content === "string" ? message.content : undefined;
-      if (!content) throw new Error("Invalid memory reconciliation response");
-      const usage = asRecord(body?.usage);
+      const result = await chatCompletion(config, {
+        job: options.job ?? "review",
+        system: input.system,
+        user: JSON.stringify(input.payload),
+        maxTokens: input.maxTokens,
+        sendMaxTokens: true,
+        // Anthropic has no JSON mode; its prompts already ask for strict JSON.
+        jsonMode: config.provider === "openai-compatible",
+        signal: input.signal,
+        errorLabel: "Memory reconciliation",
+        invalidResponseMessage: "Invalid memory reconciliation response"
+      }, { fetchImpl: options.fetchImpl, anthropicHttpClient: options.anthropicHttpClient });
       return {
-        content,
-        ...(typeof usage?.prompt_tokens === "number" ? { inputTokens: usage.prompt_tokens } : {}),
-        ...(typeof usage?.completion_tokens === "number" ? { outputTokens: usage.completion_tokens } : {})
+        content: result.content,
+        ...(result.inputTokens !== undefined ? { inputTokens: result.inputTokens } : {}),
+        ...(result.outputTokens !== undefined ? { outputTokens: result.outputTokens } : {})
       };
     }
   };
-}
-
-function requiredEnvironment(name: string, label: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`AI memory reconciliation ${label} is missing; set ${name}`);
-  return value;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
 }

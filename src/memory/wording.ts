@@ -13,10 +13,10 @@ import type { MemoryStore } from "../storage/store.js";
 import { withTransaction } from "../storage/transactions.js";
 import type { MemoryStatement } from "../types.js";
 import { assessClaim, createStatement, resolveStatement } from "./statement.js";
-import { createMemoryReviewContext, effectiveTerminalMemoryReview } from "./review-state.js";
+import { acceptsReviewToken, createMemoryReviewContext, effectiveTerminalMemoryReview } from "./review-state.js";
 import { isPeerLayer } from "./peer-layer.js";
 import { recordMemoryEvent } from "./events.js";
-import { createMemoryReconciliationProvider } from "./reconciliation-provider.js";
+import { reviewProviderFor } from "./reconciliation-provider.js";
 import type { MemoryReconciliationDependencies, MemoryReconciliationItem, MemoryReconciliationRun } from "./reconciliation.js";
 export type WordingSelection = {
     kind: "single";
@@ -70,9 +70,9 @@ export function previewMemoryWording(root: string, selection: WordingSelection, 
     store.init();
     try {
         const chosen = targets(store, selection);
-        const provider = deps.provider ?? createMemoryReconciliationProvider(loadProjectConfig(root).investigator);
+        const provider = deps.provider ?? reviewProviderFor(loadProjectConfig(root), "wording");
         const minimum = chosen.reduce((n, t) => n + Math.ceil(JSON.stringify(resolveStatement(t.m)).length / 4) + Math.ceil(SYSTEM.length / 4) + 1400, 0);
-        return { selected: chosen.length, selectionFingerprint: hash(chosen.map(t => ({ category: t.selection.category, id: t.m.id, token: t.context.reviewToken }))), modelItems: chosen.length, deterministicItems: 0, provider: provider.provider, model: provider.model, estimatedTokens: { minimum, maximum: minimum * 2, suggestedCap: Math.ceil(minimum * 1.5) } };
+        return { selected: chosen.length, selectionFingerprint: hash(chosen.map(t => ({ category: t.selection.category, id: t.m.id, token: t.context.reviewToken }))), modelItems: chosen.length, deterministicItems: 0, provider: provider.provider, model: provider.model, ...(provider.connectionLabel ? { connectionLabel: provider.connectionLabel } : {}), estimatedTokens: { minimum, maximum: minimum * 2, suggestedCap: Math.ceil(minimum * 1.5) } };
     }
     finally {
         store.close();
@@ -114,7 +114,7 @@ export async function runMemoryWording(root: string, input: {
         const store = openConfiguredMemoryStore(root);
         store.init();
         try {
-            const at = now(deps), provider = deps.provider ?? createMemoryReconciliationProvider(loadProjectConfig(root).investigator);
+            const at = now(deps), provider = deps.provider ?? reviewProviderFor(loadProjectConfig(root), "wording");
             let run: WordingRun;
             if (input.continueRunId) {
                 const row = store.localDb.prepare("select data_json from memory_wording_runs where id=?").get(input.continueRunId) as {
@@ -152,7 +152,7 @@ export async function runMemoryWording(root: string, input: {
             for (const item of run.items.filter(i => i.state === "pending"))
                 try {
                     const m = readTarget(store, item.memoryId, item.category);
-                    if (createMemoryReviewContext(store, item.category, m).reviewToken !== item.reviewToken)
+                    if (!acceptsReviewToken(createMemoryReviewContext(store, item.category, m), item.reviewToken))
                         throw new Error("Memory changed before continuation");
                     payloads.set(item.itemId, { text: item.wording.before.text, fields: item.wording.before.fields, type: m.type });
                 }

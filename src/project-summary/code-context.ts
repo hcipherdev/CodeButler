@@ -204,7 +204,8 @@ export function readTrackedPaths(rootDir: string): ReadonlySet<string> {
     const output = execFileSync(gitExecutable(), ["-C", rootDir, "ls-files", "-z"], {
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"]
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true
     });
     const trackedPaths = output
       .split("\0")
@@ -621,7 +622,8 @@ function runCheckIgnore(rootDir: string, paths: string[]): ReadonlySet<string> |
       encoding: "utf8",
       input: `${paths.join("\0")}\0`,
       maxBuffer: 64 * 1024 * 1024,
-      stdio: ["pipe", "pipe", "ignore"]
+      stdio: ["pipe", "pipe", "ignore"],
+      windowsHide: true
     }
   );
   if (result.error || (result.status !== 0 && result.status !== 1)) return undefined;

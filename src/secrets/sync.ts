@@ -9,6 +9,8 @@ import { readEncryptedCache, saveEncryptedCache } from "../cloud/encrypted-coord
 import { EMPTY_PIN, type RevisionPin } from "../cloud/encrypted-protocol.js";
 import type { EncryptedBundle } from "../cloud/encrypted-snapshot.js";
 import { withProjectGate } from "../cloud/gate.js";
+import { classifyCloudSyncError } from "../cloud/condition.js";
+import { OperationDeferredError } from "../cloud/outcome.js";
 import { assertCheckoutReady } from "../cloud/checkout-path.js";
 import { NativeSecurity } from "../cloud/native-security.js";
 import { UUID, atomicJson, stateDirectory, readJson, sha256 } from "../cloud/state.js";
@@ -174,6 +176,20 @@ export async function linkSecretsVault(root: string, vaultId: string): Promise<S
   }, { name: "Link secrets vault" });
 }
 
+/**
+ * Why a secrets sync stopped without anything being wrong with the secrets: another Butler operation
+ * held the project, or the cloud could not be reached. Both clear on their own, so they are retried
+ * rather than shown as an error.
+ */
+export type SecretsSyncInterruption = "busy" | "offline";
+export function secretsSyncInterruption(error: unknown): SecretsSyncInterruption | undefined {
+  if (error instanceof OperationDeferredError || error instanceof EncryptionError && error.state === "lease-expired") return "busy";
+  if (error instanceof EncryptionError || error instanceof SecretFolderError) return undefined;
+  return classifyCloudSyncError(error).condition === "offline-network" ? "offline" : undefined;
+}
+/** Error states that name a condition and never a path or value, so they are safe to keep in local state. */
+const NAMED_FAILURES = new Set(["authentication", "conflict", "upgrade-required", "integrity-failure"]);
+
 export async function encryptedSecretsSync(root: string, capturedAccount?: AccountClient): Promise<SecretSyncStatus> {
   assertCheckoutReady(root);
   const initial = secretBinding(root);
@@ -239,10 +255,19 @@ export async function encryptedSecretsSync(root: string, capturedAccount?: Accou
     }, { name: "Encrypted secrets sync" });
   } catch (error) {
     const current = secretBinding(root);
+    const interruption = secretsSyncInterruption(error);
     if (current?.enabled && current.vaultId === initial.vaultId && current.status !== "conflict") {
-      // A folder problem keeps its explanation; it stays in local state and the desktop card, never watcher logs.
-      current.status = "error";
-      current.error = error instanceof SecretFolderError ? error.message : error instanceof EncryptionError ? error.state : "sync-failed";
+      if (interruption) {
+        // Nothing failed: put back what the binding said before this attempt and let the next one run.
+        current.status = initial.status === "syncing" ? "ready" : initial.status;
+        if (initial.error === undefined) delete current.error; else current.error = initial.error;
+      } else {
+        // A folder problem keeps its explanation; it stays in local state and the desktop card, never watcher logs.
+        const classified = classifyCloudSyncError(error).condition;
+        current.status = "error";
+        current.error = error instanceof SecretFolderError ? error.message : error instanceof EncryptionError ? error.state
+          : NAMED_FAILURES.has(classified) ? classified : "sync-failed";
+      }
       delete current.phase;
       saveSecretBinding(root, current);
     }

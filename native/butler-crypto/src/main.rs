@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use zeroize::{Zeroize, Zeroizing};
+mod credentials;
 mod custody;
 mod identity;
 
@@ -152,7 +153,12 @@ fn run() -> Result<()> {
     if value["version"] != 1 || value.get("directory").is_none() {
         return Err("incompatible-format".into());
     }
-    let result = identity::process(&value);
+    let operation = value["operation"].as_str().unwrap_or_default().to_string();
+    let result = if credentials::handles(&operation) {
+        credentials::process(&value)
+    } else {
+        identity::process(&value)
+    };
     custody::wipe(&mut value);
     let mut output = json!({"version":1,"result":result?});
     let encoded = Zeroizing::new(serde_json::to_vec(&output)?);

@@ -36,12 +36,15 @@ export function extractionOutputGuidance(maxTokens: number): string {
 export function extractionBatches(context: ExtractorContext): ExtractorContext[] {
   return splitContext({
     conversations: context.conversations.map(sanitizeConversation),
-    commits: context.commits
+    commits: context.commits,
+    ...(context.existingMemories?.length ? { existingMemories: context.existingMemories } : {})
   });
 }
 
+/** Every split batch repeats the existing memories, so each can relate what it finds to them. */
 function splitContext(context: ExtractorContext): ExtractorContext[] {
   if (Buffer.byteLength(JSON.stringify(context), "utf8") <= MAX_EXTRACTION_INPUT_BYTES) return [context];
+  const shared = context.existingMemories?.length ? { existingMemories: context.existingMemories } : {};
 
   if (context.conversations.length + context.commits.length > 1) {
     const units: ExtractorContext[] = [
@@ -51,7 +54,8 @@ function splitContext(context: ExtractorContext): ExtractorContext[] {
     const midpoint = Math.ceil(units.length / 2);
     const combine = (items: ExtractorContext[]): ExtractorContext => ({
       conversations: items.flatMap(item => item.conversations),
-      commits: items.flatMap(item => item.commits)
+      commits: items.flatMap(item => item.commits),
+      ...shared
     });
     return [...splitContext(combine(units.slice(0, midpoint))), ...splitContext(combine(units.slice(midpoint)))];
   }
@@ -62,22 +66,22 @@ function splitContext(context: ExtractorContext): ExtractorContext[] {
     if (chunks.length > 1) {
       const midpoint = Math.ceil(chunks.length / 2);
       return [chunks.slice(0, midpoint), chunks.slice(midpoint)].flatMap(part =>
-        splitContext({ conversations: [{ ...conversation, chunks: part }], commits: [] }));
+        splitContext({ conversations: [{ ...conversation, chunks: part }], commits: [], ...shared }));
     }
     if (chunks[0]) {
       return splitText(chunks[0].text).flatMap(text => splitContext({
-        conversations: [{ ...conversation, chunks: [{ ...chunks[0]!, text }] }], commits: []
+        conversations: [{ ...conversation, chunks: [{ ...chunks[0]!, text }] }], commits: [], ...shared
       }));
     }
     return splitText(conversation.rawContent).flatMap(rawContent =>
-      splitContext({ conversations: [{ ...conversation, rawContent }], commits: [] }));
+      splitContext({ conversations: [{ ...conversation, rawContent }], commits: [], ...shared }));
   }
 
   const commit = context.commits[0];
   if (commit) {
     const field = commit.diffSummary.length >= commit.message.length ? "diffSummary" : "message";
     return splitText(commit[field]).flatMap(text =>
-      splitContext({ conversations: [], commits: [{ ...commit, [field]: text }] }));
+      splitContext({ conversations: [], commits: [{ ...commit, [field]: text }], ...shared }));
   }
   throw new Error("Extraction metadata exceeds the request size limit");
 }

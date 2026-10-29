@@ -36,7 +36,7 @@ export function ingestGitRepository(
 
 function readCommit(repoPath: string, hash: string, maxDiffChars: number): CommitRecord | undefined {
   const paths = execFileSync(gitExecutable(), ["show", "--format=", "--name-only", "--no-renames", "-z", hash],
-    { cwd: repoPath, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }).split("\0").filter(Boolean);
+    { cwd: repoPath, encoding: "utf8", maxBuffer: 10 * 1024 * 1024, windowsHide: true }).split("\0").filter(Boolean);
   if (!paths.length || paths.some(path => path.toLowerCase().startsWith("secrets/"))) return undefined;
   const changedFiles = paths.filter(path => !isSensitiveGitPath(path) && !isGeneratedMemoryPath(path));
   if (!changedFiles.length) return undefined;
@@ -68,7 +68,8 @@ function git(repoPath: string, args: string[]): string {
   return execFileSync(gitExecutable(), args, {
     cwd: repoPath,
     encoding: "utf8",
-    maxBuffer: 10 * 1024 * 1024
+    maxBuffer: 10 * 1024 * 1024,
+    windowsHide: true
   }).trim();
 }
 

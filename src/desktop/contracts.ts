@@ -55,11 +55,24 @@ export type DesktopRequest =
   | {version:1; action:"memory.promote-project"; root:string; id:string; category:"candidate"|"promoted"; reason:string}
   | { version: 1; action: "projects.list" }
   | { version: 1; action: "watcher.status" }
+  | { version: 1; action: "watcher.install" }
   | { version: 1; action: "watcher.runtime-details" }
   | { version: 1; action: "projects.inspect"; root: string }
   | { version: 1; action: "projects.add"; root: string; initialize?: boolean }
   | { version: 1; action: "projects.remove"; root: string; mode?: "list" | "local" | "everywhere"; confirmed?: boolean }
   | { version: 1; action: "project.overview"; root: string }
+  | { version: 1; action: "project.sources"; root: string }
+  | { version: 1; action: "project.sources.check"; root: string }
+  | { version: 1; action: "ai.clients.status"; root?: string }
+  | { version: 1; action: "ai.settings.read"; root?: string }
+  | { version: 1; action: "ai.settings.save"; root?: string; settings: import("../types.js").AiSettings }
+  | { version: 1; action: "ai.connection.setKey"; root?: string; connectionId: string; key: string; saveToEnv?: boolean }
+  | { version: 1; action: "ai.connection.removeKey"; root?: string; connectionId: string }
+  | { version: 1; action: "ai.connection.test"; connectionId: string }
+  | { version: 1; action: "ai.models.list"; connectionId: string }
+  | { version: 1; action: "update.check" }
+  | { version: 1; action: "update.download"; updateVersion: string }
+  | { version: 1; action: "ai.clients.connect"; client: import("./ai-clients.js").AiClient }
   | { version: 1; action: "cloud.sync.status"; root: string }
   | { version: 1; action: "cloud.projects.list"; refresh?: boolean }
   | { version: 1; action: "cloud.project.inspect"; root: string; refresh?: boolean }
@@ -170,7 +183,25 @@ export interface DesktopCloudStatus {
   conflictReason?: import("../cloud/state.js").Binding["conflictReason"];
   lastMerge?: import("../cloud/state.js").Binding["lastMerge"];
   deferredReason?: string;
+  /** The watcher's latest cloud run failed after the last completed sync, so the cloud copy is falling behind. */
+  failedReason?: string;
   timings?: AutomaticSyncStatus["timings"];
+}
+
+export interface DesktopProjectSources {
+  byType: Record<import("../types.js").SourceType, number>;
+  adapters: import("../types.js").SyncStatus[];
+  failures: import("../types.js").SourceFailure[];
+}
+
+export interface DesktopSourceCheck {
+  outcome: "success" | "deferred" | "failed";
+  reason?: string;
+  checkedAt: string;
+  imported: { git: number; codex: number; claude: number };
+  promoted: number;
+  pending: number;
+  waiting: number;
 }
 
 export interface DesktopProjectOverview {
@@ -185,6 +216,8 @@ export interface DesktopProjectOverview {
   tiers?: import("../retrieval/tiers.js").MemoryTierCounts;
   working?: import("../retrieval/tiers.js").WorkingMemory[];
   freshness?: import("../retrieval/index.js").RetrievalFreshness;
+  /** What clears review reminders without a person, so the overview can say what happens next. */
+  automation?: { aiReview: boolean; promotion: boolean };
 }
 
 export type DesktopResult =
@@ -228,6 +261,15 @@ export type DesktopResult =
   | DesktopProjectAddResult
   | DesktopProject
   | DesktopProjectOverview
+  | DesktopProjectSources
+  | DesktopSourceCheck
+  | import("./ai-clients.js").AiClientStatus
+  | import("./ai-settings.js").AiSettingsView
+  | import("./ai-settings.js").ConnectionTestResult
+  | import("./updater.js").UpdateStatus
+  | { version: string; file: string }
+  | Awaited<ReturnType<typeof import("./ai-settings.js").listConnectionModels>>
+  | import("./ai-clients.js").AiClientConnection
   | DesktopCloudStatus
   | import("../cloud/project-connections.js").CloudProjectList
   | import("../cloud/project-connections.js").ProjectConnectionInspection
@@ -270,7 +312,7 @@ export interface DesktopFailure {
 
 export type DesktopResponse<T extends DesktopResult = DesktopResult> = DesktopSuccess<T> | DesktopFailure;
 
-export function desktopCloudStatus(state: Binding | undefined, sync: AutomaticSyncStatus = { pending: false }, deferredReason?: string): DesktopCloudStatus {
+export function desktopCloudStatus(state: Binding | undefined, sync: AutomaticSyncStatus = { pending: false }, deferredReason?: string, failedReason?: string): DesktopCloudStatus {
   if (!state) return { enabled: false, status: "not-configured" };
   const result: DesktopCloudStatus = {
     enabled: state.enabled,
@@ -290,6 +332,7 @@ export function desktopCloudStatus(state: Binding | undefined, sync: AutomaticSy
   if (state.conflictReason !== undefined) result.conflictReason = state.conflictReason;
   if (state.lastMerge !== undefined) result.lastMerge = state.lastMerge;
   if (deferredReason !== undefined) result.deferredReason = deferredReason;
+  if (failedReason !== undefined && state.enabled) result.failedReason = failedReason;
   if (sync.pending && state.enabled) { result.pendingSync = true; result.queuedReason = sync.queuedReason ?? "local"; }
   if (sync.queuedSince !== undefined) result.queuedSince = sync.queuedSince;
   if (sync.runningSince !== undefined) result.runningSince = sync.runningSince;

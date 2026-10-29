@@ -493,8 +493,8 @@ function readReviewableMemory(
     if (!memory) throw new Error(`Unknown promoted memory: ${rawId}`);
     return memory;
   }
-  const memory = store.listMemoryCandidates({ qualityStatus: "all", owner: "any", limit: null })
-    .find((candidate) => candidate.id === id && (includePromotedCandidate || candidate.promotionState === "candidate"));
+  const candidate = store.readMemoryCandidate(id);
+  const memory = candidate && (includePromotedCandidate || candidate.promotionState === "candidate") ? candidate : undefined;
   if (!memory) throw new Error(`Unknown candidate memory: ${rawId}`);
   return memory;
 }

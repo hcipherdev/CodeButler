@@ -4,6 +4,7 @@ import { basename, extname, join, resolve, sep } from "node:path";
 import type { CodexLogSourceConfig, ConversationLogSourceConfig, MemoryChunk, MemorySource, SyncSourceName } from "../types.js";
 import type { ExtractorConversationInput } from "../types.js";
 import type { MemoryStore } from "../storage/store.js";
+import { seedExtractionCursorBeforeReimport } from "../extract/cursor.js";
 
 export interface ConversationSyncResult {
   imported: number;
@@ -141,7 +142,8 @@ function syncConversationLogSource(
         continue;
       }
       if (entry.deferred) continue;
-      if (scan && cursor !== entry.scannedCursor) continue;
+      // The watcher records a file it has never imported with an empty cursor.
+      if (scan && (cursor ?? "") !== (entry.scannedCursor ?? "")) continue;
       if (entry.result && fileSignature(filePath) !== signature) continue;
       const result = entry.result ?? parser(filePath);
       if (!result.ok) {
@@ -165,6 +167,8 @@ function syncConversationLogSource(
         store.setSyncCursor(sourceName, filePath, signature);
         continue;
       }
+      // Before the messages are replaced, so an already-extracted log only sends what it gained.
+      if (queueForExtraction && parsed.source.id) seedExtractionCursorBeforeReimport(store, store.contentPolicy.identifier(parsed.source.id));
       const storedId = store.addSourceWithChunks({ source: parsed.source, chunks: parsed.chunks });
       if (queueForExtraction) store.enqueueExtractionEvidence(sourceName, "conversation", storedId);
       store.setSyncCursor(sourceName, filePath, signature);

@@ -280,7 +280,9 @@ export async function runRetrievalWorker(): Promise<void> {
             store.init();
             try {
                 const { syncProjectMemory } = await import("../sync/service.js");
-                await syncProjectMemory(store, loadProjectConfig(root));
+                // Unattended, like the watcher: sessions still being written wait until they go quiet.
+                const { withAiTrigger } = await import("../ai/usage.js");
+                await withAiTrigger("background", () => syncProjectMemory(store, loadProjectConfig(root), { honorQuietWindow: true }));
             }
             finally {
                 store.close();

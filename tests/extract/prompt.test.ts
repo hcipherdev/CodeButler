@@ -19,6 +19,11 @@ describe("extraction prompt and evidence repair", () => {
       expect(EXTRACTOR_SYSTEM_PROMPT).toContain(text);
   });
 
+  it("excludes plans, status reports and unfixed bugs, and asks for a bug_fix's fix", () => {
+    for (const text of ["plans, proposals, or next steps", "status reports", "UI layout", "not yet fixed is not a bug_fix", "statement.fields.fix", "below 0.7"])
+      expect(EXTRACTOR_SYSTEM_PROMPT).toContain(text);
+  });
+
   it("infers a missing sourceType only when the id names exactly one supplied source", () => {
     expect(withInferredEvidenceTypes(memory([{ sourceId: "abc123" }]), context)).toMatchObject({ evidence: [{ sourceType: "commit", sourceId: "abc123" }] });
     expect(withInferredEvidenceTypes(memory([{ sourceId: "claude:session-1", locator: "claude:session-1:chunk:0" }]), context))

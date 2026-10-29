@@ -92,5 +92,5 @@ export function memoryContentText(memory: {
 }
 export const STATEMENT_EXTRACTION_GUIDANCE = " You may include statement:{version:1,text,fields,origin:'extracted'}. Its text is the same plain-language claim as summary. " +
     "Include only fields explicitly supported by the evidence: decisions choice/rationale/alternatives; " +
-    "constraints requirement/appliesWhen/rationale; bug fixes symptom/cause/fix; rejected approaches tried/droppedBecause/revisitIf. " +
+    "constraints requirement/appliesWhen/rationale; bug fixes symptom/cause/fix (symptom and fix are required for a bug fix); rejected approaches tried/droppedBecause/revisitIf. " +
     "Omit unstated fields; extraction provenance is not the project's rationale. Never broaden applicability or change modality.";

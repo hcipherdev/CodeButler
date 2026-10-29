@@ -1,8 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type { ArtifactRetentionConfig, ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, LayerRetentionConfig, ProjectConfig, RedactionPatternConfig } from "./types.js";
+import { DEFAULT_BACKGROUND_DAILY_TOKENS, hasAiSettings, jobInvestigatorConfig, legacyJobModels, modelFields, resolveAiJobModels } from "./ai/models.js";
+import { isAiConnectionKind } from "./ai/providers.js";
+import { AI_JOBS, type AiSettings } from "./types.js";
+import type { ArtifactRetentionConfig, AutomaticReviewConfig, ExtractionConfig, ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, LayerRetentionConfig, ProjectConfig, RedactionPatternConfig } from "./types.js";
 import { validateRedactionPattern } from "./privacy/policy.js";
 import { assertProjectNotRemoved } from "./cloud/removal-state.js";
 
@@ -15,10 +18,14 @@ interface ProjectConfigFile {
   };
   extractor?: ExtractorConfigInput;
   investigator?: InvestigatorConfigInput;
+  /** A project may override which models jobs use; connections and keys stay global. */
+  ai?: Pick<AiSettings, "tiers" | "jobs">;
   promotion?: Partial<Omit<ProjectConfig["promotion"], "automatic">> & {
     automatic?: Partial<ProjectConfig["promotion"]["automatic"]>;
   };
   sync?: Partial<ProjectConfig["sync"]>;
+  extraction?: Partial<ExtractionConfig>;
+  review?: { automatic?: Partial<AutomaticReviewConfig> };
   retrieval?: Partial<ProjectConfig["retrieval"]>;
   embeddings?: Partial<ProjectConfig["embeddings"]>;
   privacy?: Partial<ProjectConfig["privacy"]>;
@@ -58,6 +65,7 @@ interface GlobalConfigFile {
   extractor?: ExtractorConfigInput;
   investigator?: InvestigatorConfigInput;
   embeddings?: Partial<ProjectConfig["embeddings"]>;
+  ai?: AiSettings;
 }
 
 type ProviderKind = "extractor" | "investigator";
@@ -129,10 +137,52 @@ export function loadProjectConfig(rootDir: string): ProjectConfig {
 
 /** Resolve the reviewer without loading a project or creating configuration files. */
 export function loadGlobalReviewerConfig(): InvestigatorConfig {
+  return jobInvestigatorConfig(loadGlobalJobSettings(), "rules");
+}
+
+/** Every job's model from global settings alone, as a project without overrides would use them. */
+export function loadGlobalJobSettings(): Pick<ProjectConfig, "models" | "extractor" | "investigator"> & { legacyExtractor: ExtractorConfig; legacyInvestigator: InvestigatorConfig } {
   loadGlobalEnv();
   const global = loadGlobalConfig();
-  const defaults = defaultConfig(globalConfigDir(), join(globalConfigDir(), "config.json")).investigator;
-  return resolveProviderConfig("investigator", defaults, global, global.investigator);
+  const defaults = defaultConfig(globalConfigDir(), join(globalConfigDir(), "config.json"));
+  const investigator = resolveProviderConfig("investigator", defaults.investigator, global, global.investigator);
+  const extractor = resolveProviderConfig("extractor", defaults.extractor, global, global.extractor);
+  const models = resolveAiJobModels(global.ai, undefined, legacyJobModels(extractor, investigator));
+  return { models, extractor, investigator, legacyExtractor: extractor, legacyInvestigator: investigator };
+}
+
+/** The global AI settings exactly as stored; the desktop AI models page edits these. */
+export function loadGlobalAiSettings(): AiSettings | undefined {
+  return loadGlobalConfig().ai;
+}
+
+/** Today's cap on background AI tokens; null means no cap. Never throws, so a broken file cannot stop a call. */
+export function loadAiBudget(): number | null {
+  try {
+    const value = loadGlobalConfig().ai?.budgets?.backgroundDailyTokens;
+    return value === null ? null : value ?? DEFAULT_BACKGROUND_DAILY_TOKENS;
+  } catch { return DEFAULT_BACKGROUND_DAILY_TOKENS; }
+}
+
+/**
+ * Replaces the `ai` section of the global config.json after validating the whole file, keeping
+ * every other key. Written atomically, so the watcher never reads half a file.
+ */
+export function saveGlobalAiSettings(settings: AiSettings): void {
+  const globalDir = globalConfigDir();
+  mkdirSync(globalDir, { recursive: true });
+  const configPath = join(globalDir, "config.json");
+  const current = existsSync(configPath) ? readConfigObject(configPath) : {};
+  const next = { ...current, ai: settings };
+  validateGlobalConfigFile(next);
+  const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
+  try {
+    writeSync(fd, `${JSON.stringify(next, null, 2)}\n`);
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  try { renameSync(temporary, configPath); }
+  catch (error) { rmSync(temporary, { force: true }); throw error; }
 }
 
 export function loadExistingProjectConfig(rootDir: string): ProjectConfig {
@@ -145,6 +195,24 @@ export function loadExistingProjectConfig(rootDir: string): ProjectConfig {
 
 export function projectLocalConfigPath(rootDir: string): string {
   return join(rootDir, ".code-butler", "config.local.json");
+}
+
+/** This device's recorded answer, if any. Consent covers this device's keys and logs, so it is never synced. */
+export function readRemoteModelConsent(rootDir: string): boolean | undefined {
+  const localConfigPath = projectLocalConfigPath(rootDir);
+  if (!existsSync(localConfigPath)) return undefined;
+  const value = readConfigObject(localConfigPath).privacy;
+  return isConfigRecord(value) && typeof value.allowRemoteModels === "boolean" ? value.allowRemoteModels : undefined;
+}
+
+export function setRemoteModelConsent(rootDir: string, allowed: boolean): string {
+  ensureProjectConfig(rootDir);
+  const localConfigPath = projectLocalConfigPath(rootDir);
+  const local = existsSync(localConfigPath) ? readConfigObject(localConfigPath) : {};
+  const next = { ...local, privacy: { ...(isConfigRecord(local.privacy) ? local.privacy : {}), allowRemoteModels: allowed } };
+  validateProjectConfigFile(next);
+  writeConfigObject(localConfigPath, next);
+  return localConfigPath;
 }
 
 export function portableProjectConfig(config: ConfigObject): ConfigObject {
@@ -225,8 +293,7 @@ export function migrateSharedConfigToLocal(rootDir: string, options: { apply: bo
 }
 
 function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
-  loadProjectEnv(rootDir);
-  loadGlobalEnv();
+  const butlerEnvKeys = new Set([...loadProjectEnv(rootDir), ...loadGlobalEnv()]);
   const raw = readFileSync(configPath, "utf8");
   const parsedValue: unknown = raw.trim().length > 0 ? JSON.parse(raw) : {};
   validateProjectConfigFile(parsedValue);
@@ -271,8 +338,10 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
         roots: (claude.roots ?? defaults.sources.claude.roots).map((root) => resolveRootedPath(rootDir, root))
       }
     },
-    extractor: resolveProviderConfig("extractor", defaults.extractor, globalConfig, parsed.extractor),
-    investigator: resolveProviderConfig("investigator", defaults.investigator, globalConfig, parsed.investigator),
+    ...resolveProjectModels(defaults, globalConfig, parsed, mergeConfigFiles(parsedValue as ProjectConfigFile, localValue as ProjectConfigFile), {
+      allowRemoteModels: parsed.privacy?.allowRemoteModels === true,
+      butlerEnvKeys
+    }),
     promotion: {
       ...defaults.promotion,
       ...(parsed.promotion ?? {}),
@@ -286,6 +355,13 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
     sync: {
       ...defaults.sync,
       ...(parsed.sync ?? {})
+    },
+    extraction: {
+      ...DEFAULT_EXTRACTION_CONFIG,
+      ...(parsed.extraction ?? {})
+    },
+    review: {
+      automatic: { ...DEFAULT_AUTOMATIC_REVIEW_CONFIG, ...(parsed.review?.automatic ?? {}) }
     },
     retrieval: {
       ...defaults.retrieval,
@@ -418,6 +494,8 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
       shareLocalLayers: "durable",
       conflictPolicy: "merge"
     },
+    extraction: { ...DEFAULT_EXTRACTION_CONFIG },
+    review: { automatic: { ...DEFAULT_AUTOMATIC_REVIEW_CONFIG } },
     retrieval: {
       mode: "fts",
       rrfK: 60
@@ -431,6 +509,7 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
     },
     privacy: {
       allowRemoteEmbeddings: false,
+      allowRemoteModels: false,
       redactionPatterns: []
     },
     retention: {
@@ -474,6 +553,7 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
 
 export function validateProjectConfigFile(value: unknown): void {
   if (!isConfigRecord(value)) throw new Error("Project config must be an object");
+  if (value.ai !== undefined) validateAiSettings(value.ai, "ai", false);
   const rules = optionalConfigSection(value, "globalRules");
   if (rules) {
     assertKnownKeys(rules, new Set(["enabled", "exclude"]), "globalRules");
@@ -514,9 +594,9 @@ export function validateProjectConfigFile(value: unknown): void {
 
   const privacy = optionalConfigSection(value, "privacy");
   if (privacy) {
-    assertKnownKeys(privacy, new Set(["allowRemoteEmbeddings", "redactionPatterns"]), "privacy");
-    if (privacy.allowRemoteEmbeddings !== undefined && typeof privacy.allowRemoteEmbeddings !== "boolean") {
-      throw new Error("privacy.allowRemoteEmbeddings must be a boolean");
+    assertKnownKeys(privacy, new Set(["allowRemoteEmbeddings", "allowRemoteModels", "redactionPatterns"]), "privacy");
+    for (const key of ["allowRemoteEmbeddings", "allowRemoteModels"] as const) {
+      if (privacy[key] !== undefined && typeof privacy[key] !== "boolean") throw new Error(`privacy.${key} must be a boolean`);
     }
     if (privacy.redactionPatterns !== undefined) {
       if (!Array.isArray(privacy.redactionPatterns)) throw new Error("privacy.redactionPatterns must be an array");
@@ -545,17 +625,67 @@ export function validateProjectConfigFile(value: unknown): void {
       throw new Error("sync.conflictPolicy must be merge or ask");
     }
   }
+  const extraction = optionalConfigSection(value, "extraction");
+  if (extraction) {
+    assertKnownKeys(extraction, new Set(Object.keys(DEFAULT_EXTRACTION_CONFIG)), "extraction");
+    for (const [key, setting] of Object.entries(extraction)) {
+      if (!Number.isInteger(setting) || (setting as number) < 0) throw new Error(`extraction.${key} must be a non-negative integer`);
+    }
+  }
+  const review = optionalConfigSection(value, "review");
+  if (review) {
+    assertKnownKeys(review, new Set(["automatic"]), "review");
+    const automatic = review.automatic;
+    if (automatic !== undefined) {
+      if (!isConfigRecord(automatic)) throw new Error("review.automatic must be an object");
+      assertKnownKeys(automatic, new Set(Object.keys(DEFAULT_AUTOMATIC_REVIEW_CONFIG)), "review.automatic");
+      if (automatic.enabled !== undefined && typeof automatic.enabled !== "boolean") throw new Error("review.automatic.enabled must be a boolean");
+      for (const key of ["dailyItems", "tokenBudget"] as const) {
+        if (automatic[key] !== undefined && !isPositiveInteger(automatic[key])) throw new Error(`review.automatic.${key} must be a positive integer`);
+      }
+      if (automatic.applyVerdicts !== undefined && (!Array.isArray(automatic.applyVerdicts) ||
+        automatic.applyVerdicts.some((verdict) => !["current", "obsolete", "low_value"].includes(String(verdict))))) {
+        throw new Error("review.automatic.applyVerdicts may contain only current, obsolete, and low_value");
+      }
+    }
+  }
   const retention = optionalConfigSection(value, "retention");
   if (retention) validateRetentionConfig(retention);
+}
+
+export const DEFAULT_AUTOMATIC_REVIEW_CONFIG: AutomaticReviewConfig = {
+  enabled: true,
+  dailyItems: 100,
+  tokenBudget: 1_500_000,
+  applyVerdicts: ["current", "obsolete"]
+};
+
+/** The effective automatic-review settings, including for configs built without the section. */
+export function automaticReviewPolicy(config: Pick<ProjectConfig, "review">): AutomaticReviewConfig {
+  return { ...DEFAULT_AUTOMATIC_REVIEW_CONFIG, ...(config.review?.automatic ?? {}) };
+}
+
+export const DEFAULT_EXTRACTION_CONFIG: ExtractionConfig = {
+  conversationQuietMinutes: 10,
+  conversationMaxWaitMinutes: 60,
+  maxDeltaChunks: 200,
+  overlapChunks: 6,
+  relatedMemories: 20
+};
+
+/** The effective extraction settings, including for configs built without the section. */
+export function extractionPolicy(config: Pick<ProjectConfig, "extraction">): ExtractionConfig {
+  return { ...DEFAULT_EXTRACTION_CONFIG, ...(config.extraction ?? {}) };
 }
 
 function validateGlobalConfigFile(value: unknown): void {
   if (!isConfigRecord(value)) throw new Error("Global config must be an object");
   assertKnownKeys(
     value,
-    new Set(["defaults", "profiles", "sources", "extractor", "investigator", "embeddings", "globalRules"]),
+    new Set(["defaults", "profiles", "sources", "extractor", "investigator", "embeddings", "globalRules", "ai"]),
     "global config"
   );
+  if (value.ai !== undefined) validateAiSettings(value.ai, "ai", true);
   if (value.globalRules !== undefined) validateProjectConfigFile({ globalRules: value.globalRules });
 
   if (value.defaults !== undefined) {
@@ -613,6 +743,66 @@ function validateGlobalConfigFile(value: unknown): void {
   });
 }
 
+const AI_ID = /^[a-z0-9][a-z0-9-]{0,39}$/;
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+/** Checks AI settings; a project override may only choose models, never define connections or budgets. */
+function validateAiSettings(value: unknown, path: string, global: boolean): void {
+  if (!isConfigRecord(value)) throw new Error(`${path} must be an object`);
+  assertKnownKeys(value, new Set(global ? ["connections", "tiers", "jobs", "budgets"] : ["tiers", "jobs"]), path);
+  const connections = value.connections;
+  if (connections !== undefined) {
+    if (!isConfigRecord(connections)) throw new Error(`${path}.connections must be an object`);
+    for (const [id, connection] of Object.entries(connections)) {
+      const at = `${path}.connections.${id}`;
+      if (!AI_ID.test(id)) throw new Error(`${at}: connection ids use lowercase letters, digits and hyphens`);
+      if (!isConfigRecord(connection)) throw new Error(`${at} must be an object`);
+      assertKnownKeys(connection, new Set(["kind", "label", "baseUrl", "apiKeyEnv", "workspaceIdEnv", "regionEnv", "workspaceId", "region", "keyUpdatedAt", "keySavedToEnv", "dataCollection"]), at);
+      if (!isAiConnectionKind(connection.kind)) throw new Error(`${at}.kind is not a supported provider`);
+      if (connection.label !== undefined && (typeof connection.label !== "string" || connection.label.length > 80)) throw new Error(`${at}.label must be at most 80 characters`);
+      if (connection.baseUrl !== undefined && !isValidEmbeddingBaseUrl(connection.baseUrl)) throw new Error(`${at}.baseUrl must be an HTTP(S) URL without credentials`);
+      if (connection.kind === "openai-compatible" && connection.baseUrl === undefined) throw new Error(`${at}.baseUrl is required for a custom endpoint`);
+      for (const key of ["apiKeyEnv", "workspaceIdEnv", "regionEnv"] as const) {
+        if (connection[key] !== undefined && (typeof connection[key] !== "string" || !ENV_NAME.test(connection[key] as string))) throw new Error(`${at}.${key} must be an environment variable name`);
+      }
+      for (const key of ["workspaceId", "region", "keyUpdatedAt"] as const) {
+        if (connection[key] !== undefined && (!isNonemptyString(connection[key]) || (connection[key] as string).length > 200)) throw new Error(`${at}.${key} must be a short string`);
+      }
+      if (connection.keySavedToEnv !== undefined && connection.keySavedToEnv !== true) throw new Error(`${at}.keySavedToEnv must be true when set`);
+      if (connection.dataCollection !== undefined && connection.dataCollection !== "allow" && connection.dataCollection !== "deny") throw new Error(`${at}.dataCollection must be allow or deny`);
+    }
+  }
+  const knownConnection = (id: unknown) => !global || (isConfigRecord(connections) && typeof id === "string" && Object.prototype.hasOwnProperty.call(connections, id));
+  const validateChoice = (choice: unknown, at: string, allowTier: boolean): void => {
+    if (!isConfigRecord(choice)) throw new Error(`${at} must be an object`);
+    if (allowTier && choice.tier !== undefined) {
+      assertKnownKeys(choice, new Set(["tier"]), at);
+      if (choice.tier !== "fast" && choice.tier !== "smart") throw new Error(`${at}.tier must be fast or smart`);
+      return;
+    }
+    assertKnownKeys(choice, new Set(["connection", "model", "maxTokens"]), at);
+    if (!isNonemptyString(choice.connection) || !knownConnection(choice.connection)) throw new Error(`${at}.connection must name a configured connection`);
+    if (!isNonemptyString(choice.model) || choice.model.length > 200) throw new Error(`${at}.model must be a model id`);
+    if (choice.maxTokens !== undefined && !isPositiveInteger(choice.maxTokens)) throw new Error(`${at}.maxTokens must be a positive integer`);
+  };
+  if (value.tiers !== undefined) {
+    if (!isConfigRecord(value.tiers)) throw new Error(`${path}.tiers must be an object`);
+    assertKnownKeys(value.tiers, new Set(["fast", "smart"]), `${path}.tiers`);
+    for (const tier of ["fast", "smart"] as const) if (value.tiers[tier] !== undefined) validateChoice(value.tiers[tier], `${path}.tiers.${tier}`, false);
+  }
+  if (value.jobs !== undefined) {
+    if (!isConfigRecord(value.jobs)) throw new Error(`${path}.jobs must be an object`);
+    assertKnownKeys(value.jobs, new Set(AI_JOBS), `${path}.jobs`);
+    for (const [job, choice] of Object.entries(value.jobs)) validateChoice(choice, `${path}.jobs.${job}`, true);
+  }
+  if (value.budgets !== undefined) {
+    if (!isConfigRecord(value.budgets)) throw new Error(`${path}.budgets must be an object`);
+    assertKnownKeys(value.budgets, new Set(["backgroundDailyTokens"]), `${path}.budgets`);
+    const limit = value.budgets.backgroundDailyTokens;
+    if (limit !== undefined && limit !== null && (!isPositiveInteger(limit) || limit > 10_000_000_000)) throw new Error(`${path}.budgets.backgroundDailyTokens must be a positive integer or null`);
+  }
+}
+
 function validatePromotionConfig(promotion: Record<string, unknown>): void {
   assertKnownKeys(
     promotion,
@@ -658,7 +848,7 @@ function isUnitInterval(value: unknown): value is number {
 
 function optionalConfigSection(
   config: Record<string, unknown>,
-  name: "retrieval" | "embeddings" | "privacy" | "retention" | "promotion" | "globalRules"
+  name: "retrieval" | "embeddings" | "privacy" | "retention" | "promotion" | "globalRules" | "extraction" | "review"
 ): Record<string, unknown> | undefined {
   const value = config[name];
   if (value === undefined) return undefined;
@@ -852,6 +1042,75 @@ function resolveProviderConfig<T extends ExtractorConfig | InvestigatorConfig>(
   return merged as T;
 }
 
+/**
+ * Legacy profiles resolve first; an `ai` section then decides every job's model, with this
+ * project's `ai` overrides applied last.
+ */
+function resolveProjectModels(
+  defaults: ProjectConfig,
+  globalConfig: GlobalConfigFile,
+  parsed: ProjectConfigFile,
+  projectOnly: ProjectConfigFile,
+  consent: RemoteModelConsent
+): Pick<ProjectConfig, "extractor" | "investigator" | "models" | "aiBudget"> {
+  const legacyExtractor = withConsentRequirement(
+    resolveProviderConfig("extractor", defaults.extractor, globalConfig, parsed.extractor),
+    providerChosenByUser("extractor", globalConfig, parsed.extractor),
+    consent
+  );
+  const legacyInvestigator = withConsentRequirement(
+    resolveProviderConfig("investigator", defaults.investigator, globalConfig, parsed.investigator),
+    providerChosenByUser("investigator", globalConfig, parsed.investigator),
+    consent
+  );
+  const legacy = legacyJobModels(legacyExtractor, legacyInvestigator);
+  const models = resolveAiJobModels(globalConfig.ai, parsed.ai, legacy);
+  // Provider settings written in this project's own config files still win over the global AI settings.
+  const setsProvider = (block: ExtractorConfigInput | InvestigatorConfigInput | undefined) =>
+    Boolean(block && (block.profile !== undefined || PROVIDER_KEYS.some(key => block[key] !== undefined)));
+  if (hasAiSettings(globalConfig.ai)) {
+    if (setsProvider(projectOnly.extractor)) models.extraction = { ...legacy.extraction, source: "project-override" };
+    if (setsProvider(projectOnly.investigator)) {
+      for (const job of ["review", "wording", "summary", "investigator", "consolidation"] as const) models[job] = { ...legacy[job], source: "project-override" };
+    }
+  }
+  const budget = globalConfig.ai?.budgets?.backgroundDailyTokens;
+  return {
+    extractor: models.extraction.source === "legacy" ? legacyExtractor : modelFields(models.extraction),
+    investigator: jobInvestigatorConfig({ models, extractor: legacyExtractor, investigator: legacyInvestigator }, "investigator"),
+    models,
+    aiBudget: { backgroundDailyTokens: budget === null ? null : budget ?? DEFAULT_BACKGROUND_DAILY_TOKENS }
+  };
+}
+
+interface RemoteModelConsent {
+  allowRemoteModels: boolean;
+  /** Variables given a value in Butler's own .env files; a key put there was meant for Butler. */
+  butlerEnvKeys: ReadonlySet<string>;
+}
+
+/**
+ * Marks the built-in default model when it would run on a key that merely sits in the shell
+ * environment: nobody chose to send this project's transcripts and diffs to that provider.
+ */
+function withConsentRequirement<T extends ExtractorConfig | InvestigatorConfig>(model: T, chosenByUser: boolean, consent: RemoteModelConsent): T {
+  const requiresConsent = !chosenByUser
+    && !consent.allowRemoteModels
+    && !consent.butlerEnvKeys.has(model.apiKeyEnv);
+  return requiresConsent ? { ...model, requiresConsent: true } : model;
+}
+
+/** Whether a person picked this provider, rather than the built-in default or a generated profile. */
+function providerChosenByUser(kind: ProviderKind, globalConfig: GlobalConfigFile, overrides: ExtractorConfigInput | InvestigatorConfigInput | undefined): boolean {
+  if (overrides && (overrides.profile !== undefined || PROVIDER_KEYS.some(key => overrides[key] !== undefined))) return true;
+  const name = kind === "extractor" ? globalConfig.defaults?.extractorProfile : globalConfig.defaults?.investigatorProfile;
+  const profile = name ? globalConfig.profiles?.[name] : undefined;
+  if (!name || !profile) return false;
+  // Older releases generated these profiles with other models, so only a changed destination counts.
+  const generated = defaultGlobalConfigFile().profiles?.[name];
+  return !generated || (["provider", "baseUrl", "apiKeyEnv"] as const).some(key => profile[key] !== generated[key]);
+}
+
 function readProviderProfile(
   config: GlobalConfigFile,
   profileName: string | undefined,
@@ -905,14 +1164,15 @@ function localOnlyConfigPaths(config: ConfigObject): string[] {
     "sources.claude.roots",
     "extractor",
     "investigator",
-    "embeddings"
+    "embeddings",
+    "ai"
   ];
   return paths.filter((path) => getNested(config, path) !== undefined);
 }
 
 function localOnlyReason(path: string): ConfigPortabilityIssue["reason"] {
   if (path.endsWith(".repoPath") || path.endsWith(".roots")) return "device_local_path";
-  if (path === "extractor" || path === "investigator" || path === "embeddings") return "provider_runtime_setting";
+  if (path === "extractor" || path === "investigator" || path === "embeddings" || path === "ai") return "provider_runtime_setting";
   return "device_local_source_setting";
 }
 
@@ -994,25 +1254,62 @@ function globalProjectConfig(config: GlobalConfigFile): ProjectConfigFile {
   };
 }
 
-function loadGlobalEnv(): void {
-  loadEnvFile(join(globalConfigDir(), ".env"));
+function loadGlobalEnv(): Set<string> {
+  return loadEnvFile(join(globalConfigDir(), ".env"));
 }
 
-function loadProjectEnv(rootDir: string): void {
-  loadEnvFile(join(rootDir, ".code-butler", ".env"));
+function loadProjectEnv(rootDir: string): Set<string> {
+  return loadEnvFile(join(rootDir, ".code-butler", ".env"));
 }
 
-function loadEnvFile(envPath: string): void {
-  if (!existsSync(envPath)) return;
+/** Returns the names the file gives a value, whether or not the environment already had one. */
+function loadEnvFile(envPath: string): Set<string> {
+  const defined = new Set<string>();
+  if (!existsSync(envPath)) return defined;
   const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
   for (const line of lines) {
     const parsed = parseEnvLine(line);
     if (!parsed) continue;
     const [key, value] = parsed;
+    if (value.trim()) defined.add(key);
     if (process.env[key] === undefined || process.env[key] === "") {
       process.env[key] = value;
     }
   }
+  return defined;
+}
+
+/**
+ * Sets (or with undefined, removes) one variable in the global .env file, keeping every other
+ * line. Returns the value it replaced. Written atomically and readable only by this user.
+ */
+export function setGlobalEnvValue(name: string, value: string | undefined): string | undefined {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error(`${name} is not an environment variable name`);
+  if (value !== undefined && (!value || /[\s"']/.test(value))) throw new Error("That value cannot be written to the .env file.");
+  const globalDir = globalConfigDir();
+  mkdirSync(globalDir, { recursive: true });
+  ensureEnvGitignore(globalDir);
+  const envPath = join(globalDir, ".env");
+  const lines = existsSync(envPath) ? readFileSync(envPath, "utf8").split(/\r?\n/) : [];
+  let previous: string | undefined;
+  const kept = lines.filter(line => {
+    const parsed = parseEnvLine(line);
+    if (parsed?.[0] !== name) return true;
+    previous = parsed[1];
+    return false;
+  });
+  while (kept.length && kept.at(-1) === "") kept.pop();
+  if (value !== undefined) kept.push(`${name}=${value}`);
+  if (previous === undefined && value === undefined) return undefined;
+  const temporary = `${envPath}.${process.pid}.${Date.now()}.tmp`;
+  const fd = openSync(temporary, "wx", 0o600);
+  try {
+    writeSync(fd, kept.length ? `${kept.join("\n")}\n` : "");
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  try { renameSync(temporary, envPath); }
+  catch (error) { rmSync(temporary, { force: true }); throw error; }
+  return previous;
 }
 
 function ensureProjectGitignore(rootDir: string): void {
@@ -1158,8 +1455,9 @@ function defaultConfigExamplesFile(): Record<string, unknown> {
       privacy: { allowRemoteEmbeddings: false }
     },
     privacyControls: {
-      description: "Project-specific redaction and retention examples. Replace example patterns before use.",
+      description: "Project-specific redaction and retention examples. Replace example patterns before use. allowRemoteModels lets the built-in default model run on a key found only in the shell environment; set it in config.local.json.",
       privacy: {
+        allowRemoteModels: false,
         redactionPatterns: [
           { name: "internal token", kind: "regex", pattern: "INTERNAL-[A-Za-z0-9]+" },
           { name: "literal password", kind: "literal", pattern: "replace-this-example" }

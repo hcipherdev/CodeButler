@@ -50,7 +50,7 @@ export function selectedSecretServer(): string {
 export function ensureSecretsGitGuard(root: string): void {
   try {
     const tracked = execFileSync(gitExecutable(), ["ls-files", "-z", "--cached"], { cwd: root, maxBuffer: 16 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"] })
+      stdio: ["ignore", "pipe", "ignore"], windowsHide: true })
       .toString("utf8").split("\0").some(path => path && isSensitiveGitPath(path) && path.split("/")[0]?.toLowerCase() === "secrets");
     if (tracked) throw new Error("Secret files are tracked by Git. Remove them from the index and rotate any exposed credentials before enabling sync.");
   } catch (error) {

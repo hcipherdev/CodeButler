@@ -1,5 +1,6 @@
 import { registerDatabaseHandle } from "../cloud/gate.js";
 import { cachedRead, hasCachedRead } from "../retrieval/read-cache.js";
+import { revisionCached } from "../retrieval/canonical-revision.js";
 import { stateDirectory } from "../cloud/state.js";
 import { normalizeScope, parseScope, sanitizeScope, scopeKey, assessApplicability } from "../memory/scope.js";
 import { CORE_LAYER, deviceLayer, matchesLayerFilter, normalizeLayer, sanitizeLayer } from "../memory/layer.js";
@@ -22,6 +23,8 @@ import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { claimText, createStatement, memoryContentText, parseStatement } from "../memory/statement.js";
+import { countMatchedTerms, queryTermsFor, type MemoryQueryMatch } from "../search/query-terms.js";
+import { searchExcludedPathSql } from "../sources/sensitive-path.js";
 import { presentMemory } from "../memory/presentation.js";
 import { parseMemoryOrigin, sanitizeMemoryOrigin } from "../memory/origin.js";
 import {
@@ -39,6 +42,7 @@ import {
   createProviderKey
 } from "../embeddings/fingerprint.js";
 import { createEvidenceSignature } from "../memory/evidence-signature.js";
+import { mergeEvidence, mergeRelatedFiles, type CandidateMergeOutcome } from "../memory/evidence-merge.js";
 import { createMemorySubjectKey } from "../memory/lifecycle.js";
 import {
   pendingQuality,
@@ -283,10 +287,16 @@ function createDurableContentPolicy(
   });
 }
 
+// Migrations create the table and never drop it, so only a positive answer is remembered.
+const privateIdentityTables = new WeakSet<DatabaseSync>();
+
 function hasPrivateIdentityTable(db: DatabaseSync): boolean {
-  return Boolean(db.prepare(
+  if (privateIdentityTables.has(db)) return true;
+  const found = Boolean(db.prepare(
     "select 1 from sqlite_master where type = 'table' and name = 'private_identity_mappings'"
   ).get());
+  if (found) privateIdentityTables.add(db);
+  return found;
 }
 
 function sanitizeStoredJson(
@@ -327,6 +337,8 @@ export interface ProjectSummary {
     quarantined: number;
     retired: number;
     replaced: number;
+    /** The part of `needsReview` and `quarantined` that is still a candidate; the rest is durable. */
+    candidates?: { needsReview: number; quarantined: number };
   };
   lastSyncAt?: string;
   syncSources: Partial<Record<SyncSourceName, SyncStatus>>;
@@ -400,6 +412,7 @@ export interface MemoryStore {
     resolved?: boolean;
     limit?: number | null;
   }): SourceFailure[];
+  countSourcesByType(): Record<SourceType, number>;
   listEmbeddingOwners(): EmbeddingOwner[];
   reconcileEmbeddingJobs(input: {
     providerKey: string;
@@ -465,6 +478,19 @@ export interface MemoryStore {
       lastVerifiedAt?: string | undefined;
     }
   ): MemoryCandidate;
+  /**
+   * Stores an extracted memory without overwriting what an earlier extraction of the
+   * same fact recorded: evidence and files are unioned, wording is kept, and a fact a
+   * reviewer withdrew is left alone. Explicit quality applies only to a new row.
+   */
+  mergeExtractedMemoryCandidate(
+    memory: ExtractedMemory,
+    options?: {
+      qualityStatus?: MemoryQualityStatus;
+      qualityReasons?: string[];
+      lastVerifiedAt?: string | undefined;
+    }
+  ): { candidate: MemoryCandidate; outcome: CandidateMergeOutcome };
   promoteMemoryCandidate(
     candidateId: string,
     source?: DurableMemory["source"],
@@ -497,6 +523,8 @@ export interface MemoryStore {
     relationType?: MemoryRelationType;
   }): MemoryRelation[];
   deleteMemoryRelation(id: string): boolean;
+  /** One candidate by id in any layer, with its device-local quality. */
+  readMemoryCandidate(id: string): MemoryCandidate | undefined;
   listMemoryCandidates(input?: {
     type?: MemoryType;
     promotionState?: MemoryPromotionState;
@@ -504,6 +532,7 @@ export interface MemoryStore {
     layer?: MemoryLayerFilter;
     owner?: MemoryLayerOwner;
     query?: string;
+    match?: MemoryQueryMatch;
     limit?: number | null;
     excludeTerminalReviews?: boolean;
   }): MemoryCandidate[];
@@ -515,6 +544,7 @@ export interface MemoryStore {
     layer?: MemoryLayerFilter;
     owner?: MemoryLayerOwner;
     query?: string;
+    match?: MemoryQueryMatch;
     limit?: number | null;
   }): DurableMemory[];
   updateMemoryQuality(
@@ -546,6 +576,7 @@ export interface MemoryStore {
   deleteExpiredTemporaryMemories(input?: { now?: string; expiredOnly?: boolean }): number;
   searchMemoryLayer(input?: {
     query?: string;
+    match?: MemoryQueryMatch;
     type?: MemoryType;
     status?: "promoted" | "candidate";
     lifecycleStatus?: MemoryLifecycleStatusFilter;
@@ -933,6 +964,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
            join chunks c on c.id = f.chunk_id
            where chunks_fts match ?
            ${sourceTypeClause}
+           and not ${generatedOnlyCommitSql("f.source_id")}
            order by score asc
            limit ?`
         )
@@ -1362,6 +1394,12 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       ).run(resolvedAt ?? new Date().toISOString(), adapter, path);
       return Number(result.changes);
     },
+    countSourcesByType() {
+      const counts: Record<SourceType, number> = { conversation: 0, commit: 0, decision: 0 };
+      const rows = db.prepare("select type, count(*) as count from sources group by type").all() as Array<{ type: SourceType; count: number }>;
+      for (const row of rows) counts[row.type] = row.count;
+      return counts;
+    },
     listSourceFailures(input = {}) {
       const conditions: string[] = [];
       const parameters: Array<string | number> = [];
@@ -1786,6 +1824,57 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         return withResolvedQuality(store, "candidate", candidate);
       });
     },
+    mergeExtractedMemoryCandidate(memory, options) {
+      return withTransaction(db, () => {
+        const sanitized = sanitizeExtractedMemory(contentPolicy, memory);
+        const existing = db
+          .prepare(
+            `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                    dedupe_key, promotion_state, promoted_memory_id,
+                    created_at, updated_at
+             from memory_candidates
+             where dedupe_key = ? and scope_key = ? and layer = ?`
+          )
+          .get(sanitized.dedupeKey, scopeKey(sanitized.scope), sanitizeLayer(contentPolicy, sanitized.layer)) as MemoryCandidateRow | undefined;
+        if (!existing) return { candidate: store.upsertMemoryCandidate(memory, options), outcome: "inserted" as const };
+
+        const current = memoryCandidateFromRow(existing);
+        const durable = existing.promoted_memory_id ? readMemoryRowRaw(db, existing.promoted_memory_id) : undefined;
+        // A reviewer's discard or correction, or a withdrawn durable copy, outranks a re-extraction.
+        if (effectiveTerminalMemoryReview(store, "candidate", current) || (durable && durable.lifecycle_status !== "current")) {
+          return { candidate: withResolvedQuality(store, "candidate", current), outcome: "skipped_withdrawn" as const };
+        }
+        const evidence = mergeEvidence(current.evidence, sanitized.evidence);
+        const relatedFiles = mergeRelatedFiles(current.relatedFiles, sanitized.relatedFiles);
+        const confidence = Math.max(current.confidence, sanitized.confidence);
+        if (
+          createEvidenceSignature(evidence) === createEvidenceSignature(current.evidence) &&
+          relatedFiles.every((file) => current.relatedFiles.includes(file)) &&
+          confidence === current.confidence
+        ) {
+          // No new write keeps the version, so recorded reviews and promotion decisions still apply.
+          return { candidate: withResolvedQuality(store, "candidate", current), outcome: "unchanged" as const };
+        }
+        // A strictly newer version wins the cloud merge even within the same millisecond.
+        const now = new Date(Math.max(Date.now(), Date.parse(existing.updated_at) + 1)).toISOString();
+        db.prepare(
+          `update memory_candidates
+              set evidence_json = ?, related_files_json = ?, confidence = ?, evidence_signature = ?, updated_at = ?
+            where id = ?`
+        ).run(JSON.stringify(evidence), JSON.stringify(relatedFiles), confidence, createEvidenceSignature(evidence), now, existing.id);
+        rebuildMemoryLinks(db, "candidate", existing.id, evidence, relatedFiles);
+        const row = db
+          .prepare(
+            `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                    dedupe_key, promotion_state, promoted_memory_id,
+                    created_at, updated_at
+             from memory_candidates
+             where id = ?`
+          )
+          .get(existing.id) as unknown as MemoryCandidateRow;
+        return { candidate: withResolvedQuality(store, "candidate", memoryCandidateFromRow(row)), outcome: "merged" as const };
+      });
+    },
     promoteMemoryCandidate(candidateId, source = "auto", options = {}) {
       return withTransaction(db, () => {
         candidateId = contentPolicy.identifier(candidateId);
@@ -1907,6 +1996,15 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
     deleteMemoryRelation(id) {
       return deleteStoredMemoryRelation(db, contentPolicy, id);
     },
+    readMemoryCandidate(id) {
+      const row = db.prepare(
+        `select scope_json, scope_key, layer, origin_json, statement_json, id, type, title, summary, reason, confidence, evidence_json, related_files_json,
+                dedupe_key, promotion_state, promoted_memory_id,
+                created_at, updated_at
+         from memory_candidates where id = ?`
+      ).get(contentPolicy.identifier(id)) as MemoryCandidateRow | undefined;
+      return row ? withResolvedQuality(store, "candidate", memoryCandidateFromRow(row)) : undefined;
+    },
     listMemoryCandidates(input = {}) {
       const layer = layerSqlPredicate(input.layer, input.owner, importedPeerLayers(db));
       const rows = db
@@ -1921,18 +2019,25 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         .iterate(...layer.parameters) as unknown as Iterable<MemoryCandidateRow>;
       const matches: MemoryCandidate[] = [];
       const limit = input.limit === null ? Infinity : normalizeLimit(input.limit);
+      const terms = queryTermsFor(input.query, input.match);
+      const counts = new Map<string, number>();
       for (const row of rows) {
         if (input.type && row.type !== input.type) continue;
         if (input.promotionState && row.promotion_state !== input.promotionState) continue;
         const candidate = withResolvedQuality(store, "candidate", memoryCandidateFromRow(row));
         if (!matchesQualityStatus(candidate.qualityStatus, input.qualityStatus)) continue;
         if (!matchesLayerFilter(candidate.layer, input.layer)) continue;
-        if (!matchesMemoryQuery(candidate, input.query)) continue;
+        if (terms) {
+          const matched = countMatchedTerms(memoryQueryHaystack(candidate), terms);
+          if (matched === 0) continue;
+          counts.set(candidate.id, matched);
+        } else if (!matchesMemoryQuery(candidate, input.query)) continue;
         if (input.excludeTerminalReviews && effectiveTerminalMemoryReview(store, "candidate", candidate) !== undefined) continue;
         matches.push(candidate);
-        if (matches.length >= limit) break;
+        // Ranked term queries must see every match before the best ones can be cut to the limit.
+        if (!terms && matches.length >= limit) break;
       }
-      return matches;
+      return terms ? rankByMatchedTerms(matches, counts).slice(0, limit) : matches;
     },
     listMemories(input = {}) {
       if (input.status === "candidate") return [];
@@ -1951,17 +2056,23 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         .iterate(...layer.parameters) as unknown as Iterable<MemoryRow>;
       const matches: DurableMemory[] = [];
       const limit = input.limit === null ? Infinity : normalizeLimit(input.limit);
+      const terms = queryTermsFor(input.query, input.match);
+      const counts = new Map<string, number>();
       for (const row of rows) {
         if (input.type && row.type !== input.type) continue;
         if (!matchesLifecycleStatus(row.lifecycle_status, input.lifecycleStatus)) continue;
         const memory = withResolvedQuality(store, "promoted", memoryFromRow(row));
         if (!matchesQualityStatus(memory.qualityStatus, input.qualityStatus)) continue;
         if (!matchesLayerFilter(memory.layer, input.layer)) continue;
-        if (!matchesMemoryQuery(memory, input.query)) continue;
+        if (terms) {
+          const matched = countMatchedTerms(memoryQueryHaystack(memory), terms);
+          if (matched === 0) continue;
+          counts.set(memory.id, matched);
+        } else if (!matchesMemoryQuery(memory, input.query)) continue;
         matches.push(memory);
-        if (matches.length >= limit) break;
+        if (!terms && matches.length >= limit) break;
       }
-      return matches;
+      return terms ? rankByMatchedTerms(matches, counts).slice(0, limit) : matches;
     },
     updateMemoryQuality(kind, id, quality) {
       id = contentPolicy.identifier(id);
@@ -2173,6 +2284,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       };
       if (input.type !== undefined) promotedInput.type = input.type;
       if (input.query !== undefined) promotedInput.query = input.query;
+      if (input.match !== undefined) promotedInput.match = input.match;
       if (input.qualityStatus !== undefined) promotedInput.qualityStatus = input.qualityStatus;
       if (input.lifecycleStatus !== undefined) promotedInput.lifecycleStatus = input.lifecycleStatus;
       if (input.layer !== undefined) promotedInput.layer = input.layer;
@@ -2188,6 +2300,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       };
       if (input.type !== undefined) candidateInput.type = input.type;
       if (input.query !== undefined) candidateInput.query = input.query;
+      if (input.match !== undefined) candidateInput.match = input.match;
       if (input.qualityStatus !== undefined) candidateInput.qualityStatus = input.qualityStatus;
       if (input.layer !== undefined) candidateInput.layer = input.layer;
       if (input.owner !== undefined) candidateInput.owner = input.owner;
@@ -2203,11 +2316,17 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
         ...promoted.map((memory) => ({ kind: "promoted" as const, memory })),
         ...candidates.map((memory) => ({ kind: "candidate" as const, memory }))
       ];
+      const terms = queryTermsFor(input.query, input.match);
       return matches
         .slice(offset, offset + limit)
-        .map(({ kind, memory }) => input.summaryOnly
-          ? memorySearchSummaryResult(store, kind, memory)
-          : memorySearchResult(store, kind, memory));
+        .map(({ kind, memory }) => {
+          const result = input.summaryOnly
+            ? memorySearchSummaryResult(store, kind, memory)
+            : memorySearchResult(store, kind, memory);
+          return terms
+            ? { ...result, match: { terms: terms.length, matched: countMatchedTerms(memoryQueryHaystack(memory), terms) } }
+            : result;
+        });
     },
     readMemorySearchResultsByIds(memoryIds, input = {}) {
       memoryIds = memoryIds.map(contentPolicy.identifier);
@@ -2641,16 +2760,24 @@ function countMemoryHealth(store: MemoryStore): {
   quarantined: number;
   retired: number;
   replaced: number;
+  candidates: { needsReview: number; quarantined: number };
 } {
-  const population = readMemoryPopulation(store);
-  const live = population.live.map(({ memory }) => memory.qualityStatus);
-  return {
-    active: live.filter((status) => status === "active").length,
-    needsReview: live.filter((status) => status === "needs_review").length,
-    quarantined: live.filter((status) => status === "quarantined").length,
-    retired: population.retired,
-    replaced: population.replaced
-  };
+  return { ...revisionCached(store, "memory-health", () => {
+    const population = readMemoryPopulation(store);
+    const live = population.live.map(({ memory }) => memory.qualityStatus);
+    const candidates = population.live.filter(({ category }) => category === "candidate").map(({ memory }) => memory.qualityStatus);
+    return {
+      active: live.filter((status) => status === "active").length,
+      needsReview: live.filter((status) => status === "needs_review").length,
+      quarantined: live.filter((status) => status === "quarantined").length,
+      retired: population.retired,
+      replaced: population.replaced,
+      candidates: {
+        needsReview: candidates.filter((status) => status === "needs_review").length,
+        quarantined: candidates.filter((status) => status === "quarantined").length
+      }
+    };
+  }) };
 }
 
 /**
@@ -3028,10 +3155,27 @@ function matchesMemoryQuery(
   if (!query) return true;
   const normalized = query.trim().toLowerCase();
   if (!normalized) return true;
-  const haystack = [memoryContentText(value), value.relatedFiles.join(" ")]
-    .join(" ")
-    .toLowerCase();
-  return haystack.includes(normalized);
+  return memoryQueryHaystack(value).includes(normalized);
+}
+
+// Same text the published index stores in records.text, so both engines match identically.
+function memoryQueryHaystack(value: Pick<MemoryCandidate, "title" | "summary" | "reason" | "relatedFiles" | "statement">): string {
+  return [memoryContentText(value), value.relatedFiles.join(" ")].join(" ").toLowerCase();
+}
+
+/**
+ * True for a commit source whose every changed file is a generated summary or handbook.
+ * Such commits stay as evidence but leave raw search.
+ */
+function generatedOnlyCommitSql(sourceIdColumn: string): string {
+  return `exists (select 1 from commits gc where gc.hash = ${sourceIdColumn}
+    and json_array_length(gc.changed_files_json) > 0
+    and not exists (select 1 from json_each(gc.changed_files_json) gj where not ${searchExcludedPathSql("gj.value")}))`;
+}
+
+/** Stable, so equal counts keep the caller's recency order. */
+function rankByMatchedTerms<T extends { id: string }>(items: T[], counts: Map<string, number>): T[] {
+  return [...items].sort((left, right) => (counts.get(right.id) ?? 0) - (counts.get(left.id) ?? 0));
 }
 
 function syncStatusFromRow(row: SyncStatusRow): SyncStatus {

@@ -12,7 +12,7 @@ It indexes evidence from Git commits, Codex sessions, Claude sessions, manual de
 
 Project memory stays local by default in each repository's `.code-butler/` directory.
 
-Search is local SQLite FTS by default. Projects may opt into hybrid lexical/semantic ranking through an explicitly configured OpenAI-compatible embedding endpoint; FTS remains the exact fallback and remote use requires explicit privacy permission with mandatory redaction.
+Search is local SQLite FTS by default. Projects may opt into hybrid lexical/semantic ranking through an explicitly configured OpenAI-compatible embedding endpoint; FTS remains the exact fallback and remote use requires explicit privacy permission with mandatory redaction. LLM extraction is likewise opt-in: a provider key exported in your shell does not switch it on ([privacy](privacy.md#remote-ai-models)).
 
 Code-aware summaries inspect deterministic, privacy-filtered Git-tracked implementation files and preserve a user-owned notes overlay. Manual summary edits are protected with a separate output hash. Persisted source parsing failures are available through `code-butler sources failures` and `list_source_failures`, then resolve automatically after repair.
 

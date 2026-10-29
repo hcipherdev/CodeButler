@@ -3,6 +3,7 @@ import type { DatabaseSync } from "node:sqlite";
 
 import { normalizeMemorySummary, type ComparableMemoryFact } from "../memory/conflicts.js";
 import { parseScope } from "../memory/scope.js";
+import { repairPartitionReferences } from "./partition.js";
 import type { EvidenceRef, MemoryType } from "../types.js";
 import type { MemoryStore } from "../storage/store.js";
 
@@ -168,52 +169,80 @@ export function mergeCore(
   const byTable = (left: PlannedRow, right: PlannedRow): number =>
     (order.get(left.table) ?? 0) - (order.get(right.table) ?? 0);
 
-  for (const item of [...planned].sort((left, right) => byTable(right, left))) {
-    if (item.action !== "delete_local") continue;
-    deleteRow(local, item.table, item.key, item.id);
-    result.deleted += 1;
-  }
-  for (const item of [...planned].sort(byTable)) {
-    if (item.action === "insert_remote" || item.action === "take_remote") {
-      // Guaranteed by decideRow: neither action is reachable without a remote row.
-      if (item.row === undefined) throw new Error("Cloud merge cannot adopt a missing row");
-      const row={...item.row};
-      const remap=(field:string,table:string)=>{if(typeof row[field]==="string")row[field]=aliases.get(table+":"+row[field])??row[field];};
-      const categoryTable=(category:unknown)=>category==="candidate"?"memory_candidates":category==="temporary"?"temporary_memories":"memories";
-      if(item.table==="memory_candidates")remap("promoted_memory_id","memories");
-      if(item.table==="memory_relations"){remap("from_memory_id","memories");remap("to_memory_id","memories");}
-      if(item.table==="memory_links")remap("owner_id",row.owner_kind==="candidate"?"memory_candidates":"memories");
-      if(item.table==="temporary_memory_links")remap("memory_id","temporary_memories");
-      if(["memory_events","memory_topic_links","memory_review_resolutions","memory_review_resolution_compensations"].includes(item.table)){
-        remap("memory_id",categoryTable(row.category));remap("related_memory_id",categoryTable(row.related_category));remap("replacement_memory_id",categoryTable(row.replacement_category));
-      }
-      const duplicate = heldUnderAnotherId(local, item.table, item.key, row);
-      if (duplicate) {
-        if (MEMORY_TABLES.has(item.table) && statementFact(duplicate) !== statementFact(item.row)) {
-          result.flagged += 1;
-          result.reviewMemoryIds.push(String(duplicate.id));
-          result.decisions.push({ table: item.table, key: item.id, action: "flag_conflict", reason: "divergent_statement_existing_identity" });
+  /*
+   * Table order alone cannot settle a child that is updated rather than deleted: when the
+   * other device deletes a memory and clears its candidate's `promoted_memory_id`, the
+   * delete pass removes the memory while the candidate still points at it, and the update
+   * that clears the pointer only comes in the second pass. References are therefore
+   * checked once the whole plan is applied, not after each row.
+   *
+   * Deletes win unconditionally, so a row this device kept (its own addition, or its side of
+   * a conflict) can still point at a memory the other device deleted. Applying a snapshot
+   * repairs exactly that rather than failing, and so does the merge; any reference still
+   * dangling after the repair is a real inconsistency and fails the merge.
+   */
+  const deferred = Number((local.prepare("pragma defer_foreign_keys").get() as { defer_foreign_keys: number }).defer_foreign_keys);
+  local.exec("pragma defer_foreign_keys = on");
+  try {
+    for (const item of [...planned].sort((left, right) => byTable(right, left))) {
+      if (item.action !== "delete_local") continue;
+      deleteRow(local, item.table, item.key, item.id);
+      result.deleted += 1;
+    }
+    for (const item of [...planned].sort(byTable)) {
+      if (item.action === "insert_remote" || item.action === "take_remote") {
+        // Guaranteed by decideRow: neither action is reachable without a remote row.
+        if (item.row === undefined) throw new Error("Cloud merge cannot adopt a missing row");
+        const row={...item.row};
+        const remap=(field:string,table:string)=>{if(typeof row[field]==="string")row[field]=aliases.get(table+":"+row[field])??row[field];};
+        const categoryTable=(category:unknown)=>category==="candidate"?"memory_candidates":category==="temporary"?"temporary_memories":"memories";
+        if(item.table==="memory_candidates")remap("promoted_memory_id","memories");
+        if(item.table==="memory_relations"){remap("from_memory_id","memories");remap("to_memory_id","memories");}
+        if(item.table==="memory_links")remap("owner_id",row.owner_kind==="candidate"?"memory_candidates":"memories");
+        if(item.table==="temporary_memory_links")remap("memory_id","temporary_memories");
+        if(["memory_events","memory_topic_links","memory_review_resolutions","memory_review_resolution_compensations"].includes(item.table)){
+          remap("memory_id",categoryTable(row.category));remap("related_memory_id",categoryTable(row.related_category));remap("replacement_memory_id",categoryTable(row.replacement_category));
+        }
+        const duplicate = heldUnderAnotherId(local, item.table, item.key, row);
+        if (duplicate) {
+          if (MEMORY_TABLES.has(item.table) && statementFact(duplicate) !== statementFact(item.row)) {
+            result.flagged += 1;
+            result.reviewMemoryIds.push(String(duplicate.id));
+            result.decisions.push({ table: item.table, key: item.id, action: "flag_conflict", reason: "divergent_statement_existing_identity" });
+            continue;
+          }
+          result.decisions.push({ table: item.table, key: item.id, action: "keep_local", reason: "converged_existing_identity" });
+          result.converged += 1;
+          if(MEMORY_TABLES.has(item.table)&&newer(row,duplicate))writeRow(local,item.table,item.key,item.columns,{...row,id:duplicate.id});
+          if(["memories","memory_candidates","temporary_memories"].includes(item.table))aliases.set(item.table+":"+String(item.row.id),String(duplicate.id));
           continue;
         }
-        result.decisions.push({ table: item.table, key: item.id, action: "keep_local", reason: "converged_existing_identity" });
-        result.converged += 1;
-        if(MEMORY_TABLES.has(item.table)&&newer(row,duplicate))writeRow(local,item.table,item.key,item.columns,{...row,id:duplicate.id});
-        if(["memories","memory_candidates","temporary_memories"].includes(item.table))aliases.set(item.table+":"+String(item.row.id),String(duplicate.id));
-        continue;
+        writeRow(local, item.table, item.key, item.columns, row);
+        result.adopted += 1;
+      } else if (item.action === "flag_conflict") {
+        result.flagged += 1;
+        if (MEMORY_TABLES.has(item.table) && item.localId !== undefined) result.reviewMemoryIds.push(item.localId);
+      } else if (item.action === "keep_local") {
+        result.retained += 1;
       }
-      writeRow(local, item.table, item.key, item.columns, row);
-      result.adopted += 1;
-    } else if (item.action === "flag_conflict") {
-      result.flagged += 1;
-      if (MEMORY_TABLES.has(item.table) && item.localId !== undefined) result.reviewMemoryIds.push(item.localId);
-    } else if (item.action === "keep_local") {
-      result.retained += 1;
     }
+    repairPartitionReferences(local);
+    assertNoDanglingReferences(local);
+  } finally {
+    local.exec(`pragma defer_foreign_keys = ${deferred ? "on" : "off"}`);
   }
 
   // Each device's operation log is its own history; neither supersedes the other.
   unionOperationLog(local, remote);
   return result;
+}
+
+/** Names the first reference a merge left dangling, which a deferred commit would only report as a bare constraint failure. */
+function assertNoDanglingReferences(db: DatabaseSync): void {
+  const violations = db.prepare("pragma foreign_key_check").all() as Array<{ table: string; rowid: number | null; parent: string }>;
+  if (violations.length === 0) return;
+  const first = violations[0]!;
+  throw new Error(`Cloud merge left ${violations.length} dangling reference(s), first ${first.table} row ${first.rowid ?? "?"} -> missing ${first.parent}: FOREIGN KEY constraint failed`);
 }
 
 /** This device's shared memories before a merge, and how many of them the merge deletes. */

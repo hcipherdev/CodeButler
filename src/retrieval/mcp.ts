@@ -49,12 +49,11 @@ export async function createPublishedMemoryServer(root: string, options: Project
             const filter={...input,reach:(input.reach??"project") as "project"};
             return input.topicId?readHandbookTopic(data,String(input.topicId),filter,input.offset as number|undefined,input.limit as number|undefined):readHandbook(data,filter);
         });
+        // Agents phrase queries as loose keywords; the desktop keeps exact-phrase filtering.
         if (name === "find_memories")
-            return findPublishedMemories(root, input);
+            return findPublishedMemories(root, { ...input, match: "terms" });
         if (name === "search_project_memory")
-            return searchPublishedMemory(root, input as {
-                query: string;
-            });
+            return searchPublishedMemory(root, { ...input as { query: string }, match: "terms" });
         if (name === "summarize_project_state") {
             const page = readPublishedSummary(root);
             return { ...page.summary, freshness: page.freshness };

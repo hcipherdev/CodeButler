@@ -19,7 +19,7 @@ import { readProjectOperationStatus, withProjectGate } from "../src/cloud/gate.j
 import { activeForegroundIntent, renewForegroundIntent } from "../src/cloud/foreground.js";
 import { ReviewStartCancelledError, runDesktopMemoryReview } from "../src/desktop/service.js";
 import { AutomaticSyncOwner } from "../src/cloud/sync-owner.js";
-import { runGlobalWatch } from "../src/global-watch.js";
+import { globalWatchDirectory, runGlobalWatch } from "../src/global-watch.js";
 import { NativeSecurity } from "../src/cloud/native-security.js";
 
 describe("desktop engine contract", () => {
@@ -158,6 +158,38 @@ describe("desktop engine contract", () => {
     expect(applied).toMatchObject({ counts: { applied: 1 } });
     expect(status).toMatchObject({ run: { id: run.id } });
     expect(results).toMatchObject({ run: { id: run.id } });
+  });
+
+  it("returns saved AI review results while another operation holds the project lock", async () => {
+    await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
+    const store = openConfiguredMemoryStore(root); store.init();
+    store.upsertMemoryCandidate({
+      type: "constraint", title: "Legacy config", summary: "package.json defines retries.",
+      reason: "Legacy deterministic config extraction.", confidence: 0.65, evidence: [],
+      relatedFiles: ["package.json"], dedupeKey: "deterministic:config:package.json:retries"
+    }, { qualityStatus: "quarantined", qualityReasons: ["legacy_low_signal_heuristic"] });
+    store.close();
+    const run = await planMemoryReconciliation(root, {
+      queue: "all", desktopSelection: { kind: "quarantined", limit: 1 }, maxRequests: 1, tokenBudget: 1
+    });
+
+    let release!: () => void;
+    let entered!: () => void;
+    const acquired = new Promise<void>(resolve => { entered = resolve; });
+    const holding = withProjectGate(root, async () => {
+      await new Promise<void>(resolve => { release = resolve; entered(); });
+    });
+    await acquired;
+    const started = Date.now();
+    const busy = await handleDesktopRequest({ version: 1, action: "memory.ai.results", root, runId: run.id });
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(busy).toMatchObject({ run: { id: run.id }, memories: {}, memoriesPending: true });
+    release();
+    await holding;
+
+    const free = await handleDesktopRequest({ version: 1, action: "memory.ai.results", root, runId: run.id });
+    expect(free).not.toHaveProperty("memoriesPending");
+    expect(free).toMatchObject({ run: { id: run.id }, memories: { [run.items[0]!.memoryId]: { title: "Legacy config" } } });
   });
 
   it("identifies a lock owner and queues review startup until the lock clears", async () => {
@@ -386,6 +418,22 @@ describe("desktop engine contract", () => {
     const overview = await handleDesktopRequest({ version: 1, action: "project.overview", root }) as { cloud: { pendingSync?: boolean; lastCompletedAt?: string } };
     expect(overview.cloud.pendingSync).toBeUndefined();
     expect(overview.cloud.lastCompletedAt).toEqual(expect.any(String));
+  });
+
+  it("reports a cloud sync as failing only after repeated failed runs", async () => {
+    await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
+    saveBinding(root, {
+      projectId: "test-cloud-project", server: "https://cloud.example.test", vaultId: "test-vault",
+      enabled: true, revision: 1, fingerprint: "0".repeat(64), status: "deferred", syncCondition: "deferred"
+    });
+    const reason = "Cloud merge failed and was rolled back: FOREIGN KEY constraint failed";
+    await runGlobalWatch({ cliPath: "unused", once: true, runProject: async () => ({ outcome: "failed", stage: "cloud", reason }) });
+    expect(await handleDesktopRequest({ version: 1, action: "cloud.sync.status", root })).not.toHaveProperty("failedReason");
+    // Later passes wait out the retry backoff, so the third consecutive failure is written as the watcher records it.
+    const statusDirectory = join(globalWatchDirectory(), "status");
+    const [statusFile] = readdirSync(statusDirectory).map(name => join(statusDirectory, name));
+    writeFileSync(statusFile!, JSON.stringify({ ...JSON.parse(readFileSync(statusFile!, "utf8")), retryCount: 3 }));
+    expect(await handleDesktopRequest({ version: 1, action: "cloud.sync.status", root })).toMatchObject({ failedReason: reason });
   });
 
   it("does not follow a project-memory junction outside the project", async () => {
@@ -855,6 +903,16 @@ describe("desktop engine contract", () => {
     expect(result).toMatchObject({ initialized: false, warnings: [expect.stringContaining("Task Scheduler unavailable")] });
     const list = await handleDesktopRequest({ version: 1, action: "projects.list" }, { watcherServiceStatus });
     expect(list).toMatchObject({ projects: [{ root }] });
+  });
+
+  it("installs the shared watcher on request and reports why it could not", async () => {
+    const ensureGlobalWatcher = vi.fn();
+    await expect(handleDesktopRequest({ version: 1, action: "watcher.install" }, { ensureGlobalWatcher, watcherServiceStatus }))
+      .resolves.toMatchObject({ installed: true, label: "com.codebutler.watch.global" });
+    expect(ensureGlobalWatcher).toHaveBeenCalledOnce();
+    await expect(handleDesktopRequest({ version: 1, action: "watcher.install" }, {
+      ensureGlobalWatcher() { throw new Error("Task Scheduler unavailable"); }, watcherServiceStatus
+    })).rejects.toMatchObject({ code: "invalid-request", message: expect.stringContaining("Task Scheduler unavailable") });
   });
 
   it("reports a missing folder clearly and does not register it", async () => {

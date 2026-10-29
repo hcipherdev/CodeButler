@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 import { cachedRead } from "../retrieval/read-cache.js";
+import { prepareCached } from "../storage/statements.js";
+import { fileCommits, latestRelevantCommit } from "./related-change.js";
 
 import type { MemoryStore } from "../storage/store.js";
 import type {
+  CommitRecord,
   DurableMemory,
   EvidenceRef,
   MemoryCandidate,
@@ -61,8 +64,15 @@ const REVIEW_COLUMNS = `
 export interface MemoryReviewContext {
   memoryVersion: string;
   reviewToken: string;
-  /** Compatibility with reviews saved before evidence content was included in tokens. */
-  legacyReviewToken: string;
+  /**
+   * reviewToken plus the tokens earlier fingerprint rules gave this same context: before
+   * evidence content was included, and before related files counted only relevant commits.
+   */
+  acceptedTokens: string[];
+}
+
+export function acceptsReviewToken(context: MemoryReviewContext, token: string): boolean {
+  return context.acceptedTokens.includes(token);
 }
 
 export function createMemoryReviewContext(
@@ -76,11 +86,11 @@ export function createMemoryReviewContext(
   const evidenceState = memory.evidence
     .map((evidence) => ({ ...evidence, resolved: evidenceExists(store, evidence), version: evidenceVersion(store,evidence) }))
     .sort((left, right) => evidenceKey(left).localeCompare(evidenceKey(right)));
-  const relatedFileState = [...new Set(memory.relatedFiles)].sort().map((filePath) => {
-    const latest = cachedRead(store, `latest-commits:${filePath}`, () => store.findCommits({ filePath, limit: 100 }))
-      .sort((left, right) => right.authoredAt.localeCompare(left.authoredAt) || right.hash.localeCompare(left.hash))[0];
-    return { filePath, latestCommit: latest ? { hash: latest.hash, authoredAt: latest.authoredAt } : null };
-  });
+  const relatedFiles = [...new Set(memory.relatedFiles)].sort();
+  const commitState = (commit: CommitRecord | undefined) => commit ? { hash: commit.hash, authoredAt: commit.authoredAt } : null;
+  // A commit that changes nothing the memory names leaves its review current.
+  const relatedFileState = relatedFiles.map((filePath) => ({ filePath, latestCommit: commitState(latestRelevantCommit(store, memory, filePath)) }));
+  const anyCommitFileState = relatedFiles.map((filePath) => ({ filePath, latestCommit: commitState(fileCommits(store, filePath)[0]) }));
   const conflicts = [
     ...store.listMemoryRelations({ fromMemoryId: memory.id, relationType: "potentially_contradicts" }),
     ...store.listMemoryRelations({ toMemoryId: memory.id, relationType: "potentially_contradicts" })
@@ -113,13 +123,17 @@ export function createMemoryReviewContext(
     relatedFileState,
     conflicts
   };
+  const token = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  const reviewToken = token(payload);
+  const anyCommitPayload = { ...payload, relatedFileState: anyCommitFileState };
   return {
     memoryVersion,
-    reviewToken: createHash("sha256").update(JSON.stringify(payload)).digest("hex"),
-    legacyReviewToken: createHash("sha256").update(JSON.stringify({
-      ...payload,
-      evidenceState: evidenceState.map(({ version: _version, ...evidence }) => evidence)
-    })).digest("hex")
+    reviewToken,
+    acceptedTokens: [...new Set([
+      reviewToken,
+      token(anyCommitPayload),
+      token({ ...anyCommitPayload, evidenceState: evidenceState.map(({ version: _version, ...evidence }) => evidence) })
+    ])]
   };
 }
 
@@ -133,8 +147,7 @@ export function currentMemoryReview(
   if (!latest) return undefined;
   const context = providedContext ?? createMemoryReviewContext(store, category, memory);
   const current = latest.action === "verify"
-    ? latest.memory_version === context.memoryVersion &&
-      [context.reviewToken, context.legacyReviewToken].includes(latest.context_fingerprint)
+    ? latest.memory_version === context.memoryVersion && acceptsReviewToken(context, latest.context_fingerprint)
     : true;
   return reviewSummary(latest, current);
 }
@@ -144,7 +157,7 @@ export function effectiveTerminalMemoryReview(
   category: MemoryReviewCategory,
   memory: Pick<ReviewableMemory, "id">
 ): MemoryReviewSummary | undefined {
-  const row = store.db.prepare(
+  const row = prepareCached(store.db,
     `select ${REVIEW_COLUMNS}
        from memory_review_resolutions r
       where r.memory_id = ? and r.category = ?
@@ -165,16 +178,45 @@ export function matchingMemoryVerification(
   providedContext?: MemoryReviewContext
 ): MemoryReviewSummary | undefined {
   const context = providedContext ?? createMemoryReviewContext(store, category, memory);
-  const row = store.db.prepare(
+  const row = prepareCached(store.db,
     `select ${REVIEW_COLUMNS}
        from memory_review_resolutions r
-      where memory_id = ? and category = ? and memory_version = ? and context_fingerprint in (?, ?)
+      where memory_id = ? and category = ? and memory_version = ? and context_fingerprint in (${placeholders(context.acceptedTokens)})
         and not exists (select 1 from memory_review_resolution_compensations c where c.resolution_id = r.id)
       order by reviewed_at desc, rowid desc
       limit 1`
-  ).get(memory.id, category, context.memoryVersion, context.reviewToken, context.legacyReviewToken) as MemoryReviewRow | undefined;
+  ).get(memory.id, category, context.memoryVersion, ...context.acceptedTokens) as MemoryReviewRow | undefined;
   if (!row || row.action !== "verify") return undefined;
   return reviewSummary(row, true);
+}
+
+/**
+ * A durable memory made from a candidate starts without reviews of its own, so the
+ * candidate's verification would otherwise be asked for again. It carries over when the
+ * candidate's latest review is that verification, the durable memory states the same
+ * claim, and the candidate's context, rebuilt at the version and layer it was verified
+ * at, still gives the verified token: nothing it was checked against has changed since.
+ */
+export function inheritedCandidateVerification(store: MemoryStore, memory: DurableMemory): MemoryReviewSummary | undefined {
+  const candidateIds = prepareCached(store.db, "select id from memory_candidates where promoted_memory_id = ? order by updated_at desc")
+    .all(memory.id) as Array<{ id: string }>;
+  for (const { id } of candidateIds) {
+    const candidate = store.readMemoryCandidate(id);
+    if (!candidate || !sameClaim(candidate, memory)) continue;
+    const row = readLatestReview(store, id, "candidate");
+    if (row?.action !== "verify") continue;
+    const context = createMemoryReviewContext(store, "candidate", { ...candidate, updatedAt: row.memory_version, layer: row.layer });
+    if (acceptsReviewToken(context, row.context_fingerprint)) return reviewSummary(row, true);
+  }
+  return undefined;
+}
+
+function sameClaim(candidate: MemoryCandidate, memory: DurableMemory): boolean {
+  const claim = (value: ReviewableMemory) => JSON.stringify({
+    type: value.type, title: value.title, summary: value.summary, reason: value.reason,
+    statement: value.statement ?? null, relatedFiles: [...new Set(value.relatedFiles)].sort()
+  });
+  return claim(candidate) === claim(memory);
 }
 
 export function readExactMemoryReview(
@@ -187,7 +229,7 @@ export function readExactMemoryReview(
     action: MemoryReviewAction;
   }
 ): MemoryReviewSummary | undefined {
-  const row = store.db.prepare(
+  const row = prepareCached(store.db,
     `select ${REVIEW_COLUMNS}
        from memory_review_resolutions r
       where memory_id = ? and category = ? and memory_version = ? and context_fingerprint = ? and action = ?
@@ -207,7 +249,7 @@ export function findMemoryReviewByToken(
     action: MemoryReviewAction;
   }
 ): MemoryReviewSummary | undefined {
-  const row = store.db.prepare(
+  const row = prepareCached(store.db,
     `select ${REVIEW_COLUMNS}
        from memory_review_resolutions r
       where memory_id = ? and category = ? and context_fingerprint = ? and action = ?
@@ -250,7 +292,7 @@ function readLatestReview(
   memoryId: string,
   category: MemoryReviewCategory
 ): MemoryReviewRow | undefined {
-  return store.db.prepare(
+  return prepareCached(store.db,
     `select ${REVIEW_COLUMNS}
        from memory_review_resolutions r
       where memory_id = ? and category = ?
@@ -291,14 +333,14 @@ function matchingMemoryVerificationByActor(
   actors: OperationActor[]
 ): MemoryReviewSummary | undefined {
   const context = createMemoryReviewContext(store, category, memory);
-  const row = store.db.prepare(
+  const row = prepareCached(store.db,
     `select ${REVIEW_COLUMNS}
        from memory_review_resolutions r
-      where r.memory_id = ? and r.category = ? and r.memory_version = ? and r.context_fingerprint in (?, ?)
-        and r.action = 'verify' and r.actor in (${actors.map(() => "?").join(", ")})
+      where r.memory_id = ? and r.category = ? and r.memory_version = ? and r.context_fingerprint in (${placeholders(context.acceptedTokens)})
+        and r.action = 'verify' and r.actor in (${placeholders(actors)})
         and not exists (select 1 from memory_review_resolution_compensations c where c.resolution_id = r.id)
       order by r.reviewed_at desc, r.rowid desc limit 1`
-  ).get(memory.id, category, context.memoryVersion, context.reviewToken, context.legacyReviewToken, ...actors) as MemoryReviewRow | undefined;
+  ).get(memory.id, category, context.memoryVersion, ...context.acceptedTokens, ...actors) as MemoryReviewRow | undefined;
   return row ? reviewSummary(row, true) : undefined;
 }
 
@@ -310,6 +352,10 @@ function evidenceExists(store: MemoryStore, evidence: EvidenceRef): boolean {
     return store.readConversationWindow(evidence.sourceId, evidence.locator, 0, 0).length === 1;
   }
   return store.readSourceMetadata(evidence.sourceId) !== undefined;
+}
+
+function placeholders(values: readonly unknown[]): string {
+  return values.map(() => "?").join(", ");
 }
 
 function evidenceKey(evidence: EvidenceRef & { resolved: boolean }): string {

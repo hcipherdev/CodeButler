@@ -32,7 +32,7 @@ export function processStartIdentity(pid: number): string | undefined {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       value = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!;
     } else {
-      value = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 5000 }).trim();
+      value = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 5000, windowsHide: true }).trim();
     }
     if (!value) return undefined;
     if (pid === process.pid) ownBirth = value;

@@ -1,10 +1,8 @@
 import { SCOPE_GUIDANCE } from "../memory/scope.js";
-import {
-  anthropicAwsRequestConfig,
-  readAnthropicAwsText,
-  runAnthropicAwsMessage,
-  type AnthropicAwsHttpClient
-} from "../providers/anthropic-aws.js";
+import { chatCompletion } from "../ai/chat.js";
+import { credentialStatus } from "../ai/credentials.js";
+import { jobModel } from "../ai/models.js";
+import type { AnthropicAwsHttpClient } from "../providers/anthropic-aws.js";
 import { parseJsonFromModelText } from "../json.js";
 import type { ExtractorConfig, InvestigatorConfig, ProjectConfig } from "../types.js";
 import type { ProjectSummaryGenerator, ProjectSummaryGeneratorInput } from "./service.js";
@@ -25,14 +23,11 @@ const DEFAULT_PROJECT_SUMMARY_MAX_TOKENS = 8192;
 const PROJECT_SUMMARY_REQUEST_TIMEOUT_MS = 300000;
 
 export function createConfiguredProjectSummaryGenerator(config: ProjectConfig): ProjectSummaryGenerator {
-  const providerConfig =
-    config.investigator.enabled
-      ? config.investigator
-      : config.extractor;
+  const providerConfig = jobModel(config, "summary");
   // Extraction/investigation profiles are deliberately small (1200/2500 tokens).
   // A full narrative needs its own budget or its JSON string can be cut off.
   const summaryConfig = { ...providerConfig, maxTokens: DEFAULT_PROJECT_SUMMARY_MAX_TOKENS };
-  if (providerConfig.provider === "anthropic-aws") {
+  if (providerConfig.provider === "anthropic-aws" || providerConfig.provider === "anthropic") {
     return createAnthropicAwsProjectSummaryGenerator(summaryConfig);
   }
   return createOpenAICompatibleProjectSummaryGenerator(summaryConfig);
@@ -45,43 +40,20 @@ export function createOpenAICompatibleProjectSummaryGenerator(
   return {
     name: `${config.provider}:${config.model}`,
     async generate(input, signal): Promise<string> {
-      const apiKey = readRequiredProjectSummaryEnv(config.apiKeyEnv);
-      const baseUrl = config.baseUrl ?? "https://api.openai.com/v1";
-      let response: Awaited<ReturnType<typeof fetchImpl>>;
-      try {
-        response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-          method: "POST",
-          signal: AbortSignal.any([AbortSignal.timeout(PROJECT_SUMMARY_REQUEST_TIMEOUT_MS), ...(signal ? [signal] : [])]),
-          headers: {
-            "content-type": "application/json",
-            authorization: `Bearer ${apiKey}`
-          },
-          body: JSON.stringify({
-            model: config.model,
-            temperature: 0,
-            max_tokens: config.maxTokens ?? DEFAULT_PROJECT_SUMMARY_MAX_TOKENS,
-            messages: [
-              {
-                role: "system",
-                content: PROJECT_SUMMARY_SYSTEM_PROMPT
-              },
-              {
-                role: "user",
-                content: JSON.stringify(projectSummaryPayload(input))
-              }
-            ]
-          })
-        });
-      } catch (error) {
-        if (error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name)) {
-          throw new Error("Project summary request timed out");
-        }
-        throw error;
-      }
-      if (!response.ok) {
-        throw new Error(`Project summary request failed with status ${response.status}`);
-      }
-      return readSummaryMarkdown(readCompletionContent(await response.json()));
+      assertSummaryCredentials(config);
+      const { content } = await chatCompletion(config, {
+        job: "summary",
+        system: PROJECT_SUMMARY_SYSTEM_PROMPT,
+        user: JSON.stringify(projectSummaryPayload(input)),
+        maxTokens: config.maxTokens ?? DEFAULT_PROJECT_SUMMARY_MAX_TOKENS,
+        sendMaxTokens: true,
+        signal,
+        timeoutMs: PROJECT_SUMMARY_REQUEST_TIMEOUT_MS,
+        errorLabel: "Project summary",
+        invalidResponseMessage: "Invalid project summary response",
+        timeoutMessage: "Project summary request timed out"
+      }, { fetchImpl });
+      return readSummaryMarkdown(content);
     }
   };
 }
@@ -93,20 +65,18 @@ export function createAnthropicAwsProjectSummaryGenerator(
   return {
     name: `${config.provider}:${config.model}`,
     async generate(input, signal): Promise<string> {
-      readRequiredProjectSummaryEnv(config.apiKeyEnv);
-      const requestConfig = anthropicAwsRequestConfig(config);
-      const payload = await runAnthropicAwsMessage(
-        {
-          ...requestConfig,
-          timeoutMs: PROJECT_SUMMARY_REQUEST_TIMEOUT_MS,
-          signal,
-          maxTokens: config.maxTokens ?? DEFAULT_PROJECT_SUMMARY_MAX_TOKENS,
-          system: PROJECT_SUMMARY_SYSTEM_PROMPT,
-          messages: [{ role: "user", content: JSON.stringify(projectSummaryPayload(input)) }]
-        },
-        httpClient
-      );
-      return readSummaryMarkdown(readAnthropicAwsText(payload));
+      assertSummaryCredentials(config);
+      const { content } = await chatCompletion(config, {
+        job: "summary",
+        system: PROJECT_SUMMARY_SYSTEM_PROMPT,
+        user: JSON.stringify(projectSummaryPayload(input)),
+        maxTokens: config.maxTokens ?? DEFAULT_PROJECT_SUMMARY_MAX_TOKENS,
+        signal,
+        timeoutMs: PROJECT_SUMMARY_REQUEST_TIMEOUT_MS,
+        errorLabel: "Project summary",
+        invalidResponseMessage: "Invalid AnthropicAWS response"
+      }, { anthropicHttpClient: httpClient });
+      return readSummaryMarkdown(content);
     }
   };
 }
@@ -125,12 +95,9 @@ function projectSummaryPayload(input: ProjectSummaryGeneratorInput): Record<stri
   };
 }
 
-function readRequiredProjectSummaryEnv(envName: string): string {
-  const value = process.env[envName]?.trim();
-  if (!value) {
-    throw new Error(`Project summary provider credentials are missing; set ${envName}`);
-  }
-  return value;
+function assertSummaryCredentials(config: SummaryProviderConfig): void {
+  const status = credentialStatus(config);
+  if (!status.ok) throw new Error(`Project summary provider credentials are missing; set ${status.missing.join(", ")}`);
 }
 
 function readSummaryMarkdown(content: string): string {
@@ -149,25 +116,6 @@ function readSummaryMarkdown(content: string): string {
     throw new Error("Invalid project summary response");
   }
   return summaryMarkdown;
-}
-
-function readCompletionContent(payload: unknown): string {
-  const record = asRecord(payload);
-  const choices = Array.isArray(record?.choices) ? record.choices : [];
-  const first = asRecord(choices[0]);
-  const message = asRecord(first?.message);
-  if (typeof message?.content === "string") return message.content;
-  if (Array.isArray(message?.content)) {
-    const joined = message.content
-      .map((item) => {
-        const part = asRecord(item);
-        return typeof part?.text === "string" ? part.text : "";
-      })
-      .join("\n")
-      .trim();
-    if (joined) return joined;
-  }
-  throw new Error("Invalid project summary response");
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

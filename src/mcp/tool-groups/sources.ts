@@ -3,7 +3,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { ProjectMemoryToolHandlers } from "../tools.js";
-import { asJsonContent, compactOptionalInput } from "./shared.js";
+import { asCompactJsonContent, asJsonContent, compactOptionalInput, searchMaxCharsSchema } from "./shared.js";
+import { shapeSearchProjectMemory } from "../search-response.js";
 import { ruleQuerySchema, GLOBAL_RULES_INSTRUCTIONS } from "../../rules/match.js";
 import { agentRecordInputSchema, RECORD_RULE_ATTESTATION_DESCRIPTION } from "../../rules/attestations.js";
 
@@ -32,16 +33,19 @@ export function registerSourceToolGroup(
       targetEnvironment: targetEnvironmentSchema.optional(),
       query: z.string().min(1),
       sourceTypes: z.array(z.enum(["conversation", "commit", "decision"])).optional(),
-      limit: z.number().int().positive().max(100).optional()
+      limit: z.number().int().positive().max(100).optional(),
+      maxChars: searchMaxCharsSchema
     }
-  }, async (input) => asJsonContent(await handlers.search_project_memory(
+  }, async ({ maxChars, ...input }) => asCompactJsonContent(shapeSearchProjectMemory(await handlers.search_project_memory(
     compactOptionalInput<Parameters<ProjectMemoryToolHandlers["search_project_memory"]>[0]>(input)
-  )));
+  ), { query: input.query, maxChars })));
 
   server.registerTool("read_memory_source", {
-    description: "Read the raw stored source for a memory source id.",
-    inputSchema: { sourceId: z.string().min(1) }
-  }, async (input) => asJsonContent(await handlers.read_memory_source(input)));
+    description: "Read the raw stored source for a memory source id. Pass chunkId from a search hit to read just that chunk in full.",
+    inputSchema: { sourceId: z.string().min(1), chunkId: z.string().min(1).optional() }
+  }, async ({ chunkId, ...input }) => asJsonContent(chunkId === undefined
+    ? await handlers.read_memory_source(input)
+    : await handlers.read_memory_chunk({ ...input, chunkId })));
 
   server.registerTool("find_decisions", {
     description: "Find project decisions from manual records and promoted decision memories." + SCOPE_GUIDANCE,

@@ -3,12 +3,8 @@ import {
   investigationPlanDecisionSchema,
   investigationSynthesisSchema
 } from "./actions.js";
-import {
-  anthropicAwsRequestConfig,
-  readAnthropicAwsText,
-  runAnthropicAwsMessage,
-  type AnthropicAwsHttpClient
-} from "../providers/anthropic-aws.js";
+import { chatCompletion } from "../ai/chat.js";
+import { anthropicAwsRequestConfig, type AnthropicAwsHttpClient } from "../providers/anthropic-aws.js";
 import type {
   InvestigationPlannerState,
   InvestigatorConfig,
@@ -69,22 +65,15 @@ async function requestJsonContent(
   systemPrompt: string,
   payload: Record<string, unknown>
 ): Promise<string> {
-  const requestConfig = anthropicAwsRequestConfig(config);
-  const response = await runAnthropicAwsMessage(
-    {
-      ...requestConfig,
-      maxTokens: requestConfig.maxTokens,
-      system: systemPrompt,
-      messages: [
-        {
-          role: "user",
-          content: JSON.stringify(payload)
-        }
-      ]
-    },
-    httpClient
-  );
-  return readAnthropicAwsText(response);
+  const { content } = await chatCompletion(config, {
+    job: "investigator",
+    maxTokens: anthropicAwsRequestConfig(config).maxTokens,
+    system: systemPrompt,
+    user: JSON.stringify(payload),
+    errorLabel: "Investigator",
+    invalidResponseMessage: "Invalid AnthropicAWS response"
+  }, { anthropicHttpClient: httpClient });
+  return content;
 }
 
 function summarizePlannerState(state: InvestigationPlannerState): Record<string, unknown> {

@@ -10,19 +10,35 @@ const ID_DOMAIN: &[u8] = b"code-butler/identity/v1\0";
 // Account profiles stay entirely inside the existing OS-encrypted custody blob.
 // Switching credentials retains trust, keys and journals, but never cached lists
 // or a previous account's tokens in the newly active profile.
+/// A profile without device or vault material; replacing it loses nothing recoverable.
+fn blank_profile(state: &Value) -> bool {
+    state["descriptor"].is_null()
+        && state["device"].is_null()
+        && state["request"].is_null()
+        && state["records"].as_array().map_or(true, Vec::is_empty)
+        && state["projects"].as_object().map_or(true, |p| p.is_empty())
+}
 fn select_account(state: &mut Value, account: &Value) -> Result<()> {
     let requested = account.as_str().ok_or("authentication-required")?;
+    // profileAccountId survives logout, so a blank profile still knows its owner once tokens are cleared.
     let previous = state["descriptor"]["accountId"]
         .as_str()
         .or_else(|| state["identityAccountId"].as_str())
+        .or_else(|| state["profileAccountId"].as_str())
         .or_else(|| state["tokens"]["accountId"].as_str())
         .map(str::to_owned);
-    if let Some(previous) = previous {
-        if previous != requested {
-            let mut profiles = state["accountProfiles"]
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
+    let mut profiles = state["accountProfiles"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    let switching = previous.as_deref().is_some_and(|p| p != requested);
+    // Repairs profiles written before profileAccountId existed: an ownerless blank profile adopted
+    // the requested account while its real profile stayed stored under accountProfiles.
+    let repairing = !switching
+        && blank_profile(state)
+        && profiles.get(requested).is_some_and(|p| !blank_profile(p));
+    if switching || repairing {
+        if let Some(previous) = previous.filter(|p| p != requested) {
             let mut saved = state.clone();
             saved
                 .as_object_mut()
@@ -30,18 +46,22 @@ fn select_account(state: &mut Value, account: &Value) -> Result<()> {
                 .remove("accountProfiles");
             saved["tokens"] = Value::Null;
             saved["catalogCache"] = Value::Null;
-            profiles.insert(previous, saved);
-            let mut restored = profiles
-                .remove(requested)
-                .unwrap_or_else(|| json!({"version":1,"projects":{},"pins":{},"records":[]}));
-            restored["tokens"] = Value::Null;
-            restored["catalogCache"] = Value::Null;
-            restored["sessionRevision"] = state["sessionRevision"].clone();
-            restored["sessionEpoch"] = state["sessionEpoch"].clone();
-            restored["accountProfiles"] = Value::Object(profiles);
-            *state = restored;
+            // Never let a blank profile overwrite a stored one that still holds device or vault keys.
+            if !(blank_profile(&saved) && profiles.get(&previous).is_some_and(|p| !blank_profile(p))) {
+                profiles.insert(previous, saved);
+            }
         }
+        let mut restored = profiles
+            .remove(requested)
+            .unwrap_or_else(|| json!({"version":1,"projects":{},"pins":{},"records":[]}));
+        restored["tokens"] = Value::Null;
+        restored["catalogCache"] = Value::Null;
+        restored["sessionRevision"] = state["sessionRevision"].clone();
+        restored["sessionEpoch"] = state["sessionEpoch"].clone();
+        restored["accountProfiles"] = Value::Object(profiles);
+        *state = restored;
     }
+    state["profileAccountId"] = json!(requested);
     Ok(())
 }
 pub fn project_catalog_id(vault_id: &str) -> String {

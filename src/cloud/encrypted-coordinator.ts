@@ -83,6 +83,8 @@ export function readEncryptedCache(directory: string, ref: CacheRef): PreparedPu
   const parsed = JSON.parse(gunzipSync(bytes,{maxOutputLength:256*1024*1024}).toString()) as PreparedPublication & {objects:Record<string,string>};
   return {...parsed,objects:new Map(Object.entries(parsed.objects).map(([id,b])=>[id,Buffer.from(b,"base64")]))};
 }
+const partitionKey = (bundle: SnapshotBundle) => JSON.stringify(bundle.manifest.segments.filter(segment => segment.kind === "partition").map(segment => [segment.id, segment.fingerprint]).sort());
+
 export async function encryptedCloudSync(root: string, keep?: "local" | "cloud" | "merge", suppliedClient?: AccountClient, review?: SyncReview): Promise<Binding | undefined> {
   assertCheckoutReady(root);
   const initial = binding(root);
@@ -216,7 +218,10 @@ export async function encryptedCloudSync(root: string, keep?: "local" | "cloud" 
           delete journal.pending;
         }
         const localChanged = local.snapshot.fingerprint !== journal.fingerprint;
-        const remoteCoreChanged = remote && remote.bundle.manifest.fingerprint !== journal.fingerprint;
+        // A restore may keep this device's project summary, or give it this checkout's path, so local files can
+        // differ from a revision already applied here; only a revision not yet applied is a change from the cloud.
+        const appliedRemote = !!remote && remote.pin.commitment === journal.applied?.pin.commitment;
+        const remoteCoreChanged = remote && !appliedRemote && remote.bundle.manifest.fingerprint !== journal.fingerprint;
         const diverged = !keep && localChanged && remoteCoreChanged && local.snapshot.fingerprint !== remote!.bundle.manifest.fingerprint;
         // Both sides changed: the three-way merge settles disjoint edits and flags competing ones per memory.
         if (diverged && conflictPolicy === "merge") { keep = "merge"; automatic = true; }
@@ -266,6 +271,10 @@ export async function encryptedCloudSync(root: string, keep?: "local" | "cloud" 
         }
         let bundle:SnapshotBundle={manifest:local.snapshot,blocks:local.blocks};
         if(remote) bundle=rebasePartitions(bundle,remote,true);
+        // Nothing was edited since that applied revision, so the summary kept by the restore is not republished.
+        if (!keep && !merged && appliedRemote && !localChanged && partitionKey(bundle) === partitionKey(remote!.bundle)) {
+          state.status="synced"; await persist(pin); return state;
+        }
         progress.phase("encrypting");
         const encryptionStarted = performance.now();
         let prepared: PreparedPublication | undefined;
