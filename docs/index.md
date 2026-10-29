@@ -35,4 +35,4 @@ Code Butler uses three layers:
 - [Quick Start](./quickstart.md)
 - [MCP Setup](./mcp-setup.md)
 - [Encrypted `secrets/` sync](./secrets-sync.md)
-- [Architecture and retrieval](./architecture.html)
+- [Architecture and retrieval](./architecture.md)

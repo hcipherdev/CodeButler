@@ -5,13 +5,12 @@ export default defineConfig({
   description: "Local-first project memory for coding agents.",
   base: "/CodeButler/",
   cleanUrls: true,
-  ignoreDeadLinks: [/\/architecture\.html/],
   themeConfig: {
     nav: [
       { text: "Quick Start", link: "/quickstart" },
       { text: "MCP Setup", link: "/mcp-setup" },
       { text: "Privacy", link: "/privacy" },
-      { text: "Architecture", link: "/architecture.html" },
+      { text: "Architecture", link: "/architecture" },
       { text: "GitHub", link: "https://github.com/hcipherdev/CodeButler" },
     ],
     sidebar: [
@@ -26,7 +25,7 @@ export default defineConfig({
           { text: "Global Rules", link: "/global-rules" },
           { text: "Operations", link: "/operations" },
           { text: "Privacy", link: "/privacy" },
-          { text: "Architecture", link: "/architecture.html" },
+          { text: "Architecture", link: "/architecture" },
         ],
       },
       {

@@ -177,4 +177,4 @@ Start by syncing memory and reading the project brief. When the user asks to rem
 
 ## See Also
 
-[Architecture overview](/architecture.html) — full system diagram with pipeline stages, layer stack, and data flows.
+[Architecture](./architecture.md) — retrieval, project summaries, memory scope, layers, and review.
