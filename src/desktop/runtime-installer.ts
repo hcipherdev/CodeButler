@@ -475,7 +475,7 @@ function inspectWatchRegistration(config: string, roots: string[]): GlobalWatchR
       const path = registration.files[0]?.path;
       if (!path) throw new Error("launchd reports a loaded job without its installation file.");
       const args = JSON.parse(execFileSync("/usr/bin/plutil", ["-extract", "ProgramArguments", "json", "-o", "-", path],
-        { encoding: "utf8", timeout: 5000 })) as string[];
+        { encoding: "utf8", timeout: 5000, windowsHide: true })) as string[];
       if (!managed(args[0]!, args[1]!) || args[2] !== "watch" || !args.includes("--global")) {
         throw new Error("The launchd job points outside the managed runtime or uses unexpected arguments.");
       }

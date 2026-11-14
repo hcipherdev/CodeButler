@@ -70,8 +70,11 @@ describe("desktop engine contract", () => {
   it("does not promise a daily AI review when the review model runs only when a person starts it", async () => {
     vi.stubEnv("CODE_BUTLER_RETRIEVAL_ENGINE", "legacy");
     await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
+    const cliPath = join(directory, "claude-fixture");
+    // The overview checks whether the configured CLI exists without invoking it.
+    writeFileSync(cliPath, "");
     await handleDesktopRequest({ version: 1, action: "ai.settings.save", settings: {
-      connections: { local: { kind: "ollama" }, "claude-code": { kind: "claude-code" } },
+      connections: { local: { kind: "ollama" }, "claude-code": { kind: "claude-code", cliPath } },
       tiers: { fast: { connection: "local", model: "llama3.1:8b" } },
       jobs: { review: { connection: "claude-code", model: "sonnet" } }
     } } as never);

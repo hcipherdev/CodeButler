@@ -30,7 +30,7 @@ describe("public package metadata", () => {
     expect(packageJson.bugs).toEqual({
       url: "https://github.com/hcipherdev/CodeButler/issues"
     });
-    expect(packageJson.homepage).toBe("https://github.com/hcipherdev/CodeButler#readme");
+    expect(packageJson.homepage).toBe("https://codebutler.dev/");
     expect(packageJson.bin?.["code-butler"]).toBe("dist/cli.js");
     expect(packageJson.files).toContain("dist");
     expect(packageJson.keywords).toEqual(

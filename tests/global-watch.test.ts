@@ -18,6 +18,7 @@ import { runCli } from "../src/cli.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 import { beginForegroundIntent } from "../src/cloud/foreground.js";
 import { watcherOwnsProjectGate } from "../src/cloud/gate.js";
+import { openConfiguredMemoryStore } from "../src/storage/open-configured-store.js";
 
 describe("global watcher", () => {
   let directory: string;
@@ -150,6 +151,8 @@ describe("global watcher", () => {
 
   it("registers a project through a real MCP connection and retains it after disconnect", async () => {
     const root = project("mcp");
+    const store = openConfiguredMemoryStore(root);
+    try { store.init(); } finally { store.close(); }
     const client = new Client({ name: "watch-test", version: "1" });
     const transport = new StdioClientTransport({ command: process.execPath,
       args: ["--import", "tsx", join(process.cwd(), "src", "cli.ts"), "mcp", "--project-root", root],
