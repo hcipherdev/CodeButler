@@ -11,7 +11,9 @@ import { syncGlobalRules, setGlobalRulesSyncEnabled, encryptedRulesSync } from "
 import type { AccountClient } from "../src/cloud/account-client.js";
 import { planMemoryReconciliation } from "../src/memory/reconciliation.js";
 import { getApplicableRules, buildRulesCatalog, PAGE_BYTES, globToRegExp } from "../src/rules/match.js";
+import { trustProjectSettings } from "../src/config.js";
 import { contentHash, decodeRulesFiles, encodeRulesFiles, filesRevision, mergeRules, conflictsIn, stateHash, type RuleFiles } from "../src/rules/merge.js";
+import { captureGlobalRulesSnapshot, rulesFilesFromBundle } from "../src/rules/snapshot.js";
 
 const roots: string[] = [];
 const temp = () => { const path = makeTempDir(); roots.push(path); return path; };
@@ -40,6 +42,25 @@ describe("manual global rules format", () => {
 });
 describe("global rules store and retrieval", () => {
   it("reads an absent store without initializing files", () => { const { root, project } = setup(); expect(listRules().rules).toEqual([]); getApplicableRules(project); expect(existsSync(root)).toBe(false); });
+  it("ignores filesystem metadata during rule creation and snapshot capture", async () => {
+    const { root } = setup();
+    const directory = join(root, ".code-butler", "rules");
+    const nested = join(directory, ".conflicts", "variants");
+    mkdirSync(nested, { recursive: true });
+    const { revision } = listRules();
+    const metadata = [join(directory, ".DS_Store"), join(directory, "Thumbs.db"),
+      join(nested, "Desktop.INI"), join(nested, "._rule.md")];
+    for (const path of metadata) writeFileSync(path, "metadata");
+    expect(listRules()).toMatchObject({ revision, invalid: [] });
+
+    const created = await createRule({ title: "Debug notes", body: "Store notes here." }, root, revision);
+    const snapshot = await captureGlobalRulesSnapshot(root, "00000000-0000-4000-8000-000000000001", 0, "00000000-0000-4000-8000-000000000002");
+    expect([...rulesFilesFromBundle(snapshot).keys()]).toEqual([`rules/${created.id}.md`]);
+    for (const path of metadata) expect(readFileSync(path, "utf8")).toBe("metadata");
+
+    writeFileSync(join(directory, "backup.txt"), "unsupported");
+    expect(listRules().invalid[0]?.error).toContain("Unsupported or orphaned rules file: rules/backup.txt");
+  });
   it("keeps stable ids, rejects stale edits, and observes hand edits and deletion", async () => {
     setup(); const created = await createRule({ title: "Debug notes", body: "Store notes here." });
     const updated = await updateRule(created.id, { title: "Renamed" }, created.contentHash); expect(updated.id).toBe(created.id);
@@ -71,6 +92,9 @@ describe("global rules store and retrieval", () => {
     expect(first).toMatchObject({ applicabilityInfo: { conditions: { shells: ["powershell"] } } });
     expect(getApplicableRules(project, { targetEnvironment: { shell: "bash" } }).rules).toHaveLength(0);
     mkdirSync(join(project, ".code-butler")); writeFileSync(join(project, ".code-butler", "config.json"), JSON.stringify({ globalRules: { exclude: [created.id] } }));
+    // A repo cannot exclude this device's rules until its owner approves the repo's settings.
+    expect(getApplicableRules(project, { ids: [created.id] }).rules.map(rule => rule.id)).toEqual([created.id]);
+    trustProjectSettings(project);
     expect(getApplicableRules(project, { ids: [created.id] }).notApplicable[0]!.reasons[0]).toContain("Excluded");
   });
   it("paginates required rules within hard budgets and invalidates changed contexts", async () => {

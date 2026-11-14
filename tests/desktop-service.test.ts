@@ -1,14 +1,18 @@
-// Tests desktop project setup, review actions, and operation coordination.
+// Tests desktop project setup, review actions (including restoring a candidate expiry pass), and operation coordination.
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ensureProjectConfig } from "../src/config.js";
+import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
 import { runCli } from "../src/cli.js";
 import { handleDesktopRequest } from "../src/desktop/service.js";
+import { projectOperation } from "../src/cloud/client.js";
+import { runAutomaticPromotions } from "../src/memory/automatic-promotion.js";
 import { rememberProjectMemory } from "../src/memory/remember.js";
+import { resolveMemoryReview } from "../src/memory/review.js";
+import { readCanonicalTierPage } from "../src/retrieval/tiers.js";
 import { planMemoryReconciliation, previewDesktopMemoryReconciliation } from "../src/memory/reconciliation.js";
 import { initializeSchema, SCHEMA_MIGRATIONS } from "../src/storage/migrations.js";
 import { openConfiguredMemoryStore } from "../src/storage/open-configured-store.js";
@@ -19,7 +23,7 @@ import { readProjectOperationStatus, withProjectGate } from "../src/cloud/gate.j
 import { activeForegroundIntent, renewForegroundIntent } from "../src/cloud/foreground.js";
 import { ReviewStartCancelledError, runDesktopMemoryReview } from "../src/desktop/service.js";
 import { AutomaticSyncOwner } from "../src/cloud/sync-owner.js";
-import { globalWatchDirectory, runGlobalWatch } from "../src/global-watch.js";
+import { globalWatchDirectory, registerWatchedProject, runGlobalWatch } from "../src/global-watch.js";
 import { NativeSecurity } from "../src/cloud/native-security.js";
 
 describe("desktop engine contract", () => {
@@ -63,6 +67,52 @@ describe("desktop engine contract", () => {
   });
 
 
+  it("does not promise a daily AI review when the review model runs only when a person starts it", async () => {
+    vi.stubEnv("CODE_BUTLER_RETRIEVAL_ENGINE", "legacy");
+    await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
+    await handleDesktopRequest({ version: 1, action: "ai.settings.save", settings: {
+      connections: { local: { kind: "ollama" }, "claude-code": { kind: "claude-code" } },
+      tiers: { fast: { connection: "local", model: "llama3.1:8b" } },
+      jobs: { review: { connection: "claude-code", model: "sonnet" } }
+    } } as never);
+    await expect(handleDesktopRequest({ version: 1, action: "project.overview", root }))
+      .resolves.toMatchObject({ automation: { aiReview: false, aiReviewOnDemand: true, promotion: true, candidateExpiryDays: 30 } });
+  });
+
+  it("lets a person check an expiry pass from the overview and restore it, then stops offering it", async () => {
+    vi.stubEnv("CODE_BUTLER_RETRIEVAL_ENGINE", "legacy");
+    await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
+    const later = (days: number) => new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+    const store = openConfiguredMemoryStore(root);
+    store.init();
+    try {
+      for (let index = 0; index < 9; index += 1) rememberProjectMemory(store, { type: "decision", text: `Settled desktop rule number ${index}.` });
+      store.addCommit({ hash: "idle-commit", authorName: "T", authorEmail: "t@example.com", authoredAt: "2026-10-01T00:00:00.000Z", message: "Add idle", changedFiles: [], diffSummary: "+ idle" });
+      store.upsertMemoryCandidate({ type: "decision", title: "Idle candidate", summary: "An idle candidate for the desktop.", reason: "r", confidence: 0.7,
+        evidence: [{ sourceType: "commit", sourceId: "idle-commit" }], relatedFiles: [], dedupeKey: "idle" });
+      const insert = store.db.prepare("insert into sources (id, type, title, origin, raw_content, created_at) values (?, 'commit', 't', 'test', 'r', ?)");
+      for (let day = 1; day <= 30; day += 1) insert.run(`activity-${day}`, later(day));
+      expect(runAutomaticPromotions(store, loadProjectConfig(root), { now: later(31) }).expired).toBe(1);
+    } finally { store.close(); }
+
+    const overview = await handleDesktopRequest({ version: 1, action: "project.overview", root }) as { automation?: { lastExpiry?: { at: string } } };
+    expect(overview.automation?.lastExpiry).toMatchObject({ count: 1, restorable: 1 });
+    const at = overview.automation!.lastExpiry!.at;
+    // Checking must not wait behind a sync or AI review holding the project lock.
+    let release!: () => void;
+    const held = projectOperation(root, () => new Promise<void>((resolve) => { release = resolve; }));
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const checked = await handleDesktopRequest({ version: 1, action: "memory.candidates.expired", root, at }) as { candidates: Array<{ id: string }> };
+    release(); await held;
+    expect(checked.candidates).toEqual([expect.objectContaining({ title: "Idle candidate", type: "decision", restored: false })]);
+    await expect(handleDesktopRequest({ version: 1, action: "memory.candidates.restore-expiry", root, at, ids: [checked.candidates[0]!.id] }))
+      .resolves.toMatchObject({ restored: 1 });
+    await expect(handleDesktopRequest({ version: 1, action: "memory.candidates.expired", root, at }))
+      .resolves.toMatchObject({ candidates: [{ restored: true }] });
+    const restored = await handleDesktopRequest({ version: 1, action: "project.overview", root }) as { automation?: { lastExpiry?: unknown } };
+    expect(restored.automation?.lastExpiry).toBeUndefined();
+  });
+
   it("serves tier pages and working actions through the default desktop engine", async () => {
     vi.stubEnv("CODE_BUTLER_RETRIEVAL_ENGINE", "legacy");
     await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
@@ -97,6 +147,64 @@ describe("desktop engine contract", () => {
     await expect(handleDesktopRequest({ version: 1, action: "project.overview", root }))
       .resolves.toMatchObject({ tiers: { working: 1, candidates: 1, durable: 1 }, working: [{ id: working.id }] });
   });
+
+  it("matches the tier index without materializing it for the overview", async () => {
+    vi.stubEnv("CODE_BUTLER_RETRIEVAL_ENGINE", "legacy");
+    registerWatchedProject(root);
+    const peer = "device:11111111-1111-4111-8111-111111111111";
+    const store = openConfiguredMemoryStore(root);
+    store.init();
+    let expected;
+    let health;
+    try {
+      const remember = (title: string, layer?: string) => rememberProjectMemory(store, {
+        type: "decision", title, text: `Always use the ${title} for this fixture.`, ...(layer ? { layer } : {})
+      }).memory!;
+      const human = remember("verified desktop setting");
+      store.updateMemoryQuality("promoted", human.id, { qualityStatus: "needs_review", qualityReasons: ["curator_note"] });
+      resolveMemoryReview(store, { memoryId: human.id, category: "promoted", action: "verify" }, "desktop");
+      const ai = remember("verified AI setting");
+      resolveMemoryReview(store, { memoryId: ai.id, category: "promoted", action: "verify" }, "ai");
+      const retired = remember("withdrawn setting");
+      resolveMemoryReview(store, { memoryId: retired.id, category: "promoted", action: "discard", reason: "The setting no longer exists." }, "desktop");
+      remember("peer setting", peer);
+      const candidate = (key: string) => store.upsertMemoryCandidate({
+        type: "decision", title: key, summary: "This project uses local working notes.",
+        reason: "Keep the notes close to the source.", confidence: 0.8, evidence: [], relatedFiles: [], dedupeKey: key
+      });
+      candidate("live-candidate");
+      const terminal = candidate("discarded-candidate");
+      resolveMemoryReview(store, { memoryId: terminal.id, category: "candidate", action: "discard", reason: "The note is obsolete." }, "desktop");
+      const now = Date.now();
+      for (let i = 0; i < 6; i++) {
+        const at = new Date(now + i * 1000).toISOString();
+        store.upsertTemporaryMemory({
+          kind: "open_question", title: `Working item ${i}`, summary: `An open question numbered ${i}.`,
+          layer: i === 5 ? peer : "core", createdAt: at, updatedAt: at,
+          expiresAt: new Date(now + (i === 0 ? -60_000 : 60_000)).toISOString()
+        });
+      }
+      store.db.prepare("insert into peer_partitions values (?, ?, ?, ?, ?)")
+        .run("partition:peer", peer, peer.slice(7), "fingerprint", new Date(now).toISOString());
+      expected = readCanonicalTierPage(store, { tier: "working", limit: 3 });
+      health = store.getProjectSummary().memoryHealth;
+      expect(expected.counts).toMatchObject({ candidates: 1, durable: 3, working: 4, verified: 1 });
+    } finally { store.close(); }
+    await expect(handleDesktopRequest({ version: 1, action: "project.overview", root }))
+      .resolves.toMatchObject({ tiers: expected.counts, working: expected.items, memory: { memoryHealth: health } });
+  });
+
+  it("skips freshness and narrative checks while the project gate is occupied", async () => {
+    vi.stubEnv("CODE_BUTLER_RETRIEVAL_ENGINE", "legacy");
+    registerWatchedProject(root);
+    let release!: () => void;
+    const holding = withProjectGate(root, () => new Promise<void>(resolve => { release = resolve; }));
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    try {
+      await expect(handleDesktopRequest({ version: 2, action: "memory.freshness", root })).rejects.toThrow("active");
+      await expect(handleDesktopRequest({ version: 1, action: "project.overview.narrative-status", root })).rejects.toThrow("active");
+    } finally { release(); await holding; }
+  }, 5000);
 
   it("requires explicit deletion consent, preserves source files, and prevents stale operations recreating memory", async () => {
     await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
@@ -500,6 +608,28 @@ describe("desktop engine contract", () => {
     expect(empty).toMatchObject({ projects: [] });
   });
 
+  it("reads the saved overview narrative without waiting for the project gate or opening the memory store", async () => {
+    registerWatchedProject(root);
+    const data = join(root, ".code-butler");
+    const database = join(data, "memory.sqlite");
+    renameSync(database, `${database}.fixture`);
+    const preview = () => handleDesktopRequest({ version: 1, action: "project.overview.preview", root });
+    let entered!: () => void;
+    let release!: () => void;
+    const acquired = new Promise<void>(resolve => { entered = resolve; });
+    const holding = withProjectGate(root, () => new Promise<void>(resolve => { release = resolve; entered(); }));
+    await acquired;
+    try {
+      await expect(preview()).resolves.toEqual({ root, narrative: { exists: true, summary: "# Project brief\n\nDesktop work is active.\n" } });
+      unlinkSync(join(data, "project-summary.md"));
+      await expect(preview()).resolves.toEqual({ root, narrative: { exists: false, summary: "" } });
+    } finally { release(); await holding; }
+    expect(existsSync(database)).toBe(false);
+
+    unlinkSync(join(data, "config.json"));
+    await expect(preview()).rejects.toMatchObject({ code: "not-found" });
+  });
+
   it("refreshes a stale project summary once and skips generation after it becomes current", async () => {
     await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
     const generate = vi.fn(async () => "## Where things stand\n\nCurrent desktop state.\n");
@@ -513,8 +643,8 @@ describe("desktop engine contract", () => {
       { projectSummaryOptions: { generator: { generate } } }
     )).resolves.toMatchObject({ checked: false, generated: false, skippedReason: "not_stale" });
     expect(generate).toHaveBeenCalledTimes(1);
-    await expect(handleDesktopRequest({ version: 1, action: "project.overview", root }))
-      .resolves.toMatchObject({ narrative: { status: { stale: false } } });
+    await expect(handleDesktopRequest({ version: 1, action: "project.overview.narrative-status", root }))
+      .resolves.toMatchObject({ status: { stale: false } });
   });
 
   it("filters memory health and reads quality reasons for candidate memories", async () => {
@@ -732,6 +862,7 @@ describe("desktop engine contract", () => {
 
   it("rejects unregistered roots and unbounded search requests", async () => {
     await expect(handleDesktopRequest({ version: 1, action: "project.overview", root })).rejects.toMatchObject({ code: "not-registered" });
+    await expect(handleDesktopRequest({ version: 1, action: "project.overview.preview", root })).rejects.toMatchObject({ code: "not-registered" });
     await expect(handleDesktopRequest({ version: 1, action: "memory.search", root, query: "x", limit: 500 })).rejects.toMatchObject({ code: "invalid-request" });
   });
 

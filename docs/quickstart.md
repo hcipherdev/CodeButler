@@ -27,6 +27,20 @@ desktop, CLI, MCP server, native helper, and global watcher as one compatible
 release. Do not install a second global CLI when using the desktop installer; it
 provides the stable `code-butler` command and keeps existing MCP launch paths current.
 
+## Connect Claude Code And Codex
+
+Register Code Butler once per client; it then serves whichever repository the
+client is working in, even when the client starts it from another folder:
+
+```bash
+code-butler clients connect claude
+code-butler clients connect codex
+code-butler clients status    # registration plus a real MCP start check
+```
+
+The desktop app and the macOS package do this automatically for each installed
+client, once. See [MCP setup](mcp-setup.md).
+
 ## Initialize A Project
 
 Run `init` in each repository where you want the full Code Butler workflow:

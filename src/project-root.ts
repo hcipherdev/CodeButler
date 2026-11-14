@@ -18,6 +18,15 @@ export interface ResolveProjectRootOptions {
 }
 
 export function resolveProjectRoot(options: ResolveProjectRootOptions = {}): ProjectRootResolution {
+  const resolved = tryResolveProjectRoot(options);
+  if (resolved) return resolved;
+  throw new Error(
+    "No Git repository found for Code Butler MCP startup. Run from inside a Git repository, pass --project-root <path>, set CODE_BUTLER_PROJECT_ROOT, or pass --init-here to initialize the current directory."
+  );
+}
+
+/** Like resolveProjectRoot, but returns undefined when no project can be found, so MCP can start unbound. */
+export function tryResolveProjectRoot(options: ResolveProjectRootOptions = {}): ProjectRootResolution | undefined {
   const cwd = resolve(options.cwd ?? process.cwd());
   assertOrdinaryProject(cwd);
   const explicitRoot = normalizeOptionalPath(cwd, options.projectRoot);
@@ -58,12 +67,10 @@ export function resolveProjectRoot(options: ResolveProjectRootOptions = {}): Pro
     };
   }
 
-  throw new Error(
-    "No Git repository found for Code Butler MCP startup. Run from inside a Git repository, pass --project-root <path>, set CODE_BUTLER_PROJECT_ROOT, or pass --init-here to initialize the current directory."
-  );
+  return undefined;
 }
 
-function findGitRoot(startDir: string): string | undefined {
+export function findGitRoot(startDir: string): string | undefined {
   let current = resolve(startDir);
   while (true) {
     if (hasGitMarker(current)) return current;

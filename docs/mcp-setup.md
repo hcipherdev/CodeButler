@@ -4,11 +4,16 @@ Install the `code-butler` command first: build from source as described in the
 [Quick Start](./quickstart.md), or use the desktop app where it is available (it is
 not publicly released yet). The Windows desktop app installs and updates the
 matching per-user `code-butler` CLI/MCP runtime. Configure MCP clients to use that
-stable command:
+stable command once, globally, with no project argument:
 
 ```bash
-code-butler mcp --project-root /absolute/path/to/project
+claude mcp add --scope user code-butler -- code-butler mcp
+codex mcp add code-butler -- code-butler mcp
 ```
+
+`code-butler clients connect <claude|codex>` does the same with the installed command's
+full path. The desktop app and the macOS package connect each installed client once
+automatically.
 
 The desktop installer preserves this command across upgrades, refreshes older explicit
 CLI compatibility paths, and stops stale managed MCP processes so clients can reconnect
@@ -19,13 +24,36 @@ Without the desktop app, install the CLI from source (see the
 still has the retired 1.x release, so do not use `npx code-butler` or
 `npm install -g code-butler` until 2.0 is published there.
 
-```bash
-code-butler mcp --project-root /absolute/path/to/project
-```
+### How a connection chooses its project
 
-The MCP server resolves the target Git repository and completes project setup automatically after the connection handshake. It creates internal memory storage, a local project summary, `AGENTS.md`, and `CLAUDE.md`, without requiring the desktop app or an API key. Existing agent files are backed up and replaced on first completion; later reconnects preserve user edits and recreate missing files. An existing summary is preserved. A provider you configured enriches an unedited local summary in the background, with failures retried no sooner than once per day. The built-in default model does this only after you opt in with `code-butler config remote-models on`; see [privacy](privacy.md#remote-ai-models).
+One registered server serves every repository. Each connection picks its project in
+this order:
 
-Call `current_project` to inspect its `setup` field for progress, missing artifacts, summary quality, backups, and errors. Desktop readiness and `code-butler doctor` also check both agent files. `code-butler init` remains available for explicit setup; `code-butler mcp --no-auto-init` retains storage-only startup. Automatic setup respects deliberate project-memory removal and does not re-enable it. Restart existing MCP connections after installing a new runtime.
+1. `--project-root <path>` or `CODE_BUTLER_PROJECT_ROOT`, then the Git repository
+   containing the folder the client started the server in. These are fixed at launch.
+2. When the client started it outside any repository, the first of the client's MCP
+   roots (workspace folders) inside a Git repository. A roots change moves the
+   connection to the new repository.
+3. Otherwise, the agent's working directory: `current_project({ projectRoot })` with an
+   absolute path binds the repository containing it. An agent-chosen project can move
+   to another repository the same way; a project fixed at launch or chosen from roots
+   cannot, and the call explains why.
+
+Until a project is bound, the server still connects and lists every tool.
+`current_project` reports `{ bound: false, reason, hint }`, and every other tool fails
+with a `no_project` error that tells the agent to pass its working directory. The
+server instructions say the same, because a repository that has never been bound has
+no generated `AGENTS.md` or `CLAUDE.md` yet. `code-butler clients status` starts the
+installed command from a folder outside any project and checks that it answers
+`initialize` and `tools/list`, the way a client does.
+
+Automatic initialization of new projects is **off by default**. Enable **Settings → General → Automatically initialize new projects** in the desktop app to opt in on this computer. This preference is stored in the device's global `config.json` as `general.autoInitializeProjects`; repository settings cannot enable it. Without opt-in, connecting MCP to a new folder leaves it untouched: no `.code-butler/`, summary, agent guidance files, or watcher registration. The connection stays available, and `current_project` explains how to set up the folder. Existing initialized projects continue serving memory.
+
+Use **Add project** in the desktop app and confirm setup, or run `code-butler init`, to initialize a folder explicitly while the preference is off. After that, ask the agent to call `current_project` again or reconnect. After enabling the preference, the same check can initialize a pending project without changing the coding tool's MCP registration.
+
+With opt-in enabled, the MCP server completes project setup after the connection handshake. It creates internal memory storage, a local project summary, `AGENTS.md`, and `CLAUDE.md`, without requiring an API key. Existing summaries and user edits are preserved. A configured provider can enrich an unedited local summary in the background; the built-in default model requires remote-model consent. See [privacy](privacy.md#remote-ai-models).
+
+Call `current_project` to inspect its `setup` field once initialized. Desktop readiness and `code-butler doctor` also check both agent files. `code-butler mcp --no-auto-init` disables automatic initialization for that connection even when the device preference is on; it does not create storage in new projects. Automatic setup respects deliberate project-memory removal. Reconnect existing MCP clients after installing a new runtime.
 
 ## Global background watching
 
@@ -36,7 +64,7 @@ code-butler watch install --global
 code-butler watch status --global
 ```
 
-Every project opened through `code-butler mcp` is registered automatically. The global
+Every initialized project opened through `code-butler mcp` is registered automatically. The global
 watcher reloads that registry each pass and continues running after MCP sessions close.
 It does not scan arbitrary folders. Register another initialized project explicitly with:
 
@@ -113,7 +141,7 @@ The MCP server exposes 34 tools. `tests/docs/mcp-tool-docs.test.ts` keeps this l
 
 Project, sync and health:
 
-- `current_project()`
+- `current_project({ projectRoot? })`
 - `sync_project_memory({ source? })`
 - `summarize_project_state()`
 - `list_source_failures({ adapter?, resolved?, limit? })`

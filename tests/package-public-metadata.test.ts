@@ -20,7 +20,7 @@ describe("public package metadata", () => {
 
   it("publishes discoverable metadata for the public npm package", () => {
     expect(packageJson.name).toBe("code-butler");
-    expect(packageJson.version).toBe("2.0.0");
+    expect(packageJson.version).toBe("2.0.1");
     expect(packageJson.engines?.node).toBe(">=24.0.0");
     expect(packageJson.license).toBe("Apache-2.0");
     expect(packageJson.repository).toEqual({

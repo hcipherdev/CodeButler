@@ -49,7 +49,7 @@ describe("memory events and migration", () => {
         expect(store.db.prepare("select * from memories where id=?").get(m.id)).toEqual(before);
         expect(matchingMemoryVerification(store, "promoted", store.readMemory(m.id)!)).toBeDefined();
         expect(store.db.prepare("select kind,recorded from memory_events where memory_id=?").all(m.id)).toEqual([{ kind: "made_durable", recorded: 1 }]);
-        expect(store.db.prepare("select max(version) version from schema_migrations").get()).toEqual({ version: 24 });
+        expect(store.db.prepare("select max(version) version from schema_migrations").get()).toEqual({ version: 26 });
     });
     it("recovers dated corrections, withdrawals, restorations and branch sharing from schema 23", () => {
         const { store } = fixture(true);

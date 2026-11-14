@@ -27,7 +27,9 @@ export function nativeExecutable(): string {
   // Development resolution is relative to this module, never an arbitrary user's cwd.
   const development = fileURLToPath(new URL(`../../native/butler-crypto/target/debug/${name}`,import.meta.url));
   if (existsSync(development)) return development;
-  throw new EncryptionError("locked");
+  // Releases ship the helper for macOS and Windows only; local memory works everywhere.
+  const supported = process.platform === "darwin" || process.platform === "win32";
+  throw new EncryptionError("locked", supported ? undefined : { unsupportedPlatform: `${process.platform}-${process.arch}` });
 }
 /** All private keys stay in Rust. The only references crossing IPC are IDs and epochs. */
 export class NativeSecurity extends CryptoHelper {

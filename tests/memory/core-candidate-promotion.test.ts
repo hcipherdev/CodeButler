@@ -1,19 +1,29 @@
-// Tests planAutomaticPromotions(), runAutomaticPromotions() and undoAutomaticPromotions() in src/memory/automatic-promotion.ts for core-layer candidates, including AI-corrected replacements, plus active-candidate verification in src/memory/review.ts.
+// Tests planAutomaticPromotions(), runAutomaticPromotions(), expireUnconfirmedCandidates() (usage and device clocks), recordLocalActivityDay(), latestCandidateExpiry(), listCandidateExpiry(), restoreCandidateExpiry() (also through `memory promotions --undo-expiry`) and undoAutomaticPromotions() in src/memory/automatic-promotion.ts for core-layer candidates, including AI-corrected replacements, plus active-candidate verification in src/memory/review.ts.
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { mergeCore } from "../../src/cloud/merge.js";
 import {
   collapseCoreCandidateSkips,
+  expireUnconfirmedCandidates,
+  latestCandidateExpiry,
+  listCandidateExpiry,
+  recordLocalActivityDay,
   planAutomaticPromotions,
+  restoreCandidateExpiry,
   runAutomaticPromotions,
   undoAutomaticPromotions
 } from "../../src/memory/automatic-promotion.js";
 import { rememberProjectMemory } from "../../src/memory/remember.js";
 import { compensateMemoryReview, resolveMemoryReview } from "../../src/memory/review.js";
+import { effectiveTerminalMemoryReview } from "../../src/memory/review-state.js";
 import { exportPrivacy, importPrivacy } from "../../src/privacy/service.js";
+import { openConfiguredMemoryStore } from "../../src/storage/open-configured-store.js";
 import { openMemoryStore, type MemoryStore } from "../../src/storage/store.js";
+import { runCli } from "../../src/cli.js";
+import { recordMemoryAttention, usageDay } from "../../src/memory/usage.js";
+import { closeRetrievalReaders, publishRetrieval, readPublishedSummary } from "../../src/retrieval/index.js";
 import { withTransaction } from "../../src/storage/transactions.js";
 import type { MemoryCandidate, ProjectConfig } from "../../src/types.js";
 import { cleanupTempDir, makeTempDir } from "../helpers/temp.js";
@@ -103,6 +113,7 @@ function candidateRow(s: MemoryStore, id: string): MemoryCandidate {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   stores.splice(0).forEach(s => s.close());
   roots.splice(0).forEach(cleanupTempDir);
 });
@@ -323,5 +334,167 @@ describe("core candidate promotion", () => {
     expect(candidateRow(peer, c.id).promotionState).toBe("candidate");
     expect(peer.readMemory(current[0]!.id)).toMatchObject({ lifecycleStatus: "retracted" });
     expect(decisionFor(peer, c.id)!.reasonCodes).toContain("previously_withdrawn");
+  });
+});
+
+describe("unconfirmed candidate expiry", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const daysLater = (days: number) => new Date(Date.now() + days * DAY).toISOString();
+  const terminal = (s: MemoryStore, id: string) => effectiveTerminalMemoryReview(s, "candidate", candidateRow(s, id));
+
+  /** A project past the durable floor, unless told otherwise. */
+  function project(durable = 10): MemoryStore {
+    const s = store();
+    for (let index = 0; index < durable; index += 1) {
+      rememberProjectMemory(s, { type: "decision", title: `Settled rule ${index}`, text: `Settled project rule number ${index} for uploads.` });
+    }
+    return s;
+  }
+
+  /** Evidence imported on each of these future days, which is what makes a day active. */
+  function activeOn(s: MemoryStore, days: number[]): void {
+    const insert = s.db.prepare("insert into sources (id, type, title, origin, raw_content, created_at) values (?, 'commit', 't', 'test', 'r', ?)");
+    for (const day of days) insert.run(`activity-${randomUUID()}`, daysLater(day));
+  }
+  const range = (from: number, count: number) => Array.from({ length: count }, (_, index) => from + index);
+
+  it("counts only active days, so time away from the project does not expire candidates", () => {
+    const s = project();
+    const waiting = candidate(s, "waiting");
+    expect(expireUnconfirmedCandidates(s, config(), daysLater(60))).toEqual({ expired: 0 });
+    // 30 active days spread across 90 calendar days, after a 30-day break.
+    activeOn(s, range(0, 30).map((index) => 31 + index * 2));
+    expect(expireUnconfirmedCandidates(s, config({ candidateExpiryDays: 31 }), daysLater(95)).expired).toBe(0);
+    const at = daysLater(95);
+    expect(expireUnconfirmedCandidates(s, config(), at)).toEqual({ expired: 1, at });
+    expect(terminal(s, waiting.id)).toMatchObject({ action: "discard", actor: "system" });
+  });
+
+  it("lets promotion act first, and expires nothing below ten durable memories", () => {
+    const small = project(9);
+    candidate(small, "waiting");
+    activeOn(small, range(1, 40));
+    expect(runAutomaticPromotions(small, config(), { now: daysLater(41) }).expired).toBe(0);
+
+    const s = project();
+    candidate(s, "waiting");
+    const corroborated = candidate(s, "corroborated", { sources: 2 });
+    activeOn(s, range(1, 40));
+    expect(runAutomaticPromotions(s, config(), { now: daysLater(41) })).toMatchObject({ promoted: 1, expired: 1 });
+    expect(candidateRow(s, corroborated.id).promotionState).toBe("promoted");
+  });
+
+  it("restores a whole pass at once and keeps it restored", () => {
+    const s = project();
+    const first = candidate(s, "first"), second = candidate(s, "second");
+    activeOn(s, range(1, 30));
+    const pass = expireUnconfirmedCandidates(s, config(), daysLater(31));
+    expect(latestCandidateExpiry(s)).toEqual({ at: pass.at, count: 2, restorable: 2 });
+
+    expect(restoreCandidateExpiry(s, {}, "desktop")).toEqual({ at: pass.at, restored: 2 });
+    expect(terminal(s, first.id)).toBeUndefined();
+    expect(terminal(s, second.id)).toBeUndefined();
+    expect(latestCandidateExpiry(s)).toMatchObject({ restorable: 0 });
+    activeOn(s, range(31, 40));
+    expect(expireUnconfirmedCandidates(s, config(), daysLater(72)).expired).toBe(0);
+    expect(restoreCandidateExpiry(s)).toEqual({ at: pass.at, restored: 0 });
+  });
+
+  it("lists a pass for checking and restores only the candidates picked", () => {
+    const s = project();
+    const keep = candidate(s, "keep"), drop = candidate(s, "drop");
+    activeOn(s, range(1, 30));
+    const pass = expireUnconfirmedCandidates(s, config(), daysLater(31));
+    expect(listCandidateExpiry(s).candidates.map(({ id, restored }) => ({ id, restored })).sort((a, b) => a.id.localeCompare(b.id)))
+      .toEqual([{ id: keep.id, restored: false }, { id: drop.id, restored: false }].sort((a, b) => a.id.localeCompare(b.id)));
+
+    expect(restoreCandidateExpiry(s, { at: pass.at, ids: [keep.id] })).toEqual({ at: pass.at, restored: 1 });
+    expect(terminal(s, keep.id)).toBeUndefined();
+    expect(terminal(s, drop.id)).toBeDefined();
+    expect(listCandidateExpiry(s, pass.at).candidates.find((item) => item.id === keep.id)).toMatchObject({ title: keep.title, restored: true });
+    expect(latestCandidateExpiry(s)).toMatchObject({ count: 2, restorable: 1 });
+    expect(listCandidateExpiry(project()).candidates).toEqual([]);
+  });
+
+  it("restores the latest pass from the CLI", async () => {
+    vi.stubEnv("CODE_BUTLER_HOME", makeTempDir());
+    const cwd = makeTempDir(); roots.push(cwd);
+    const s = openConfiguredMemoryStore(cwd); s.init();
+    let waiting: MemoryCandidate;
+    try {
+      for (let index = 0; index < 10; index += 1) rememberProjectMemory(s, { type: "decision", text: `Settled project rule number ${index} for uploads.` });
+      waiting = candidate(s, "waiting");
+      activeOn(s, range(1, 30));
+      expect(expireUnconfirmedCandidates(s, config(), daysLater(31)).expired).toBe(1);
+    } finally { s.close(); }
+    const lines: string[] = [];
+    expect(await runCli(["memory", "promotions", "--undo-expiry", "--json"], { cwd, stdout: (line: string) => lines.push(line) })).toBe(0);
+    expect(JSON.parse(lines.join("\n"))).toMatchObject({ restored: 1 });
+    const after = openConfiguredMemoryStore(cwd); after.init();
+    try { expect(terminal(after, waiting!.id)).toBeUndefined(); } finally { after.close(); }
+  });
+
+  it("restarts the clock when a candidate is used, or an AI review proposes a correction, on any device", () => {
+    vi.stubEnv("CODE_BUTLER_HOME", makeTempDir());
+    for (const kind of ["used", "correction_proposed"] as const) {
+      const s = project();
+      const waiting = candidate(s, "waiting");
+      activeOn(s, range(1, 40));
+      recordMemoryAttention(s, { category: "candidate", id: waiting.id, layer: "core" }, kind, usageDay(daysLater(20)));
+      expect(expireUnconfirmedCandidates(s, config(), daysLater(41)).expired).toBe(0);
+      activeOn(s, range(41, 10));
+      expect(expireUnconfirmedCandidates(s, config(), daysLater(51)).expired).toBe(1);
+    }
+  });
+
+  it("expires this device's own candidates on its own activity only", () => {
+    const s = project();
+    const mine = candidate(s, "mine", { layer: `device:${DEVICE}` });
+    activeOn(s, range(1, 40));
+    expect(expireUnconfirmedCandidates(s, config(), daysLater(41)).expired).toBe(0);
+    for (const day of range(41, 30)) recordLocalActivityDay(s, daysLater(day));
+    expect(expireUnconfirmedCandidates(s, config(), daysLater(71)).expired).toBe(1);
+    expect(terminal(s, mine.id)).toMatchObject({ action: "discard" });
+  });
+
+  it("restores a candidate two devices expired before they synced", () => {
+    const ancestor = project();
+    const waiting = candidate(ancestor, "waiting");
+    activeOn(ancestor, range(1, 30));
+    const local = clone(ancestor), peer = clone(ancestor);
+    expect(expireUnconfirmedCandidates(local, config(), daysLater(31)).expired).toBe(1);
+    expect(expireUnconfirmedCandidates(peer, config(), daysLater(32)).expired).toBe(1);
+    withTransaction(local.db, () => mergeCore(local.db, peer.db, ancestor.db));
+
+    expect(latestCandidateExpiry(local)).toMatchObject({ count: 1, restorable: 1 });
+    expect(restoreCandidateExpiry(local)).toMatchObject({ restored: 1 });
+    expect(terminal(local, waiting.id)).toBeUndefined();
+    expect(latestCandidateExpiry(local)).toMatchObject({ restorable: 0 });
+  });
+
+  it("publishes the last pass with the search index, so the overview needs no store", () => {
+    const s = project();
+    candidate(s, "waiting");
+    activeOn(s, range(1, 30));
+    const pass = expireUnconfirmedCandidates(s, config(), daysLater(31));
+    publishRetrieval(s, s.paths.rootDir, "fixture");
+    try { expect(readPublishedSummary(s.paths.rootDir).lastExpiry).toEqual({ at: pass.at, count: 1, restorable: 1 }); }
+    finally { closeRetrievalReaders(); }
+  });
+
+  it("leaves reviewed, quarantined and non-core candidates, and does nothing when switched off", () => {
+    const s = project();
+    activeOn(s, range(1, 30));
+    const reviewed = candidate(s, "reviewed", { quality: "needs_review" });
+    resolveMemoryReview(s, { memoryId: reviewed.id, category: "candidate", action: "verify", reason: "Checked by an agent." }, "mcp");
+    candidate(s, "quarantined", { quality: "quarantined" });
+    candidate(s, "device", { layer: `device:${DEVICE}` });
+    expect(expireUnconfirmedCandidates(s, config(), daysLater(31)).expired).toBe(0);
+
+    candidate(s, "waiting");
+    for (const off of [{ enabled: false }, { coreCandidates: false }, { candidateExpiryDays: 0 }, { candidateExpiryDays: 60 }]) {
+      expect(expireUnconfirmedCandidates(s, config(off), daysLater(31)).expired).toBe(0);
+    }
+    expect(expireUnconfirmedCandidates(s, config(), daysLater(31)).expired).toBe(1);
   });
 });

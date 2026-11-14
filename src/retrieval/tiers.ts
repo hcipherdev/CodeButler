@@ -6,7 +6,8 @@ import { sharingLabel } from "../memory/presentation.js";
 import { memoryMovement, type KnowledgeSnapshot } from "../memory/events.js";
 import { readMemoryKnowledge } from "../memory/knowledge.js";
 import { isPeerLayer } from "../memory/peer-layer.js";
-import { canonicalRevisionParts } from "./canonical-revision.js";
+import { canonicalRevisionParts, revisionCached } from "./canonical-revision.js";
+import { trustDisplayStatus } from "../memory/review-state.js";
 import { withReadCache } from "./read-cache.js";
 import type { MemorySearchResult, TemporaryMemory, MemoryQualityStatus } from "../types.js";
 import { withPublishedIndex, freshness, RetrievalUnavailableError, type RetrievalFreshness, type Publication } from "./index.js";
@@ -269,4 +270,44 @@ export function readCanonicalFreshness(store: MemoryStore, now = new Date().toIS
         expiry: string | null;
     };
     return { revision: p.revision, indexedAt: now, evaluatedAt: now, refreshing: false, ...(row.expiry ? { nextExpiryAt: row.expiry } : {}) };
+}
+
+/** The Overview needs totals and three working items, without the search index or movement history. */
+export function readCanonicalOverviewTiers(store: MemoryStore, now = new Date().toISOString()) {
+    const counts = revisionCached(store, "overview-tiers", () => {
+        const candidates = store.listMemoryCandidates({
+            promotionState: "candidate", excludeTerminalReviews: true, qualityStatus: "all", owner: "self", limit: null
+        });
+        const promoted = store.listMemories({ lifecycleStatus: "all", qualityStatus: "all", owner: "self", limit: null });
+        const durable = promoted.filter(memory => memory.lifecycleStatus === "current");
+        return {
+            candidates: candidates.length,
+            durable: durable.length,
+            verified: durable.filter(memory => memory.qualityStatus === "active" &&
+                trustDisplayStatus(store, "promoted", memory) === "human_verified").length,
+            replaced: promoted.filter(memory => memory.lifecycleStatus === "superseded").length
+        };
+    });
+    const rows = store.db.prepare(
+        "select id, layer, expires_at from temporary_memories where project_id=? and expires_at>? order by updated_at desc, created_at desc, id"
+    ).all(store.paths.rootDir, now) as Array<{ id: string; layer: string; expires_at: string }>;
+    const peerByLayer = new Map<string, boolean>();
+    const local = rows.filter(row => {
+        let peer = peerByLayer.get(row.layer);
+        if (peer === undefined) {
+            peer = isPeerLayer(store, row.layer);
+            peerByLayer.set(row.layer, peer);
+        }
+        return !peer;
+    });
+    const items = local.slice(0, 3).flatMap(({ id }): WorkingMemory[] => {
+        const memory = store.readTemporaryMemory(id);
+        return memory ? [{ ...memory, peer: false, sharing: sharingLabel(memory.layer) }] : [];
+    });
+    const tomorrow = new Date(Date.parse(now) + 24 * 60 * 60 * 1000).toISOString();
+    return {
+        counts: { ...counts, working: local.length, expiringToday: local.filter(row => row.expires_at <= tomorrow).length },
+        items,
+        freshness: readCanonicalFreshness(store, now)
+    };
 }

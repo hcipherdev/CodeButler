@@ -1,24 +1,26 @@
 #!/usr/bin/env node
 import { runCloudCommand } from "./cloud/cli.js";
-import { binding } from "./cloud/state.js";
+import { binding, readJson } from "./cloud/state.js";
 import { secretBinding } from "./secrets/state.js";
 import { encryptedSecretsSync, secretsSyncInterruption } from "./secrets/sync.js";
 import { localCloudChangeStamp, projectOperation, startCloudScheduler, syncQuietly } from "./cloud/client.js";
 import { automaticSyncPending, requestLocalChangeSync } from "./cloud/sync-owner.js";
 import { queueAutomaticConnection } from "./cloud/auto-connect.js";
 import { errorOutcome, type OperationOutcome, type OperationStage } from "./cloud/outcome.js";
+import { isNetworkUnavailable } from "./cloud/network.js";
 import { buildInfo, newRuntimeRecord, registerRuntime, runtimeDiagnostics } from "./runtime.js";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { ensureGlobalConfig, ensureProjectConfig, loadProjectConfig, migrateSharedConfigToLocal } from "./config.js";
+import { globalConfigDir, ensureGlobalConfig, ensureProjectConfig, loadProjectConfig, migrateSharedConfigToLocal, readProjectTrust } from "./config.js";
 import { runEmbeddingsCommand } from "./cli/commands/embeddings.js";
 import { runMemoryCommand } from "./cli/commands/memory.js";
 import { runPrivacyCommand } from "./cli/commands/privacy.js";
 import { runSourcesCommand } from "./cli/commands/sources.js";
 import { runExtractionCommand } from "./cli/commands/extraction.js";
 import { runRemoteModelsCommand, settleInitRemoteModelConsent, type Confirm } from "./cli/commands/remote-models.js";
+import { describePendingSettings, runTrustCommand } from "./cli/commands/trust.js";
 import { addDecision, importDecisionMarkdown } from "./decisions/store.js";
 import { runDoctor } from "./doctor/service.js";
 import type { EmbeddingServiceOptions } from "./embeddings/service.js";
@@ -42,12 +44,14 @@ import {
 } from "./project-summary/service.js";
 import { initializeProjectMemory } from "./project-initialization.js";
 import { validateProjectSetupPaths } from "./project-setup.js";
-import { resolveProjectRoot } from "./project-root.js";
+import { tryResolveProjectRoot } from "./project-root.js";
 import { globalWatchStatus, registerWatchedProject, runGlobalWatch, unregisterWatchedProject } from "./global-watch.js";
 import { startServer as startProjectMemoryServer, type ProjectMemoryServerOptions } from "./server.js";
 import { openConfiguredMemoryStore } from "./storage/open-configured-store.js";
 import type { MemoryStore } from "./storage/store.js";
-import { backgroundBudgetPaused } from "./ai/usage.js";
+import { runsOnlyWhenStarted } from "./ai/connection-policy.js";
+import { jobModel } from "./ai/models.js";
+import { backgroundBudgetPaused, withAiTrigger } from "./ai/usage.js";
 import { importNewGitCommits, ingestionOutcomes, syncProjectMemory, syncWatchedProjectMemory } from "./sync/service.js";
 import { launchAutomaticReviewIfDue } from "./memory/auto-review.js";
 import type { DoctorCheckCategory, DoctorReport, DoctorStatus, EvidenceRef, MemoryLifecycleStatus, MemoryType, SyncSourceName } from "./types.js";
@@ -84,9 +88,20 @@ export async function runCli(args = process.argv.slice(2), options: CliOptions =
   const root = options.cwd ?? process.cwd();
   const command = args[0] ?? "help";
   try {
+    // The staged watcher can register behind its own gate. During verification
+    // only a project-free MCP probe and the CLI build check may use this runtime.
+    if (["cli.mjs", "watch.mjs"].includes(basename(process.argv[1] ?? ""))) {
+      const pending = readJson<{ buildId: string; token: string }>(join(globalConfigDir(), "watch", "runtime-activation.json"));
+      if (pending?.buildId === buildInfo.buildId) {
+        const watcher = command === "watch" && args[1] === "--global";
+        const probe = command === "mcp" && args.length === 2 && args[1] === "--no-auto-init" &&
+          pending.token && pending.token === process.env.CODE_BUTLER_UPGRADE_PROBE;
+        if (!watcher && !probe && command !== "--version") throw new Error("The shared Code Butler runtime is being verified. Retry after the update finishes.");
+      }
+    }
     const reconciliationMutation = command === "memory" && args[1] === "reconcile" &&
       (args[2] === "apply" || args[2] === "revert");
-    if (binding(root)?.enabled && !reconciliationMutation && !["rules", "cloud", "watch", "mcp", "serve", "runtime", "--version", "help", "--help", "-h"].includes(command)) {
+    if (binding(root)?.enabled && !reconciliationMutation && !["rules", "ai", "cloud", "watch", "mcp", "serve", "runtime", "--version", "help", "--help", "-h"].includes(command)) {
       return await projectOperation(root, () => runCliOperation(args, options), { name: command === "sync" ? "Memory sync" : "CLI project operation" });
     }
     return await runCliOperation(args, options);
@@ -119,6 +134,9 @@ async function runCliOperation(args: string[], options: CliOptions): Promise<num
       }
       return result;
     }
+    // AI connections are global, like rules, so this works from any folder.
+    if (command === "ai") return await (await import("./cli/commands/ai-chatgpt.js")).runAiCommand(rest, stdout);
+    if (command === "clients") return await (await import("./cli/commands/clients.js")).runClientsCommand(rest, stdout);
     (await import("./rules/identity.js")).assertOrdinaryProject(cwd);
     if (command === "cloud") return await runCloudCommand(rest, cwd, stdout);
 
@@ -132,6 +150,11 @@ async function runCliOperation(args: string[], options: CliOptions): Promise<num
       stdout(`Project summary ready at ${relativeSummaryPath(cwd, installed.summaryPath)}`);
       if (installed.backupFiles.length) {
         stdout(`Backed up agent files: ${installed.backupFiles.map((file) => relativeSummaryPath(cwd, file)).join(", ")}`);
+      }
+      // A cloned repository can arrive with its own .code-butler/ settings; say so now, not in a later doctor run.
+      if (readProjectTrust(cwd).status === "untrusted") {
+        stdout("This repository's .code-butler/ folder sets things that only apply once you approve them on this device:");
+        for (const line of describePendingSettings(cwd).slice(1)) stdout(line);
       }
       try {
         const watcher = installWatchService(watchServiceOptions(cwd, options));
@@ -254,34 +277,26 @@ async function runMcp(
   const unknownFlag = args.find((arg) => arg.startsWith("--") && arg !== "--project-root" && arg !== "--init-here" && arg !== "--no-auto-init");
   if (unknownFlag) throw new Error(`Unknown mcp option: ${unknownFlag}`);
 
-  const resolved = resolveProjectRoot({
+  const resolved = tryResolveProjectRoot({
     cwd,
     projectRoot,
     initHere,
     env: options.env
   });
+  const autoInit = args.includes("--no-auto-init") ? false : undefined;
 
-  const configPath = join(resolved.rootDir, ".code-butler", "config.json");
-  const databasePath = join(resolved.rootDir, ".code-butler", "memory.sqlite");
-  const configCreated = !existsSync(configPath);
-  const databaseCreated = !existsSync(databasePath);
-
-  validateProjectSetupPaths(resolved.rootDir, false);
-  await projectOperation(resolved.rootDir, () => {
-    validateProjectSetupPaths(resolved.rootDir, false);
-    const store = openConfiguredMemoryStore(resolved.rootDir);
-    try { store.init(); } finally { store.close(); }
-    ensureProjectConfig(resolved.rootDir);
-  });
+  // A client may launch the global server from any folder; it then binds the
+  // project from the client's roots or the agent's working directory.
+  if (!resolved) {
+    stderr("Starting Code Butler MCP without a project; waiting for client roots or current_project(projectRoot).");
+    await options.startServer({ ...(autoInit === undefined ? {} : { autoInit }) });
+    return 0;
+  }
 
   stderr(`Starting Code Butler MCP for project ${resolved.rootDir}`);
   await options.startServer({
     rootDir: resolved.rootDir,
-    autoInit: !args.includes("--no-auto-init"),
-    startupMetadata: {
-      configCreated,
-      databaseCreated
-    }
+    ...(autoInit === undefined ? {} : { autoInit })
   });
   return 0;
 }
@@ -314,7 +329,8 @@ async function runConfig(args: string[], cwd: string, stdout: (line: string) => 
     return 0;
   }
   if (subcommand === "remote-models") return runRemoteModelsCommand(nested === undefined ? [] : [nested, ...rest], cwd, stdout);
-  throw new Error("Usage: code-butler config <init|global init|migrate-local|remote-models>");
+  if (subcommand === "trust") return runTrustCommand(nested === undefined ? [] : [nested, ...rest], cwd, stdout);
+  throw new Error("Usage: code-butler config <init|global init|migrate-local|remote-models|trust>");
 }
 
 function printConfigMigration(
@@ -530,10 +546,11 @@ async function runProjectSummary(
       operationOptions.generator = createFallbackProjectSummaryGenerator(new Error("local fallback requested"));
     }
     importNewGitCommits(store, config);
-    const result = await refreshProjectSummary(store, config, {
+    // Typed by a person, so a connection limited to work they start may serve it.
+    const result = await withAiTrigger("user", () => refreshProjectSummary(store, config, {
       ...operationOptions,
       force
-    });
+    }));
     if (result.generated) {
       stdout(`${summaryWriteVerb(result)} project summary at ${relativeSummaryPath(cwd, result.summaryPath)}`);
     } else {
@@ -574,6 +591,10 @@ async function runWatch(
   const cloudOnly = args.includes("--cloud-only");
   if (cloudOnly && (!args.includes("--once") || !process.env.CODE_BUTLER_WATCH_TOKEN)) throw new Error("Cloud-only watch jobs require the global watcher");
   let stages: Partial<Record<OperationStage, OperationOutcome>> = {};
+  // Set when the secrets check found nothing to do, so the global watcher can check back later.
+  let secretsIdle = false;
+  // Set when the memory pass found nothing new, so the global watcher can space out the next one.
+  let ingestionIdle = false;
   const report = (result: OperationOutcome): void => {
     const previous = stages[result.stage];
     // A successful retry clears a deferral, but cannot hide a real error in this pass.
@@ -609,7 +630,7 @@ async function runWatch(
     const managedPass = !!process.env.CODE_BUTLER_WATCH_TOKEN;
     let beforeStamp: string | undefined;
     try {
-      stages = {};
+      stages = {}; secretsIdle = false; ingestionIdle = false;
       if (cloudOnly) {
         await (await import("./cloud/project-connections.js")).retryCatalogMaintenance(cwd);
         // A job started for secrets or catalog upkeep syncs memory only when that was asked for too, so it
@@ -618,13 +639,16 @@ async function runWatch(
         if (secretBinding(cwd)?.enabled) {
           try {
             const status = await encryptedSecretsSync(cwd);
+            secretsIdle = !!status.unchanged;
             report({ outcome: status.status === "conflict" ? "deferred" : "success", stage: "cloud",
               ...(status.status === "conflict" ? { reason: "Secrets sync needs conflict resolution" } : {}) });
           } catch (error) {
             // The native binding records a bounded error state; never write secret paths or values to watcher logs.
             const interruption = secretsSyncInterruption(error);
             report(interruption
-              ? { outcome: "deferred", stage: "cloud", reason: interruption === "busy" ? "Secrets sync deferred: another local Butler operation is active" : "Secrets sync deferred: the cloud could not be reached" }
+              ? interruption === "busy"
+                ? { outcome: "deferred", stage: "cloud", reason: "Secrets sync deferred: another local Butler operation is active" }
+                : { outcome: "deferred", stage: "cloud", reason: "Secrets sync deferred: the cloud could not be reached", ...(isNetworkUnavailable(error) ? { network: true as const } : {}) }
               : { outcome: "failed", stage: "cloud", reason: "Secrets sync failed; open Sync in the desktop app" });
           }
         }
@@ -636,13 +660,16 @@ async function runWatch(
       let projectBriefExists = false;
       const config = loadProjectConfig(cwd);
       const result = await syncWatchedProjectMemory(cwd, config, { source });
+      ingestionIdle = result.idle === true;
       for (const outcome of ingestionOutcomes(result)) report(outcome);
       stdout(
         `Synced project memory at ${result.completedAt} (git=${result.sources.git.imported}, codex=${result.sources.codex.imported}, claude=${result.sources.claude.imported}, promoted=${result.memories.promoted})`
       );
       projectBriefExists = readProjectBrief(config.sources.git.repoPath).exists;
-      // The scheduled refresh is background work; once today's budget is spent it waits for tomorrow.
-      if (projectBriefExists && !backgroundBudgetPaused()) {
+      // The scheduled refresh is background work: it waits once today's budget or the plan is spent,
+      // and leaves Claude Code to refreshes a person starts.
+      const summaryModel = jobModel(config, "summary");
+      if (projectBriefExists && !backgroundBudgetPaused(summaryModel) && !runsOnlyWhenStarted(summaryModel)) {
         try {
           // Summary generation can call a remote provider; the database handle
           // guard still blocks unsafe restores without holding the project gate.
@@ -653,6 +680,7 @@ async function runWatch(
             const summaryResult = await refreshProjectSummaryIfDue(store, config, {
               ...projectSummaryOperationOptions(options)
             });
+            if (summaryResult.generated) ingestionIdle = false;
             if (summaryResult.checked) {
               stdout(
                 summaryResult.generated
@@ -685,7 +713,7 @@ async function runWatch(
     if (args.includes("--once")) {
       const results = Object.values(stages);
       const result = results.find(item => item.outcome === "failed") ?? results.find(item => item.outcome === "deferred") ?? { outcome: "success", stage: "watcher" };
-      if (process.env.CODE_BUTLER_WATCH_TOKEN && process.send) await new Promise<void>((resolve, reject) => process.send!({ type: "watch-result", ...result, stages }, error => error ? reject(error) : resolve()));
+      if (process.env.CODE_BUTLER_WATCH_TOKEN && process.send) await new Promise<void>((resolve, reject) => process.send!({ type: "watch-result", ...result, stages, ...(secretsIdle ? { secretsIdle: true } : {}), ...(ingestionIdle ? { ingestionIdle: true } : {}) }, error => error ? reject(error) : resolve()));
       return result.outcome === "failed" ? 1 : result.outcome === "deferred" ? 75 : 0;
     }
     while (!activeSignal.aborted) {
@@ -1018,12 +1046,17 @@ function usage(): string {
   return [
     "Usage:",
     "  code-butler rules path|list|show <id>|match|conflicts|resolve <id>|attestations|attest <id>|revoke <id>|sync status|enable|disable|now",
+    "  code-butler ai chatgpt login|logout|status [--connection <id>] [--no-browser]",
+    "  code-butler clients status [--json]                 # Claude Code and Codex connections, with a real MCP start check",
+    "  code-butler clients connect <claude|codex>          # register the installed code-butler command globally",
+    "  code-butler clients connect --auto [--json]         # connect each installed client once; never overrides custom entries",
     "  code-butler init [--allow-remote-models]",
     "  code-butler config init",
     "  code-butler config global init",
     "  code-butler config migrate-local <--dry-run|--apply> [--json]",
     "  code-butler config remote-models <on|off|status>",
-    "  code-butler cloud <register|login> --server <https-origin> --email <email>",
+    "  code-butler config trust <status|approve>",
+    "  code-butler cloud <register|login> --email <email> [--server <https-origin>]",
     "  code-butler cloud logout",
     "  code-butler cloud init --recovery-file <path> [--label <name>] [--recovery-code-file <path>]",
     "  code-butler cloud device request [--label <name>]",
@@ -1063,6 +1096,7 @@ function usage(): string {
     "  code-butler memory promotions --apply [--min-score <0..1>] [--json]",
     "  code-butler memory promotions --history [--id <id>] [--limit <n>] [--json]",
     "  code-butler memory promotions --undo (--since <ISO time> | --id <candidate-id>) [--json]",
+    "  code-butler memory promotions --undo-expiry [--at <ISO time>] [--json]",
     "  code-butler memory retention [--apply] [--history] [--id <id>] [--limit <n>] [--json]",
     "  code-butler memory branch-triage [--branch <name>] [--include-active] [--stale-days <n>] [--include-reviewed] [--limit <n>] [--json]",
     "  code-butler memory branch-resolve --id <id> --category <candidate|promoted> --action <promote_to_core|discard|retain_branch> --reason <text> [--supersedes <memory-id>] [--json]",

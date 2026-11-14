@@ -4,7 +4,7 @@
 import type { RevisionPin } from "./encrypted-protocol.js";
 import type { EnrollmentRequest, SignedVaultRecord, VaultDescriptor } from "./identity-protocol.js";
 
-export type SecurityState = "authentication-required" | "enrollment-required" | "locked" | "revoked" | "recovery-required" | "conflict" | "incompatible-format" | "verification-failed" | "upgrade-required";
+export type SecurityState = "authentication-required" | "enrollment-required" | "locked" | "revoked" | "recovery-required" | "conflict" | "incompatible-format" | "verification-failed" | "upgrade-required" | "email-not-allowed" | "human-check-required" | "account-already-registered";
 export class SecurityError extends Error {
   constructor(readonly status: number, readonly state: SecurityState, message = state as string) { super(message); }
 }
@@ -13,7 +13,8 @@ export interface AccountSession { id: string; accountId: string; deviceId: strin
 export interface AccountProfile { id: string; email: string; createdAt: number; passwordSet: boolean; passkeyCount: number }
 export interface SessionTokens { accessToken: string; refreshToken: string; accessExpiresAt: number; accountId: string }
 
-export interface VaultState { descriptor: VaultDescriptor; records: SignedVaultRecord[] }
+export interface RecoveryKit { version: 1; ciphertext: string }
+export interface VaultState { descriptor: VaultDescriptor; records: SignedVaultRecord[]; cloudRecovery?: true }
 /** Only the records after `after`: the caller already holds the chain up to that sequence. */
 export interface VaultStateUpdate extends VaultState { after: number }
 export type EnrollmentStatus = "pending" | "approved" | "complete" | "cancelled" | "expired";

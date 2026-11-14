@@ -612,21 +612,22 @@ sync is experimental, registration on the hosted service is closed; open an
 issue if you want to take part in testing. From the CLI, on your first computer:
 
 ```bash
-code-butler cloud register --server https://cloud.codebutler.dev --email you@example.com
+code-butler cloud register --email you@example.com
 code-butler cloud init --recovery-file ./code-butler-recovery.json
 code-butler cloud enable --new
 code-butler cloud status
 ```
 
 `register` sends an email code, then asks for a new password at a hidden
-prompt. `init` creates your encrypted vault and writes an offline recovery file;
+prompt. Both commands use the hosted service by default; pass
+`--server https://your-host` to use a self-hosted server. `init` creates your encrypted vault and writes an offline recovery file;
 it prints a separate recovery code. Store both somewhere safe and offline. They
 are the only way back in if you lose every approved computer.
 
 To add another computer, sign in there and request approval:
 
 ```bash
-code-butler cloud login --server https://cloud.codebutler.dev --email you@example.com
+code-butler cloud login --email you@example.com
 code-butler cloud device request
 ```
 

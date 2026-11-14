@@ -42,7 +42,10 @@ function secretSetupOutcome(root: string, outcome: SecretSyncStatus): NonNullabl
 
 /** Login and enrollment explicitly call this helper; status reads remain read-only. */
 export async function bootstrapAccount(status: DesktopAccountStatus, options: AccountBootstrapOptions = {}): Promise<AccountBootstrapResult> {
-  const result: AccountBootstrapResult = { rules: { state: "pending", reason: "Sign in and enroll this computer to sync global rules." }, projects: [] };
+  const reason = !status.signedIn ? "Sign in to sync global rules."
+    : status.device === "none" || status.device === "setup-pending" ? "Finish first-computer setup to sync global rules."
+    : "Enroll this computer to sync global rules.";
+  const result: AccountBootstrapResult = { rules: { state: "pending", reason }, projects: [] };
   const ready = status.signedIn && status.device === "enrolled";
   const account = status.server && status.accountId ? { server: status.server, accountId: status.accountId } : undefined;
   let captured: AutomaticAccountContext | undefined;

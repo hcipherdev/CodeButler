@@ -31,10 +31,11 @@ import {
 } from "./partition.js";
 import { assertNoDatabaseHandles, registerDatabaseHandle, withProjectGate } from "./gate.js";
 import { atomicJson, atomicWrite, binding, saveBinding, syncDirectory, readJson, sha256, stateDirectory, UUID, type Binding } from "./state.js";
+import { LOCAL_TABLES, NON_SNAPSHOT_TABLES } from "../storage/shared-changes.js";
+import { isRulesMetadataName } from "../rules/format.js";
 
 export const MAX_COMPRESSED = 256 * 1024 * 1024;
 export const MAX_EXPANDED = 1024 * 1024 * 1024;
-const LOCAL_TABLES = ["sync_sources", "sync_cursors", "extraction_jobs", "extraction_status", "branch_triage_reviews", "promotion_decisions", "layer_retention_decisions", "peer_partitions"];
 const SQLITE_SIDE_SUFFIXES = ["", "-wal", "-shm"];
 /**
  * Payloads travel as content-addressed blocks rather than inside the manifest, so a
@@ -227,6 +228,7 @@ export function excluded(path: string): boolean {
   if(path==="handbook-export.meta.json"||path==="handbook"||path.startsWith("handbook/"))return true;
   if (path === "setup.meta.json") return true;
   const parts = path.split("/");
+  if (parts[0] === "rules" && parts.some(isRulesMetadataName)) return true;
   return parts.some(p => p === "config.local.json" || p === "logs" || p === "backups" || p === "staging" || p.startsWith(".cloud") || p === ".foreground-intents" || p === "gate-timing.json" || p === "watcher-timing.json" || p === "cloud" || p === "device.json" || (p.startsWith(".env") && p !== ".env.example") || p.endsWith(".lock") || p.endsWith(".tmp") || p === ".DS_Store") ||
     /^memory\.sqlite(?:-|\.)/.test(path) ||
     /^memory-local\.sqlite(?:$|-|\.)/.test(path) || parts.includes("retrieval");
@@ -301,7 +303,7 @@ function layerRowSpec(match: string): ReadonlyArray<readonly [string, string]> {
    * derived from device-local memories.
    */
   return [
-    ["memory_events", match], ["memory_topic_links", match], ["memory_topics", match],
+    ["memory_events", match], ["memory_topic_links", match], ["memory_topics", match], ["memory_usage", match],
     ["memory_review_resolution_compensations", match],
     ["memory_review_resolutions", match],
     ["memory_relations", `from_memory_id in (${memories}) or to_memory_id in (${memories})`],
@@ -429,7 +431,7 @@ export function preserveLocalLayers(original: DatabaseSync, target: DatabaseSync
 export function databaseFingerprint(path: string): string {
   const db = new DatabaseSync(path, { readOnly: true });
   try {
-    const names = (db.prepare("pragma table_list").all() as Array<{ name: string; type: string; schema: string }>).filter(t => t.schema === "main" && t.type === "table" && !t.name.startsWith("sqlite_") && ![...LOCAL_TABLES, "operation_log", "schema_migrations", "retrieval_identity", "retrieval_changes"].includes(t.name)).map(t => t.name).sort();
+    const names = (db.prepare("pragma table_list").all() as Array<{ name: string; type: string; schema: string }>).filter(t => t.schema === "main" && t.type === "table" && !t.name.startsWith("sqlite_") && !NON_SNAPSHOT_TABLES.includes(t.name)).map(t => t.name).sort();
     // The hash of JSON.stringify([[name, columns, sortedRows], …]), fed as it is produced rather than built
     // as one string about twice the size of the database: the same value with far less memory and copying.
     const hash = createHash("sha256");
@@ -688,9 +690,13 @@ export function decodeSnapshot(bytes: Buffer, platform: string = process.platfor
     if (seen.has(key)) throw new Error("Snapshot contains colliding paths"); seen.add(key);
     total += segment.bytes;
     if (total > MAX_EXPANDED) throw new Error("Invalid snapshot checksum or size");
-    // A file is one block, so its content address and its fingerprint are the same
-    // hash; only the core database has a separate logical fingerprint.
-    if (segment.kind === "file" && (segment.blocks.length !== 1 || segment.blocks[0] !== segment.fingerprint)) {
+    // A file under BLOCK_SIZE is one block, so its content address and its fingerprint
+    // are the same hash. A larger file spans several blocks, and `materializeSnapshot`
+    // checks the joined bytes against the fingerprint instead.
+    if (segment.kind === "file" && segment.blocks.length === 1 && segment.blocks[0] !== segment.fingerprint) {
+      throw new Error("Invalid snapshot checksum or size");
+    }
+    if (segment.kind === "file" && segment.blocks.length > Math.max(1, Math.ceil(segment.bytes / BLOCK_SIZE))) {
       throw new Error("Invalid snapshot checksum or size");
     }
   }
@@ -707,10 +713,12 @@ export function materializeSnapshot(
   resolve: (checksum: string) => Buffer,
   deviceId?: string
 ): MaterializedSnapshot {
-  const files = fileSegments(manifest).map(segment => ({
-    path: segmentPath(segment),
-    data: segment.kind === "core" && manifest.version === 4 ? databaseFromRowStream(joinBlocks(segment, resolve)) : joinBlocks(segment, resolve)
-  }));
+  const files = fileSegments(manifest).map(segment => {
+    const data = segment.kind === "core" && manifest.version === 4 ? databaseFromRowStream(joinBlocks(segment, resolve)) : joinBlocks(segment, resolve);
+    // The core has a logical fingerprint verified with the database; a file's is the hash of its bytes.
+    if (segment.kind === "file" && sha256(data) !== segment.fingerprint) throw new Error("Invalid snapshot checksum or size");
+    return { path: segmentPath(segment), data };
+  });
   const config = files.find(file => file.path === "config.json");
   if (config) assertPortableConfigBytes(config.data);
   const own = deviceId ?? installationDeviceId();

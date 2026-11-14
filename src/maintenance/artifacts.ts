@@ -1,12 +1,13 @@
 import {
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
-  renameSync,
   rmSync,
-  statSync
+  statSync,
+  truncateSync
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
@@ -65,9 +66,29 @@ export function runArtifactMaintenance(
   return result;
 }
 
+/** What the global watcher and its runtime installer write under `<CODE_BUTLER_HOME>/watch/logs`. */
+export const GLOBAL_WATCH_LOG_NAMES = ["watch.out.log", "watch.err.log", "runtime-install.log"] as const;
+
+/** Rotates and prunes the named logs in one folder, such as the global watcher's, outside any project. */
+export function runLogDirectoryMaintenance(
+  logsDir: string,
+  names: readonly string[],
+  logs: ArtifactRetentionConfig["logs"],
+  options: { apply: boolean }
+): ArtifactMaintenanceResult {
+  const result: ArtifactMaintenanceResult = { dryRun: !options.apply, scanned: 0, removed: 0, rotated: 0, items: [], warnings: [] };
+  inspectLogDirectory(logsDir, names, logs, result);
+  if (options.apply) applyMaintenance(result, { logs });
+  return result;
+}
+
 function inspectLogs(dataDir: string, config: ArtifactRetentionConfig, result: ArtifactMaintenanceResult): void {
-  const logsDir = join(dataDir, "logs");
-  for (const name of ["watch.out.log", "watch.err.log"]) {
+  inspectLogDirectory(join(dataDir, "logs"), ["watch.out.log", "watch.err.log"], config.logs, result);
+}
+
+function inspectLogDirectory(logsDir: string, names: readonly string[], logs: ArtifactRetentionConfig["logs"], result: ArtifactMaintenanceResult): void {
+  const config = { logs };
+  for (const name of names) {
     const path = join(logsDir, name);
     if (existsSync(path)) {
       result.scanned += 1;
@@ -194,7 +215,7 @@ function inspectCloudHandles(dataDir: string, config: ArtifactRetentionConfig, r
   }
 }
 
-function applyMaintenance(result: ArtifactMaintenanceResult, config: ArtifactRetentionConfig): void {
+function applyMaintenance(result: ArtifactMaintenanceResult, config: Pick<ArtifactRetentionConfig, "logs">): void {
   const rotated = result.items.filter((item) => item.action === "rotate");
   for (const item of result.items.filter((candidate) => candidate.action === "remove")) {
     try {
@@ -214,9 +235,15 @@ function applyMaintenance(result: ArtifactMaintenanceResult, config: ArtifactRet
   }
 }
 
+/**
+ * Copies the log aside and empties it in place. The watcher's service manager (launchd,
+ * systemd, the Windows launcher) keeps the file open for appending, so a rename would leave
+ * it writing into the rotated copy; truncating keeps the open file current. Lines written
+ * between the copy and the truncate are lost, which is accepted for watcher logs.
+ */
 function rotateLog(path: string, maxFiles: number): number {
   if (maxFiles === 0) {
-    rmSync(path, { force: true });
+    truncateSync(path, 0);
     return 1;
   }
   const dir = dirname(path);
@@ -227,7 +254,14 @@ function rotateLog(path: string, maxFiles: number): number {
     .map((candidate) => Number(candidate.slice(path.length + 1)))
     .filter((value) => Number.isInteger(value) && value > 0)
     .reduce((max, value) => Math.max(max, value), 0) + 1;
-  renameSync(path, `${path}.${next}`);
+  const copy = `${path}.${next}`;
+  copyFileSync(path, copy);
+  try { truncateSync(path, 0); }
+  catch (error) {
+    // Without the truncate the next pass would copy the same lines again.
+    rmSync(copy, { force: true });
+    throw error;
+  }
   let removed = 0;
   for (const extra of listRotatedLogs(dir, name).slice(maxFiles)) {
     rmSync(extra, { force: true });

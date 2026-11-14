@@ -1,11 +1,12 @@
 import { hasCredentials } from "../ai/credentials.js";
-import { AI_BUDGET_REASON, AiBudgetExceededError, backgroundBudgetPaused } from "../ai/usage.js";
+import { AiPausedError, backgroundPauseReason, isAiPauseReason } from "../ai/usage.js";
 import { createMemoryOrigin, type OriginFactory } from "../memory/origin.js";
 import { createHash } from "node:crypto";
 import { projectOperation } from "../cloud/client.js";
 import { withProjectGateSync } from "../cloud/gate.js";
 import { activeForegroundIntent } from "../cloud/foreground.js";
 import { OperationDeferredError, type OperationOutcome } from "../cloud/outcome.js";
+import { isNetworkUnavailable } from "../cloud/network.js";
 import { openConfiguredMemoryStore } from "../storage/open-configured-store.js";
 import { atomicJson } from "../cloud/state.js";
 import { join } from "node:path";
@@ -27,11 +28,12 @@ import { candidateIdentityFor, selectRelatedMemories, type ExistingMemoryTarget 
 import { applyInvalidation, applyPendingInvalidations, type MemoryRef, type PendingInvalidationSummary } from "../memory/invalidation.js";
 import { extractionPolicy } from "../config.js";
 import { migrateRemoteModelConsent } from "../ai/consent.js";
-import { runAutomaticPromotions, type AutomaticPromotionSummary } from "../memory/automatic-promotion.js";
+import { recordLocalActivityDay, runAutomaticPromotions, type AutomaticPromotionSummary } from "../memory/automatic-promotion.js";
+import { ingestMemoryUsage } from "../memory/usage.js";
 import { runLayerRetention, type LayerRetentionSummary } from "../memory/layer-retention.js";
 import { checkMaintenancePass, recordMaintenancePass } from "./maintenance-pass.js";
 import type { ExtractionJob, MemoryStore } from "../storage/store.js";
-import { discoverConversationFiles, scanClaudeFiles, scanCodexFiles, syncClaudeSource, syncCodexSource, type ConversationFileScan } from "../sources/codex.js";
+import { discoverConversationFiles, foreignCursorKey, foreignVerdictHolds, scanClaudeFiles, scanCodexFiles, syncClaudeSource, syncCodexSource, type ConversationFileScan } from "../sources/codex.js";
 import { scanGitSource, syncGitSource, type GitSourceScan } from "../sources/git.js";
 import type {
   CommitRecord,
@@ -65,6 +67,7 @@ export interface SyncMemoryResult {
   waiting?: number;
 }
 
+export const EXTRACTION_WAITING_FOR_NETWORK = "Memory extraction waiting for the network";
 const EXTRACTION_BATCH_SIZE = 10;
 const MAX_EXTRACTION_BATCHES_PER_PASS = 3;
 /** Queued jobs scanned per pass; enough that sessions waiting to go quiet cannot starve the rest. */
@@ -88,6 +91,8 @@ export interface SyncRunResult {
   /** True when the watcher skipped promotion and retention because nothing they read changed. */
   maintenanceSkipped?: boolean | undefined;
   embeddings?: EmbeddingBuildResult | undefined;
+  /** Watcher only: the pass found nothing new and left nothing queued, so the next one can wait. */
+  idle?: boolean | undefined;
 }
 
 export type SyncEmbeddingBuilder = typeof buildEmbeddings;
@@ -293,9 +298,10 @@ export async function syncProjectMemory(
   let firstError: string | undefined;
   let completedAny = false;
   const { overlapChunks, relatedMemories } = extractionPolicy(config);
-  let budgetPaused = false;
+  let pausedReason: string | undefined;
   for (let offset = 0; offset < pending.length; offset += EXTRACTION_BATCH_SIZE) {
-    if (backgroundBudgetPaused()) { budgetPaused = true; break; }
+    pausedReason = backgroundPauseReason(config.extractor);
+    if (pausedReason) break;
     const batch = pending.slice(offset, offset + EXTRACTION_BATCH_SIZE);
     const { context, missing, units, caughtUp } = extractionContext(store, batch, { overlapChunks });
     if (missing.length) store.discardExtractionEvidence(missing);
@@ -324,8 +330,9 @@ export async function syncProjectMemory(
       completedAny = true;
       logExtractionBatch(store, config, "sync", startedAt, ready, { extracted, processed });
     } catch (error) {
-      // Over budget is not a failure of this evidence: leave it queued for tomorrow.
-      if (error instanceof AiBudgetExceededError) { budgetPaused = true; break; }
+      // Over budget or plan limit is not a failure of this evidence: leave it queued for later.
+      if (error instanceof AiPausedError) { pausedReason = error.message; break; }
+      if (isNetworkUnavailable(error)) { pausedReason = EXTRACTION_WAITING_FOR_NETWORK; break; }
       const message = error instanceof Error ? error.message : String(error);
       store.recordExtractionFailure(ready, message);
       firstError ??= message;
@@ -335,7 +342,7 @@ export async function syncProjectMemory(
   result.memories.pending = store.getExtractionStatus().pending;
   result.memories.skipped = !completedAny && deterministicProcessed.candidates === 0;
   if (firstError) result.memories.error = firstError;
-  if (result.memories.pending > 0 && !firstError) result.memories.reason = budgetPaused ? AI_BUDGET_REASON : "Memory extraction pending";
+  if (result.memories.pending > 0 && !firstError) result.memories.reason = pausedReason ?? "Memory extraction pending";
 
   return finishSync(store, config, result, options);
 }
@@ -349,8 +356,10 @@ export function ingestionOutcomes(result: SyncRunResult): OperationOutcome[] {
   }
   const pending = result.memories.pending ?? 0, waiting = result.memories.waiting ?? 0;
   if (result.memories.error) outcomes.push({ outcome: "failed", stage: "ingestion", reason: `Memory extraction failed: ${result.memories.error}` });
+  // Queued work waits for the network without counting as failed attempts; the watcher pauses on the flag.
+  else if (result.memories.reason === EXTRACTION_WAITING_FOR_NETWORK) outcomes.push({ outcome: "deferred", stage: "ingestion", reason: result.memories.reason, network: true });
   // A spent budget is on schedule, not deferred, or the watcher would retry the project on its backoff all day.
-  else if (result.memories.reason === AI_BUDGET_REASON) outcomes.push({ outcome: "success", stage: "ingestion", reason: AI_BUDGET_REASON });
+  else if (isAiPauseReason(result.memories.reason)) outcomes.push({ outcome: "success", stage: "ingestion", reason: result.memories.reason! });
   // A session waiting to go quiet is on schedule, not deferred: reporting it as deferred made the
   // global watcher retry the project on its backoff for as long as the session stayed active.
   else if (pending > waiting) outcomes.push({ outcome: "deferred", stage: "ingestion", reason: `${pending - waiting} memory extraction item(s) pending` });
@@ -382,21 +391,28 @@ export async function syncWatchedProjectMemory(
     try {
       store.init();
       config = migrateRemoteModelConsent(store, config);
+      // Verdicts that a log belongs to another project, read with the cursors so the scan can skip those logs.
+      const foreign = (source: "codex" | "claude", paths: string[]) => new Map(config.sources[source].projectOnly
+        ? paths.flatMap(path => { const value = store.getSyncCursor(source, foreignCursorKey(path))?.cursorValue; return value ? [[path, value] as const] : []; })
+        : []);
       return {
         git: store.getSyncCursor("git", "last_commit")?.cursorValue,
         codex: new Map(files.codex.map(path => [path, store.getSyncCursor("codex", path)?.cursorValue ?? ""])),
-        claude: new Map(files.claude.map(path => [path, store.getSyncCursor("claude", path)?.cursorValue ?? ""]))
+        claude: new Map(files.claude.map(path => [path, store.getSyncCursor("claude", path)?.cursorValue ?? ""])),
+        foreignCodex: foreign("codex", files.codex),
+        foreignClaude: foreign("claude", files.claude)
       };
     } finally { store.close(); }
   });
+  const projectRoot = config.sources.git.repoPath;
   const sourceScans: NonNullable<SyncProjectMemoryOptions["sourceScans"]> = {};
   const sourceScanErrors: Partial<Record<SyncSourceName, string>> = {};
   if (config.sources.git.enabled && sources.includes("git")) {
     try { sourceScans.git = scanGitSource(config.sources.git, cursors.git); }
     catch (error) { sourceScanErrors.git = error instanceof Error ? error.message : String(error); }
   }
-  sourceScans.codex = scanCodexFiles(files.codex, cursors.codex);
-  sourceScans.claude = scanClaudeFiles(files.claude, cursors.claude);
+  sourceScans.codex = scanCodexFiles(files.codex, cursors.codex, (path, signature) => foreignVerdictHolds("codex", cursors.foreignCodex.get(path), projectRoot, signature));
+  sourceScans.claude = scanClaudeFiles(files.claude, cursors.claude, (path, signature) => foreignVerdictHolds("claude", cursors.foreignClaude.get(path), projectRoot, signature));
   preparationMs = performance.now() - preparationStarted;
   const imported = await gated("Watcher import", async () => {
     const phaseStarted = performance.now();
@@ -416,7 +432,8 @@ export async function syncWatchedProjectMemory(
     const layer = defaultBranchMemoryLayer(config.sources.git.repoPath);
     const { overlapChunks, relatedMemories } = extractionPolicy(config);
     for (let batchNumber = 0; batchNumber < MAX_EXTRACTION_BATCHES_PER_PASS; batchNumber += 1) {
-      if (backgroundBudgetPaused()) { result.memories.reason = AI_BUDGET_REASON; break; }
+      const pausedReason = backgroundPauseReason(config.extractor);
+      if (pausedReason) { result.memories.reason = pausedReason; break; }
       const prepStarted = performance.now();
       const prepared = await gated("Watcher extraction preparation", () => {
         const store = openConfiguredMemoryStore(root);
@@ -450,8 +467,10 @@ export async function syncWatchedProjectMemory(
         if (!extracted) throw new Error("Extractor returned no result");
       } catch (error) { modelError = error; }
       finally { modelMs += performance.now() - modelStarted; }
-      // Over budget is not a failure of this evidence: leave it queued for tomorrow.
-      if (modelError instanceof AiBudgetExceededError) { result.memories.reason = AI_BUDGET_REASON; break; }
+      // Over budget or plan limit is not a failure of this evidence: leave it queued for later.
+      if (modelError instanceof AiPausedError) { result.memories.reason = modelError.message; break; }
+      // Neither is a missing network (asleep, offline): the jobs keep their attempt counts.
+      if (modelError && isNetworkUnavailable(modelError)) { result.memories.reason = EXTRACTION_WAITING_FOR_NETWORK; break; }
       const commitStarted = performance.now();
       const committed = await gated("Watcher extraction commit", () => {
         const store = openConfiguredMemoryStore(root);
@@ -528,6 +547,7 @@ export async function syncWatchedProjectMemory(
     result.embeddings = embeddingFailureStatus(gatedStore, config, error);
   } finally { activeStore?.close(); embeddingMs += performance.now() - embeddingStarted; }
   result.completedAt = new Date().toISOString();
+  result.idle = watcherPassIdle(result, sourceScans);
   if (process.env.CODE_BUTLER_RETRIEVAL_ENGINE === "published") {
     const { scheduleRetrieval } = await import("../retrieval/worker.js");
     scheduleRetrieval(root);
@@ -540,6 +560,20 @@ export async function syncWatchedProjectMemory(
     maintenanceSkipped: result.maintenanceSkipped === true, gateHoldMs: Math.round(gateHoldMs)
   }); } catch { /* Diagnostics never mask sync results. */ }
   return result;
+}
+
+/**
+ * Whether a watcher pass found nothing to do, so the next one can wait longer. Anything new,
+ * queued, failed, or left for a later pass (logs over the parse budget) keeps the normal pace.
+ */
+export function watcherPassIdle(result: SyncRunResult, scans: NonNullable<SyncProjectMemoryOptions["sourceScans"]> = {}): boolean {
+  if (Object.values(result.sources).some(source => source.imported > 0 || source.error)) return false;
+  if ([...(scans.codex ?? []), ...(scans.claude ?? [])].some(entry => entry.deferred)) return false;
+  const memories = result.memories;
+  if (memories.error || (memories.pending ?? 0) > 0 || memories.candidates > 0 || memories.promoted > 0) return false;
+  if (result.maintenanceSkipped !== true) return false;
+  const embeddings = result.embeddings;
+  return !embeddings || embeddings.built + embeddings.retried + embeddings.enqueued + embeddings.removedJobs + embeddings.removedVectors === 0;
 }
 
 function extractionJobIdentity(job: ExtractionJob): string {
@@ -707,6 +741,11 @@ function runMaintenancePasses(
   inputs: string | undefined
 ): void {
   let failed = false;
+  // Before promotion, whose expiry step reads both.
+  try { ingestMemoryUsage(store, store.paths.rootDir); } catch { /* Usage notes wait for the next sync. */ }
+  if (Object.values(result.sources).some((source) => source.imported > 0)) {
+    try { recordLocalActivityDay(store, result.startedAt); } catch { /* Best effort. */ }
+  }
   try {
     result.promotions = runAutomaticPromotions(store, config, {
       repoPath: config.sources.git.repoPath
@@ -719,6 +758,7 @@ function runMaintenancePasses(
       converged: 0,
       deferred: 0,
       skipped: 0,
+      expired: 0,
       warnings: ["Automatic promotion pass failed"]
     };
   }

@@ -1,11 +1,13 @@
-import { globalConfigDir } from "../config.js";
+import { globalConfigDir, storedGlobalEnvValue } from "../config.js";
 import { CryptoHelper } from "../cloud/crypto-helper.js";
 import { nativeExecutable } from "../cloud/native-security.js";
+import { readEnv } from "../project-env.js";
+import { locateClaudeCli } from "../providers/claude-cli.js";
 import type { AiConnectionKind, ExtractorConfig, InvestigatorConfig } from "../types.js";
 import { AI_PROVIDER_PRESETS, isLocalKind } from "./providers.js";
 
 type CredentialConfig = Pick<ExtractorConfig | InvestigatorConfig,
-  "provider" | "apiKeyEnv" | "workspaceIdEnv" | "regionEnv" | "workspaceId" | "region" | "connectionId" | "connectionKind" | "connectionLabel" | "keyUpdatedAt" | "requiresConsent">;
+  "provider" | "apiKeyEnv" | "workspaceIdEnv" | "regionEnv" | "workspaceId" | "region" | "connectionId" | "connectionKind" | "connectionLabel" | "keyUpdatedAt" | "keySavedToEnv" | "preferSavedKey" | "preferSavedAwsSettings" | "requiresConsent" | "cliPath" | "envRoot">;
 
 /** Reported as missing while the built-in default model waits for the person's opt-in. */
 export const REMOTE_MODEL_CONSENT = "privacy.allowRemoteModels";
@@ -46,7 +48,6 @@ export function setKeychainStoreForTests(store: KeychainStore | undefined): void
 export function keychainStoreInjected(): boolean { return keychainOverride !== undefined; }
 
 const cache = new Map<string, string>();
-const env = (name: string | undefined) => (name ? process.env[name]?.trim() : undefined) || undefined;
 
 function kindOf(config: CredentialConfig): AiConnectionKind | undefined { return config.connectionKind; }
 
@@ -59,24 +60,37 @@ export function needsApiKey(config: CredentialConfig): boolean {
   return true;
 }
 
+function keyFromEnvironment(config: CredentialConfig): string | undefined {
+  if (config.preferSavedKey && config.connectionId && (config.keyUpdatedAt || config.keySavedToEnv)) {
+    return config.keySavedToEnv ? storedGlobalEnvValue(config.apiKeyEnv)?.trim() || undefined : undefined;
+  }
+  return readEnv(config.apiKeyEnv, config.envRoot);
+}
+
 /**
  * Where the key comes from, without reading the keychain. Environment variables (including
- * values loaded from .env files) win over a key saved in the app.
+ * values loaded from .env files) win unless the person explicitly chose the app's saved key.
  */
 export function credentialStatus(config: CredentialConfig): CredentialStatus {
   const missing: string[] = [];
   let keySource: KeySource = "not-needed";
   let envName: string | undefined;
   if (needsApiKey(config)) {
-    if (env(config.apiKeyEnv)) { keySource = "env"; envName = config.apiKeyEnv; }
+    if (keyFromEnvironment(config)) { keySource = "env"; envName = config.apiKeyEnv; }
     else if (config.connectionId && config.keyUpdatedAt) keySource = "keychain";
     else { keySource = "missing"; missing.push(config.apiKeyEnv || "API key"); }
   }
+  // Plan connections hold no key: one needs a ChatGPT sign-in, the other an installed Claude Code.
+  if (config.connectionKind === "chatgpt") {
+    if (config.keyUpdatedAt) keySource = "keychain";
+    else missing.push("ChatGPT sign-in");
+  }
+  if (config.connectionKind === "claude-code" && !locateClaudeCli(config.cliPath)) missing.push("Claude Code CLI");
   if (config.provider === "anthropic-aws") {
     const workspaceEnv = config.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID";
     const regionEnv = config.regionEnv ?? "AWS_REGION";
-    if (!env(workspaceEnv) && !config.workspaceId?.trim()) missing.push(workspaceEnv);
-    if (!env(regionEnv) && !config.region?.trim()) missing.push(regionEnv);
+    if (!readEnv(workspaceEnv, config.envRoot) && !config.workspaceId?.trim()) missing.push(workspaceEnv);
+    if (!readEnv(regionEnv, config.envRoot) && !config.region?.trim()) missing.push(regionEnv);
   }
   if (config.requiresConsent) missing.push(REMOTE_MODEL_CONSENT);
   return { ok: missing.length === 0, keySource, ...(envName ? { envName } : {}), missing };
@@ -86,7 +100,7 @@ export function hasCredentials(config: CredentialConfig): boolean { return crede
 
 /** The key to send, or undefined when none is needed. Keychain reads are cached per saved key. */
 export async function resolveApiKey(config: CredentialConfig, label = config.connectionLabel ?? "Model provider"): Promise<string | undefined> {
-  const fromEnv = env(config.apiKeyEnv);
+  const fromEnv = keyFromEnvironment(config);
   if (fromEnv) return fromEnv;
   if (config.connectionId && config.keyUpdatedAt) {
     const cacheKey = `${config.connectionId}\u0000${config.keyUpdatedAt}`;
@@ -104,12 +118,24 @@ export async function resolveApiKey(config: CredentialConfig, label = config.con
   throw new Error(`${label} API key is missing; set ${config.apiKeyEnv || "an API key"} or add it in Code Butler's AI models settings`);
 }
 
-/** Claude on AWS also needs a workspace and region; the environment wins over saved values. */
-export function resolveAwsSettings(config: CredentialConfig): { workspaceId: string; region: string } {
+/** Non-secret effective values for display, with existing environment precedence preserved unless explicitly overridden. */
+export function awsSettingsValues(config: CredentialConfig) {
   const workspaceEnv = config.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID";
   const regionEnv = config.regionEnv ?? "AWS_REGION";
-  const workspaceId = env(workspaceEnv) ?? config.workspaceId?.trim();
-  const region = env(regionEnv) ?? config.region?.trim();
+  const choose = (saved: string | undefined, environment: string | undefined) => {
+    const value = saved?.trim();
+    if (value && config.preferSavedAwsSettings) return { value, source: "saved" as const };
+    if (environment) return { value: environment, source: "environment" as const };
+    return value ? { value, source: "saved" as const } : { value: undefined, source: "missing" as const };
+  };
+  const workspace = choose(config.workspaceId, readEnv(workspaceEnv, config.envRoot));
+  const region = choose(config.region, readEnv(regionEnv, config.envRoot));
+  return { workspaceId: workspace.value, region: region.value, workspaceIdSource: workspace.source, regionSource: region.source };
+}
+
+export function resolveAwsSettings(config: CredentialConfig): { workspaceId: string; region: string } {
+  const { workspaceId, region } = awsSettingsValues(config);
+  const workspaceEnv = config.workspaceIdEnv ?? "ANTHROPIC_AWS_WORKSPACE_ID", regionEnv = config.regionEnv ?? "AWS_REGION";
   if (!workspaceId) throw new Error(`Anthropic AWS workspace ID is missing; set ${workspaceEnv}`);
   if (!region) throw new Error(`AWS region is missing; set ${regionEnv}`);
   return { workspaceId, region };

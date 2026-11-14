@@ -1,4 +1,4 @@
-// Tests encodeRowStream() and buildDatabaseFromRowStream() in src/cloud/row-stream.ts, and v4 snapshots (captureSnapshot rowStream, captureFingerprint, materializeSnapshot, decodeSnapshot, objectSizeEstimates) in src/cloud/snapshot.ts and src/cloud/encrypted-snapshot.ts.
+// Tests encodeRowStream() and buildDatabaseFromRowStream() in src/cloud/row-stream.ts, and v4 snapshots (captureSnapshot rowStream, captureFingerprint, materializeSnapshot, decodeSnapshot, objectSizeEstimates, multi-block project files) in src/cloud/snapshot.ts and src/cloud/encrypted-snapshot.ts.
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -72,16 +72,17 @@ describe("row stream", () => {
     const { backup } = await import("node:sqlite");
     const source = new DatabaseSync(databasePath(root), { readOnly: true });
     try { await backup(source, copy); } finally { source.close(); }
-    // Same rows, physically reinserted in another order, so rowids differ from the original.
+    // Same rows, physically reinserted in another order, so rowids differ from the original. Journal and change counter are
+    // per-device bookkeeping a real capture strips first, so both copies drop them.
     const db = new DatabaseSync(copy);
     try {
       db.exec(`pragma foreign_keys = off;
         create temp table s as select * from sources; create temp table c as select * from chunks;
         delete from chunks; delete from sources;
         insert into sources select * from s order by id; insert into chunks select * from c order by id;
-        delete from retrieval_changes;`);
+        delete from retrieval_changes; delete from cloud_change_counter;`);
     } finally { db.close(); }
-    withStore(root, store => store.db.exec("delete from retrieval_changes"));
+    withStore(root, store => store.db.exec("delete from retrieval_changes; delete from cloud_change_counter"));
     const order = (path: string) => { const d = new DatabaseSync(path, { readOnly: true }); try { return (d.prepare("select id from sources order by rowid").all() as Array<{ id: string }>).map(r => r.id); } finally { d.close(); } };
     expect(order(copy)).not.toEqual(order(databasePath(root)));
     expect(encodeRowStream(copy).equals(encodeRowStream(databasePath(root)))).toBe(true);
@@ -96,13 +97,13 @@ describe("row stream", () => {
       const chunk = (store.db.prepare("select id from chunks where source_id = ?").get(source) as { id: string }).id;
       for (let i = 0; i < 20; i++) insert.run(randomUUID(), "chunk", chunk, `src/${source}-${i}.ts`, chunk);
     };
-    withStore(root, store => { for (const source of ["older", "active", "newer"]) mention(store, source); store.db.exec("delete from retrieval_changes"); });
+    withStore(root, store => { for (const source of ["older", "active", "newer"]) mention(store, source); store.db.exec("delete from retrieval_changes; delete from cloud_change_counter"); });
     const lines = () => encodeRowStream(databasePath(root)).toString("utf8").split("\n");
     const before = lines();
     // What re-ingesting a growing conversation does: every mention of that source comes back under a new id.
     withStore(root, store => {
       store.db.prepare("delete from relations where from_id = ? or from_id in (select id from chunks where source_id = ?)").run("active", "active");
-      mention(store, "active"); store.db.exec("delete from retrieval_changes");
+      mention(store, "active"); store.db.exec("delete from retrieval_changes; delete from cloud_change_counter");
     });
     const after = lines();
     expect(after.length).toBe(before.length);
@@ -159,6 +160,25 @@ describe("snapshot format v4", () => {
     expect(await captureFingerprint(root)).toBe(full.snapshot.fingerprint);
     remember(root, "A later change moves it.");
     expect(await captureFingerprint(root)).not.toBe(full.snapshot.fingerprint);
+  }, 60000);
+
+  it("round-trips a project file larger than one block, and rejects a tampered multi-block file", async () => {
+    const root = project();
+    const { writeFileSync } = await import("node:fs");
+    const summary = Buffer.from("# Summary\n" + "A project narrative line that keeps growing.\n".repeat(2000));
+    expect(summary.length).toBeGreaterThan(64 * 1024);
+    writeFileSync(join(root, ".code-butler", "project-summary.md"), summary);
+    const captured = await captureSnapshot(root, randomUUID(), 0);
+    const segment = captured.snapshot.segments.find(s => s.id.endsWith("project-summary.md"))!;
+    expect(segment.blocks.length).toBeGreaterThan(1);
+    const decoded = decodeSnapshot(gzipSync(Buffer.from(JSON.stringify(captured.snapshot))));
+    const materialized = materializeSnapshot(decoded, bundleResolver(captured.blocks));
+    expect(materialized.files.find(file => file.path === "project-summary.md")!.data.equals(summary)).toBe(true);
+
+    const reordered = { ...captured.snapshot, segments: captured.snapshot.segments.map(s => s === segment ? { ...s, blocks: [...s.blocks].reverse() } : s) };
+    expect(() => materializeSnapshot(decodeSnapshot(gzipSync(Buffer.from(JSON.stringify(reordered)))), bundleResolver(captured.blocks))).toThrow("Invalid snapshot checksum or size");
+    const padded = { ...captured.snapshot, segments: captured.snapshot.segments.map(s => s === segment ? { ...s, blocks: [...s.blocks, s.blocks[0]] } : s) };
+    expect(() => decodeSnapshot(gzipSync(Buffer.from(JSON.stringify(padded))))).toThrow("Invalid snapshot checksum or size");
   }, 60000);
 
   it("keeps project memory on v3 unless asked, and reports a newer manifest as needing an upgrade", async () => {

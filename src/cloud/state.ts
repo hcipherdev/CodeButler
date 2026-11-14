@@ -83,3 +83,6 @@ export function serverUrl(raw: string): string {
   if (url.username || url.password || url.search || url.hash || url.pathname !== "/" || (url.protocol !== "https:" && !(loopback && url.protocol === "http:"))) throw new Error("Use an HTTPS server origin (HTTP allowed only on localhost)");
   return url.origin;
 }
+export const DEFAULT_CLOUD_SERVER = "https://cloud.codebutler.dev";
+/** The hosted service unless CODE_BUTLER_CLOUD_SERVER points this install at a self-hosted or local server. */
+export function defaultCloudServer(): string { return serverUrl(process.env.CODE_BUTLER_CLOUD_SERVER || DEFAULT_CLOUD_SERVER); }

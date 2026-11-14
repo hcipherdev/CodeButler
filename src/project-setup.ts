@@ -2,7 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { hasCredentials } from "./ai/credentials.js";
+import { runsOnlyWhenStarted } from "./ai/connection-policy.js";
 import { jobModel } from "./ai/models.js";
+import { backgroundBudgetPaused, withAiTrigger } from "./ai/usage.js";
 import { loadProjectConfig, validateProjectConfigFile } from "./config.js";
 import type { ProjectConfig } from "./types.js";
 import { projectOperation } from "./cloud/client.js";
@@ -189,8 +191,15 @@ function setupError(error: unknown): string {
   return `${error instanceof Error ? error.message : String(error)}. Reconnect after fixing the issue, or run code-butler init.`;
 }
 
-/** Capture and commit under short locks; remote generation never holds a DB handle or gate. */
-export async function enrichLocalProjectSummary(root: string, options: AutomaticSetupOptions = {}): Promise<void> {
+/**
+ * Capture and commit under short locks; remote generation never holds a DB handle or gate.
+ * It runs on a timer nobody started, so it counts as background work against the daily budget.
+ */
+export function enrichLocalProjectSummary(root: string, options: AutomaticSetupOptions = {}): Promise<void> {
+  return withAiTrigger("background", () => enrichSummary(root, options));
+}
+
+async function enrichSummary(root: string, options: AutomaticSetupOptions): Promise<void> {
   validateProjectSetupPaths(root);
   const prepared = await projectOperation(root, () => {
     options.signal?.throwIfAborted();
@@ -204,7 +213,9 @@ export async function enrichLocalProjectSummary(root: string, options: Automatic
     if (last?.status === "running" && alive(last.pid)) return undefined;
     if (last?.status !== "running" && last?.lastAttemptAt && now.getTime() - Date.parse(last.lastAttemptAt) < RETRY_MS) return undefined;
     const config = setupConfig(root);
-    if (!options.enrichmentGenerator && !hasCredentials(jobModel(config, "summary"))) return undefined;
+    const summaryModel = jobModel(config, "summary");
+    // This timer is background work: Claude Code waits for a refresh a person starts.
+    if (!options.enrichmentGenerator && (!hasCredentials(summaryModel) || runsOnlyWhenStarted(summaryModel) || backgroundBudgetPaused(summaryModel))) return undefined;
     const store = openConfiguredMemoryStore(root);
     try {
       store.init();

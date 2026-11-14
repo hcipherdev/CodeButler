@@ -2,7 +2,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ensureProjectConfig, loadAiBudget, loadGlobalReviewerConfig, loadProjectConfig, saveGlobalAiSettings } from "../../src/config.js";
+import { ensureProjectConfig, loadAiBudget, loadGlobalReviewerConfig, loadProjectConfig, saveGlobalAiSettings, trustProjectSettings } from "../../src/config.js";
 import { jobModel } from "../../src/ai/models.js";
 import { cleanupTempDir, makeTempDir } from "../helpers/temp.js";
 
@@ -17,6 +17,8 @@ function setup(globalConfig: unknown, local?: unknown) {
   writeFileSync(join(home, "config.json"), JSON.stringify(globalConfig));
   ensureProjectConfig(root);
   if (local) writeFileSync(join(root, ".code-butler", "config.local.json"), JSON.stringify(local));
+  // The local file stands for settings this device's owner wrote.
+  trustProjectSettings(root);
   return { home, root };
 }
 

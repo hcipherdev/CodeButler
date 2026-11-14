@@ -4,7 +4,7 @@ import { getProjectSummaryStatus } from "./service.js";
 import { readPublishedSummary } from "../retrieval/index.js";
 import { readPublishedTiers, readCanonicalTierPage } from "../retrieval/tiers.js";
 export const AGENT_GUIDANCE = [
-    "Use current_project to confirm the project and summarize_project_brief for its human narrative and freshness.",
+    "Use current_project to confirm the project and summarize_project_brief for its human narrative and freshness. If it reports no project, call it again with projectRoot set to your working directory.",
     "For continuation, start with summarize_active_context; use search_temporary_memory for targeted working context.",
     "For current decisions and constraints, use find_memories and search_project_memory. Preserve applicability qualifiers.",
     "For recent changes, use summarize_project_state and summarize_recent_activity; for file history use explain_code_change.",

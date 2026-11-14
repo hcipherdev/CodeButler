@@ -15,7 +15,7 @@ import { assertCheckoutReady } from "../cloud/checkout-path.js";
 import { NativeSecurity } from "../cloud/native-security.js";
 import { UUID, atomicJson, stateDirectory, readJson, sha256 } from "../cloud/state.js";
 import { createEncryptedProject, projectTrust } from "../cloud/vault-client.js";
-import { captureSecretFolder, applySecretFiles, mergeSecretFiles, validateSecretPath } from "./files.js";
+import { captureSecretFolder, applySecretFiles, mergeSecretFiles, secretFolderStamp, validateSecretPath } from "./files.js";
 import { openSecretFolder, type VerifiedSecrets } from "./encrypted-files.js";
 import { SecretTransport } from "./transport.js";
 import { restrictSecretFile } from "./permissions.js";
@@ -27,7 +27,7 @@ import { verifiedSecretAccount, ensureAccountSecrets } from "./account-resource.
 
 interface CacheRef { hash: string; pin: RevisionPin; epoch?: number; membership?: string }
 interface SecretJournal { applied?: CacheRef; remote?: CacheRef; conflicts?: string[]; conflictPin?: RevisionPin; conflictLocalFingerprint?: string; resolutions?: Record<string, "local" | "remote"> }
-export interface SecretSyncStatus { enabled: boolean; status: string; revision: number; lastSync?: string; vaultId?: string; resourceId?: string; migration?: string; conflicts?: string[]; error?: string; warnings?: string[]; phase?: string }
+export interface SecretSyncStatus { enabled: boolean; status: string; revision: number; lastSync?: string; vaultId?: string; resourceId?: string; migration?: string; conflicts?: string[]; error?: string; warnings?: string[]; phase?: string; unchanged?: true }
 export const publicSecretStatus = (value?: SecretBinding, conflicts?: string[]): SecretSyncStatus => ({
   enabled: value?.enabled ?? false, status: value?.status ?? "disabled", revision: value?.revision ?? 0,
   ...(value?.lastSync ? { lastSync: value.lastSync } : {}), ...(value?.vaultId ? { vaultId: value.vaultId } : {}),
@@ -190,12 +190,29 @@ export function secretsSyncInterruption(error: unknown): SecretsSyncInterruption
 /** Error states that name a condition and never a path or value, so they are safe to keep in local state. */
 const NAMED_FAILURES = new Set(["authentication", "conflict", "upgrade-required", "integrity-failure"]);
 
+/**
+ * True when neither side moved since the last full sync: the folder stamp matches and the
+ * server's head is still the revision that sync settled on. It takes no project lock and one
+ * request, where a full run verifies the account, catalog and vault first. Any doubt (no
+ * record, a conflict, an error, no network) answers false and the full sync decides; a wrong
+ * "unchanged" from the server could only delay a sync, never apply anything.
+ */
+async function secretsUnchanged(root: string, state: SecretBinding, capturedAccount?: AccountClient): Promise<boolean> {
+  const check = state.idleCheck;
+  if (state.status !== "synced" || !check || secretFolderStamp(root) !== check.localStamp) return false;
+  try {
+    const head = await clientFor(state, capturedAccount).request<{ revision?: unknown; commitment?: unknown }>(`${check.headPath}/head`);
+    return head?.revision === check.revision && head?.commitment === check.commitment;
+  } catch { return false; }
+}
+
 export async function encryptedSecretsSync(root: string, capturedAccount?: AccountClient): Promise<SecretSyncStatus> {
   assertCheckoutReady(root);
   const initial = secretBinding(root);
   if (!initial?.enabled) return publicStatus(initial);
   if (initial.version === 1 && memoryBinding(root)?.encryptionVersion === 2)
     return await resumeAccountSecrets(root,capturedAccount) ?? publicStatus(secretBinding(root));
+  if (await secretsUnchanged(root, initial, capturedAccount)) return { ...publicStatus(initial), unchanged: true };
   try {
     return await withProjectGate(root, async () => {
       assertCheckoutReady(root);
@@ -242,6 +259,8 @@ export async function encryptedSecretsSync(root: string, capturedAccount?: Accou
       await persist();
       applySecretFiles(root, local, merged.files);
       state.phase = "Uploading encrypted changes"; saveSecretBinding(root, state);
+      // Stamped before the capture: an edit landing between the two shows as a change next time, never as synced.
+      const localStamp = secretFolderStamp(root);
       const next = captureSecretFolder(root, resourceId, pin.revision, installationId);
       const prepared = await transport.prepare(next, remote);
       const accepted = prepared ? await transport.publish(prepared, remote) : remote;
@@ -249,6 +268,9 @@ export async function encryptedSecretsSync(root: string, capturedAccount?: Accou
       if (journal.applied) journal.remote = journal.applied;
       else delete journal.remote;
       delete journal.conflicts; delete journal.conflictPin; delete journal.conflictLocalFingerprint; delete journal.resolutions;
+      const settled = journal.applied?.pin ?? EMPTY_PIN;
+      if (localStamp) state.idleCheck = { localStamp, headPath: transport.path, revision: settled.revision, commitment: settled.commitment };
+      else delete state.idleCheck;
       state.status = "synced"; delete state.phase; await persist();
       try { await pruneSecretCache(cache, security); } catch { /* Cleanup retries after the next successful sync. */ }
       return publicStatus(state);

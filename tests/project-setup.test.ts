@@ -1,3 +1,4 @@
+// Tests automatic project setup, explicit opt-out, and MCP setup/enrichment after the device opts in.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -5,7 +6,7 @@ import { createServer } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { ensureProjectConfig } from "../src/config.js";
+import { ensureProjectConfig, saveGeneralSettings, trustProjectSettings } from "../src/config.js";
 import { markProjectRemoved } from "../src/cloud/removal-state.js";
 import { readProjectOperationStatus, withProjectGate } from "../src/cloud/gate.js";
 import { readCurrentProjectInfo } from "../src/mcp/tools.js";
@@ -30,12 +31,14 @@ describe("automatic project setup", () => {
     vi.stubEnv("CODE_BUTLER_HOME", home);
     vi.stubEnv("CODE_BUTLER_RETRIEVAL_ENGINE", "legacy");
     writeFileSync(join(home, "config.json"), "{}");
+    saveGeneralSettings({ autoInitializeProjects: true });
     ensureProjectConfig(root);
     writeFileSync(join(root, ".code-butler/config.json"), JSON.stringify({
       sources: { git: { enabled: false }, codex: { enabled: false }, claude: { enabled: false } },
       sync: { autoSyncOnServerStart: false },
       extractor: { enabled: false, apiKeyEnv: "BUTLER_SETUP_TEST_MISSING_KEY" }, investigator: { enabled: false }
     }));
+    trustProjectSettings(root);
     delete process.env.BUTLER_SETUP_TEST_MISSING_KEY;
   });
   afterEach(() => { vi.unstubAllEnvs(); cleanupTempDir(directory); });
@@ -249,7 +252,8 @@ describe("automatic project setup", () => {
     } finally { await closeProjectMemoryServer(server); }
   });
 
-  it("supports the explicit opt-out", async () => {
+  it("supports the explicit opt-out for an existing memory store", async () => {
+    const store = openConfiguredMemoryStore(root); store.init(); store.close();
     const server = await createProjectMemoryServer({ rootDir: root, autoInit: false });
     try { expect(existsSync(join(root, "AGENTS.md"))).toBe(false); expect(existsSync(join(root, ".code-butler/project-summary.md"))).toBe(false); }
     finally { await closeProjectMemoryServer(server); }
@@ -295,6 +299,7 @@ describe("automatic project setup", () => {
     const config = JSON.parse(readFileSync(configPath, "utf8"));
     config.extractor = { enabled: false, provider: "openai-compatible", model: "test", apiKeyEnv: "BUTLER_SETUP_TEST_MISSING_KEY", baseUrl: `http://127.0.0.1:${address.port}` };
     writeFileSync(configPath, JSON.stringify(config));
+    trustProjectSettings(root);
     const client = new Client({ name: "slow-provider-test", version: "1" });
     const transport = new StdioClientTransport({ command: process.execPath,
       args: ["--import", "tsx", "src/cli.ts", "mcp", "--project-root", root],

@@ -66,7 +66,7 @@ const MERGE_TABLES: ReadonlyArray<readonly [string, readonly string[]]> = [
   ["relations", ["id"]],
   ["temporary_memories", ["id"]],
   ["temporary_memory_links", ["id"]]
-  ,["memory_events", ["id"]], ["memory_topics", ["id"]], ["memory_topic_links", ["id"]]
+  ,["memory_events", ["id"]], ["memory_topics", ["id"]], ["memory_topic_links", ["id"]], ["memory_usage", ["id"]]
 ];
 /**
  * Secondary uniqueness keys. Two devices that independently record the same fact derive
@@ -85,7 +85,7 @@ const NATURAL_KEYS: Readonly<Record<string, readonly string[]>> = {
 const MEMORY_TABLES = new Set(["memories", "memory_candidates"]);
 /** Only shared rows are merged; a local layer belongs to its own device. */
 const LAYERED_TABLES = new Set([
-  "memory_events", "memory_topics", "memory_topic_links",
+  "memory_events", "memory_topics", "memory_topic_links", "memory_usage",
   "memories",
   "memory_candidates",
   "memory_review_resolutions",
@@ -200,7 +200,7 @@ export function mergeCore(
         if(item.table==="memory_relations"){remap("from_memory_id","memories");remap("to_memory_id","memories");}
         if(item.table==="memory_links")remap("owner_id",row.owner_kind==="candidate"?"memory_candidates":"memories");
         if(item.table==="temporary_memory_links")remap("memory_id","temporary_memories");
-        if(["memory_events","memory_topic_links","memory_review_resolutions","memory_review_resolution_compensations"].includes(item.table)){
+        if(["memory_events","memory_topic_links","memory_usage","memory_review_resolutions","memory_review_resolution_compensations"].includes(item.table)){
           remap("memory_id",categoryTable(row.category));remap("related_memory_id",categoryTable(row.related_category));remap("replacement_memory_id",categoryTable(row.replacement_category));
         }
         const duplicate = heldUnderAnotherId(local, item.table, item.key, row);

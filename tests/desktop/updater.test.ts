@@ -97,4 +97,15 @@ describe("checking and downloading updates", () => {
     await expect(downloadUpdate("2.1.0", server(good, installer), "2.1.0", signer.pub)).rejects.toThrow("already installed");
     expect(existsSync(join(home, "updates")) ? readdirSync(join(home, "updates")) : []).toEqual([]);
   });
+
+  it("leaves Microsoft Store builds to the Store, without contacting GitHub", async () => {
+    const signer = testSigner();
+    const installer = Buffer.from("installer bytes");
+    const manifest = { version: "2.1.0", platforms: { [platformKey()]: { url: installerUrl, signature: signer.signFile(installer) } } };
+    const fetchImpl = server(manifest, installer);
+    await expect(checkForUpdate(fetchImpl, "2.0.0", "store")).resolves.toEqual({ current: "2.0.0", available: false, store: true });
+    await expect(downloadUpdate("2.1.0", fetchImpl, "2.0.0", signer.pub, "store")).rejects.toThrow("updated by the Microsoft Store");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(existsSync(join(home, "updates")) ? readdirSync(join(home, "updates")) : []).toEqual([]);
+  });
 });

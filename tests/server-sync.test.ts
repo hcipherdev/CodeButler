@@ -1,12 +1,17 @@
+// Tests createProjectMemoryServer() and closeProjectMemoryServer() in src/server.ts: startup sync, startup under a busy project lock, leaving startup sync to the global watcher, redaction and shutdown.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ensureProjectConfig } from "../src/config.js";
+import { ensureProjectConfig, saveGeneralSettings, trustProjectSettings } from "../src/config.js";
 import { closeProjectMemoryServer, createProjectMemoryServer, type ProjectMemoryServer } from "../src/server.js";
-import { binding, saveBinding } from "../src/cloud/state.js";
+import { binding, atomicJson, saveBinding } from "../src/cloud/state.js";
+import { withProjectGate } from "../src/cloud/gate.js";
+import { globalWatchDirectory, registerWatchedProject } from "../src/global-watch.js";
+import { newRuntimeRecord } from "../src/runtime.js";
 import { automaticSyncStatus } from "../src/cloud/sync-owner.js";
+import { openConfiguredMemoryStore } from "../src/storage/open-configured-store.js";
 import { MemoryStoreCheckpointBusyError } from "../src/storage/store.js";
 import { readProjectSetupStatus } from "../src/project-setup.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
@@ -14,7 +19,9 @@ import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 describe("server startup sync", () => {
   let tempDirs: string[] = [];
   function initializeTestProject(root: string): void {
+    saveGeneralSettings({ autoInitializeProjects: true });
     ensureProjectConfig(root);
+    const store = openConfiguredMemoryStore(root); store.init(); store.close();
     // These fixtures explicitly supply their own source locations below. The
     // generated machine-local defaults must not override those fixture paths.
     writeFileSync(join(root, ".code-butler", "config.local.json"), "{}");
@@ -92,6 +99,7 @@ describe("server startup sync", () => {
         2
       )
     );
+    trustProjectSettings(rootDir);
 
     const projectServer = await createProjectMemoryServer(rootDir);
     const summary = projectServer.store.getProjectSummary();
@@ -131,6 +139,7 @@ describe("server startup sync", () => {
       },
       sync: { autoSyncOnServerStart: true }
     }, null, 2));
+    trustProjectSettings(rootDir);
 
     const projectServer = await createProjectMemoryServer({ rootDir, deferStartupSync: true });
 
@@ -184,6 +193,70 @@ describe("server startup sync", () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  /** A cloud-bound project whose Codex fixture gives the startup sync something to import. */
+  function cloudProjectWithSession(): string {
+    const rootDir = makeTempDir();
+    tempDirs.push(rootDir);
+    vi.stubEnv("CODE_BUTLER_HOME", join(rootDir, "home"));
+    const codexDir = join(rootDir, "codex");
+    mkdirSync(codexDir, { recursive: true });
+    writeFileSync(join(codexDir, "session.jsonl"), [
+      JSON.stringify({ timestamp: "2026-07-16T00:00:00Z", type: "session_meta", payload: { id: "session-1", cwd: rootDir } }),
+      JSON.stringify({ timestamp: "2026-07-16T00:00:01Z", type: "response_item",
+        payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "startup note" }] } })
+    ].join("\n"));
+    initializeTestProject(rootDir);
+    writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({
+      sources: { git: { enabled: false }, codex: { enabled: true, roots: ["./codex"], includeDefaultRoots: false }, claude: { enabled: false, roots: [] } },
+      sync: { autoSyncOnServerStart: true }
+    }, null, 2));
+    trustProjectSettings(rootDir);
+    saveBinding(rootDir, { server: "http://127.0.0.1", projectId: "test", vaultId: "test", enabled: true, revision: 0, fingerprint: "", status: "synced" });
+    return rootDir;
+  }
+  const cloudServer = (rootDir: string) => createProjectMemoryServer({ rootDir, deferStartupSync: true, autoInit: false,
+    cloudSchedulerOptions: { automatic: false, sync: async () => binding(rootDir) } });
+  const sourceCount = async (projectServer: ProjectMemoryServer) =>
+    (await projectServer.handlers!.search_project_memory({ query: "startup note" })).results.length;
+
+  it("starts a cloud project's server while another operation holds the project lock", async () => {
+    const rootDir = cloudProjectWithSession();
+    try {
+      let release!: () => void;
+      let held!: () => void;
+      const holding = new Promise<void>(resolve => { held = resolve; });
+      const holder = withProjectGate(rootDir, () => new Promise<void>(resolve => { held(); release = resolve; }), { name: "Other server's startup sync" });
+      await holding;
+      const started = Date.now();
+      const projectServer = await cloudServer(rootDir);
+      try {
+        // It used to wait for the lock, give up after fifteen seconds and exit before the handshake.
+        expect(Date.now() - started).toBeLessThan(5_000);
+        release(); await holder;
+        expect(await sourceCount(projectServer)).toBe(0);
+        await projectServer.startupSync?.();
+        expect(await sourceCount(projectServer)).toBeGreaterThan(0);
+      } finally { await closeProjectMemoryServer(projectServer); }
+    } finally { vi.unstubAllEnvs(); }
+  }, 30_000);
+
+  it("leaves the startup sync to a running global watcher that already looks after the project", async () => {
+    const rootDir = cloudProjectWithSession();
+    try {
+      mkdirSync(globalWatchDirectory(), { recursive: true });
+      atomicJson(join(globalWatchDirectory(), "runner.json"), newRuntimeRecord("watcher"));
+      registerWatchedProject(rootDir);
+      const projectServer = await cloudServer(rootDir);
+      const lines: string[] = [];
+      const log = vi.spyOn(console, "error").mockImplementation((line: unknown) => { lines.push(String(line)); });
+      try {
+        await projectServer.startupSync?.();
+        expect(lines).toContain("Code Butler startup sync left to the background watcher");
+        expect(await sourceCount(projectServer)).toBe(0);
+      } finally { log.mockRestore(); await closeProjectMemoryServer(projectServer); }
+    } finally { vi.unstubAllEnvs(); }
+  }, 30_000);
+
   it("applies project redaction rules before startup sync writes", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
@@ -211,6 +284,7 @@ describe("server startup sync", () => {
         redactionPatterns: [{ name: "server secret", kind: "literal", pattern: secret }]
       }
     }, null, 2));
+    trustProjectSettings(rootDir);
 
     const projectServer = await createProjectMemoryServer(rootDir);
     const rows = projectServer.store.db.prepare(

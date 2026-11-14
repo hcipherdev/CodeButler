@@ -175,6 +175,8 @@ export function initializeLocalMemorySchema(db: DatabaseSync): void {
       metadata_json text not null default '{}',
       created_at text not null
     );
+    -- Days this device imported evidence: the expiry clock for its own device candidates.
+    create table if not exists local_activity_days (day text primary key);
   `);
   // Additive and idempotent, so the schema version stays put: an older build sharing
   // this device-local database ignores the column instead of refusing a newer version.

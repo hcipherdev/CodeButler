@@ -95,6 +95,32 @@ function readRegularFile(root: string, path: string): Buffer {
 const MiB = 1024 * 1024;
 /** Keep only keys, certificates and credential files in secrets/; tools, data and logs belong elsewhere. */
 const KEEP_SMALL = "Keep only keys, certificates and credential files there; move tools, test data and logs out of secrets/.";
+/**
+ * A cheap fingerprint of `secrets/`, from names, sizes and change times only; no file is read.
+ * A match means nothing changed since it was taken. Anything the full capture would reject
+ * (a link, a special file) gives no stamp, so the full sync runs and reports it.
+ */
+export function secretFolderStamp(root: string): string | undefined {
+  const directory = join(root, "secrets");
+  if (!existsSync(directory)) return sha256("absent");
+  const entries: string[] = [];
+  try {
+    if (!lstatSync(directory).isDirectory()) return undefined;
+    const walk = (current: string): boolean => {
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        const path = join(current, entry.name), stat = lstatSync(path);
+        if (stat.isSymbolicLink()) return false;
+        if (stat.isDirectory()) { if (!walk(path)) return false; continue; }
+        if (!stat.isFile()) return false;
+        entries.push(`${relative(directory, path).split(sep).join("/")}\0${stat.size}\0${stat.mtimeMs}\0${stat.ctimeMs}\0${stat.ino}`);
+      }
+      return true;
+    };
+    if (!walk(directory)) return undefined;
+  } catch { return undefined; }
+  return sha256(entries.sort().join("\n"));
+}
+
 export function captureSecretFolder(root: string, projectId: string, parentRevision: number, installationId: string): SecretBundle {
   const directory = join(root, "secrets");
   const blocks = new Map<string, Buffer>();

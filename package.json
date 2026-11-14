@@ -1,6 +1,6 @@
 {
   "name": "code-butler",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Local-first Project Memory MCP server for reconstructing project reasoning.",
   "license": "Apache-2.0",
   "type": "module",
@@ -51,6 +51,7 @@
     "@simplewebauthn/browser": "^14.0.0",
     "@simplewebauthn/server": "^14.0.3",
     "nodemailer": "^10.0.10",
+    "smol-toml": "^1.9.1",
     "zod": "^3.25.0"
   },
   "devDependencies": {

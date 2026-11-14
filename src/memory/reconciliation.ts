@@ -26,6 +26,7 @@ import type {
   MemoryReconciliationVerdict
 } from "../types.js";
 import { isExactLegacyV1Memory } from "./legacy.js";
+import { recordMemoryAttention } from "./usage.js";
 import { readMemoryPopulation } from "./quality.js";
 import { isPeerLayer } from "./peer-layer.js";
 import {
@@ -358,7 +359,9 @@ export async function planMemoryReconciliation(
       ).run(errorMessage(error), failedAt, failedAt, runId);
       throw error;
     }
-    return readMemoryReconciliationRunFromStore(store, runId);
+    const run = readMemoryReconciliationRunFromStore(store, runId);
+    noteProposedCorrections(store, run);
+    return run;
   } finally {
     store.close();
   }
@@ -412,7 +415,9 @@ async function planDesktopMemoryReconciliation(
         .run(errorMessage(error), failedAt, failedAt, prepared.runId);
       throw error;
     }
-    return readMemoryReconciliationRunFromLocalDb(db, prepared.runId);
+    const run = readMemoryReconciliationRunFromLocalDb(db, prepared.runId);
+    withProposalStore(root, run);
+    return run;
   } finally { db.close(); }
 }
 
@@ -531,7 +536,9 @@ export async function continueDesktopMemoryReconciliation(
         .run(errorMessage(error), failedAt, failedAt, runId);
       throw error;
     }
-    return readMemoryReconciliationRunFromLocalDb(db, runId);
+    const run = readMemoryReconciliationRunFromLocalDb(db, runId);
+    withProposalStore(root, run);
+    return run;
   } finally { db.close(); }
 }
 
@@ -652,7 +659,9 @@ export async function replanMemoryReconciliation(
       ).run(errorMessage(error), failedAt, failedAt, runId);
       throw error;
     }
-    return readMemoryReconciliationRunFromStore(store, runId);
+    const run = readMemoryReconciliationRunFromStore(store, runId);
+    noteProposedCorrections(store, run);
+    return run;
   } finally {
     store.close();
   }
@@ -1446,6 +1455,29 @@ function writeJudgment(
     runId,
     itemId
   );
+}
+
+/**
+ * A correction proposed for a candidate waits on this device for approval, but the
+ * candidate is shared: recording attention resets its expiry clock on every device
+ * (src/memory/usage.ts), so another device does not discard it meanwhile.
+ */
+function noteProposedCorrections(store: MemoryStore, run: MemoryReconciliationRun): void {
+  for (const item of run.items) {
+    if (item.category !== "candidate" || item.state !== "awaiting_correction_approval") continue;
+    try {
+      const memory = store.readMemoryCandidate(item.memoryId);
+      if (memory) recordMemoryAttention(store, { category: "candidate", id: memory.id, layer: memory.layer ?? "core" }, "correction_proposed");
+    } catch { /* Expiry still sees the local proposal on this device. */ }
+  }
+}
+
+function withProposalStore(root: string, run: MemoryReconciliationRun): void {
+  if (!run.items.some((item) => item.category === "candidate" && item.state === "awaiting_correction_approval")) return;
+  try {
+    const store = openConfiguredMemoryStore(root);
+    try { store.init(); noteProposedCorrections(store, run); } finally { store.close(); }
+  } catch { /* Best effort, as above. */ }
 }
 
 function buildObservations(store: MemoryStore, root: string, memory: ReviewableMemory): ReconciliationObservation[] {

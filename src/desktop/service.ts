@@ -6,10 +6,12 @@ import { readPublishedMemories, readPublishedDetail, readPublishedSummary, withP
 import { scheduleRetrieval, requestRetrievalRefresh } from "../retrieval/worker.js";
 import { withReadCache } from "../retrieval/read-cache.js";
 import { basename, dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { withAiTrigger } from "../ai/usage.js";
 import { projectOperation } from "../cloud/client.js";
 import { automaticSyncStatus, requestAutomaticSync } from "../cloud/sync-owner.js";
 import { OperationDeferredError, errorOutcome, type OperationOutcome } from "../cloud/outcome.js";
@@ -28,8 +30,14 @@ import { selectedCloudClient } from "../cloud/project-connections.js";
 import { encryptedSecretsSync, setSecretsSyncEnabled, secretsSyncStatus, linkSecretsVault, prepareSecretsRecovery, confirmSecretsRecovery, resolveSecretsConflict } from "../secrets/sync.js";
 import { requestAllSecretsAccess, approveAllSecretsAccess, completeAllSecretsAccess, revokeSecretsDevice, restoreSecretsProject, listSecretsVaults, listSecretsDevices, secretsAccessStatus } from "../secrets/access.js";
 import { EncryptionError } from "../cloud/crypto-helper.js";
-import { automaticReviewPolicy, globalConfigDir, loadProjectConfig } from "../config.js";
+import { AccountAlreadyRegisteredError } from "../cloud/account-client.js";
+import { CloudRecoveryError } from "../cloud/vault-client.js";
+import { DEFAULT_CANDIDATE_EXPIRY_DAYS, automaticReviewPolicy, globalConfigDir, loadGeneralSettings, saveGeneralSettings, loadProjectConfig, pendingProjectSettings, trustProjectSettings, type PendingProjectSettings } from "../config.js";
 import { assertJobConfigured } from "../memory/reconciliation-provider.js";
+import { runsOnlyWhenStarted } from "../ai/connection-policy.js";
+import { latestCandidateExpiry, listCandidateExpiry, restoreCandidateExpiry, type CandidateExpiryPass } from "../memory/automatic-promotion.js";
+import { noteMemoryUsage } from "../memory/usage.js";
+import { jobModel } from "../ai/models.js";
 import { buildInfo, runtimeDiagnostics } from "../runtime.js";
 import {
   globalWatchStatus,
@@ -42,8 +50,8 @@ import {
   type WatchedProject
 } from "../global-watch.js";
 import { getProjectSummaryStatus, readProjectBrief, refreshProjectSummary } from "../project-summary/service.js";
-import { aiClientStatus, connectAiClient } from "./ai-clients.js";
-import { listConnectionModels, readAiSettings, removeConnectionKey, saveAiSettings, setConnectionKey, testConnection } from "./ai-settings.js";
+import { autoConnectAiClients, checkedAiClientStatus, connectAiClient, connectClaudeDesktop } from "./ai-clients.js";
+import { finishChatGptConnectionSignIn, listConnectionModels, readAiSettings, removeConnectionKey, saveAiSettings, setConnectionKey, startChatGptConnectionSignIn, testConnection } from "./ai-settings.js";
 import { checkForUpdate, downloadUpdate } from "./updater.js";
 import type { AiSettings, ProjectConfig } from "../types.js";
 import { importNewGitCommits, ingestionOutcomes, syncWatchedProjectMemory, type SyncRunResult } from "../sync/service.js";
@@ -51,7 +59,7 @@ import { memoryScopeSchema } from "../memory/scope.js";
 import { isPeerLayer } from "../memory/peer-layer.js";
 import { memoryStatementSchema } from "../memory/statement.js";
 import { presentMemory, sharingLabel } from "../memory/presentation.js";
-import { readPublishedTierPage, readPublishedTiers, readPublishedWorkingDetail, readCanonicalTierPage, readCanonicalFreshness } from "../retrieval/tiers.js";
+import { readPublishedTierPage, readPublishedTiers, readPublishedWorkingDetail, readCanonicalTierPage, readCanonicalFreshness, readCanonicalOverviewTiers } from "../retrieval/tiers.js";
 import { createWorkingCandidate } from "../memory/working.js";
 import { memoryStatementFieldsSchema } from "../memory/statement.js";
 import { updateMemoryLayer } from "../memory/layer-service.js";
@@ -79,6 +87,7 @@ import { getWatchServiceStatus, installWatchService } from "../watch-service.js"
 import {
   DESKTOP_PROTOCOL_VERSION,
   desktopCloudStatus,
+  type DesktopFailure,
   type DesktopProject,
   type DesktopProjectAddResult,
   type DesktopProjectInspection,
@@ -94,7 +103,7 @@ import { recordDesktopTiming, recordUnexpectedDesktopError } from "./diagnostics
 import { inspectDesktopProject } from "./inspection.js";
 import { removeDesktopProject } from "./removal.js";
 import { clearProjectRemoved } from "../cloud/removal-state.js";
-import { accountCapabilities, accountChallenge, accountLogout, accountSummary, accountVerify, accountRegister, accountPasswordLogin, accountSetPassword, accountResetVerify, accountResetComplete, accountPasskeyStart, accountPasskeyExchange, accountPasskeys, accountPasskeyRemove, accountDevices, accountDeviceRevoke, deviceApprove, deviceCancel, deviceComplete, deviceRequest, enrollmentPoll, localAccountStatus, recoveryRestore, vaultConfirm, vaultPrepare } from "./account.js";
+import { accountCapabilities, accountChallenge, accountLogout, accountSummary, accountVerify, accountRegister, accountPasswordLogin, accountSetPassword, accountResetVerify, accountResetComplete, accountPasskeyStart, accountHumanStart, accountPasskeyExchange, accountPasskeys, accountPasskeyRemove, accountDevices, accountDeviceRevoke, cloudVaultConfirm, deviceApprove, deviceCancel, deviceComplete, deviceRequest, enrollmentPoll, localAccountStatus, recoveryRestore, vaultConfirm, vaultPrepare } from "./account.js";
 import type { MemorySearchResult } from "../types.js";
 
 const rootSchema = z.string().trim().min(1).max(32_767);
@@ -106,7 +115,9 @@ const aiSettingsSchema = z.object({
     kind: z.string().max(40), label: z.string().max(80).optional(), baseUrl: z.string().max(500).optional(),
     apiKeyEnv: envNameSchema.optional(), workspaceIdEnv: envNameSchema.optional(), regionEnv: envNameSchema.optional(),
     workspaceId: z.string().max(200).optional(), region: z.string().max(200).optional(),
-    dataCollection: z.enum(["allow", "deny"]).optional(), keyUpdatedAt: z.string().max(64).optional(), keySavedToEnv: z.literal(true).optional()
+    preferSavedKey: z.boolean().optional(), preferSavedAwsSettings: z.boolean().optional(),
+    dataCollection: z.enum(["allow", "deny"]).optional(), keyUpdatedAt: z.string().max(64).optional(), keySavedToEnv: z.literal(true).optional(),
+    cliPath: z.string().min(1).max(1024).optional()
   }).strict()).optional(),
   tiers: z.object({ fast: aiChoiceSchema.optional(), smart: aiChoiceSchema.optional() }).strict().optional(),
   jobs: z.record(z.enum(["extraction", "review", "wording", "summary", "investigator", "rules", "consolidation"]),
@@ -119,6 +130,7 @@ async function aiSettingsAction<T>(work: () => Promise<T> | T): Promise<T> {
   try { return await work(); }
   catch (error) { throw new DesktopServiceError("invalid-request", error instanceof Error ? error.message.replace(/^global /, "") : "The AI settings could not be changed."); }
 }
+const chatgptRedirectSchema = z.string().regex(/^http:\/\/127\.0\.0\.1:\d{1,5}\/auth\/callback$/);
 const accountServerSchema = z.string().trim().min(1).max(2048);
 const accountEmailSchema = z.string().trim().max(254).email();
 const accountCodeSchema = z.string().regex(/^\d{8}$/);
@@ -159,7 +171,9 @@ const requestSchema = z.discriminatedUnion("action", [
   z.object({ version: z.literal(1), action: z.literal("account.devices") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.secrets.review") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.capabilities"), server: accountServerSchema }).strict(),
-  z.object({ version: z.literal(1), action: z.literal("account.challenge"), server: accountServerSchema, email: accountEmailSchema, purpose: z.enum(["register", "login", "reset"]) }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("account.challenge"), server: accountServerSchema, email: accountEmailSchema, purpose: z.enum(["register", "login", "reset"]),
+    humanCode: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional(), humanVerifier: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("account.human.start"), server: accountServerSchema, redirectUri: z.string().max(150) }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.verify"), server: accountServerSchema, email: accountEmailSchema, challengeId: z.string().uuid(), code: accountCodeSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.register"), server: accountServerSchema, email: accountEmailSchema, challengeId: z.string().uuid(), code: accountCodeSchema, password: accountPasswordSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.password.login"), server: accountServerSchema, email: accountEmailSchema, password: accountPasswordSchema }).strict(),
@@ -170,16 +184,18 @@ const requestSchema = z.discriminatedUnion("action", [
   z.object({ version: z.literal(1), action: z.literal("account.passkey.exchange"), server: accountServerSchema, kind: z.enum(["login", "add"]), code: z.string().regex(/^[A-Za-z0-9_-]{43}$/), verifier: z.string().regex(/^[A-Za-z0-9_-]{43}$/), state: z.string().regex(/^[A-Za-z0-9_-]{43}(?:_\d{1,20})?$/) }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.passkeys") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.passkey.remove"), id: z.string().regex(/^[A-Za-z0-9_-]{16,1024}$/) }).strict(),
-  z.object({ version: z.literal(1), action: z.literal("account.vault.prepare"), filePath: rootSchema, label: accountLabelSchema.optional() }).strict(),
-  z.object({ version: z.literal(1), action: z.literal("account.vault.confirm"), filePath: rootSchema, code: recoveryCodeSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("account.vault.prepare"), filePath: rootSchema.optional(), label: accountLabelSchema.optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("account.vault.confirm"), filePath: rootSchema.optional(), code: recoveryCodeSchema.optional(), vaultId: z.string().uuid().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.device.request"), label: accountLabelSchema.optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.device.approve"), fingerprint: fingerprintSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.device.revoke"), deviceId: z.string().uuid(), confirmed: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.device.complete"), requestId: z.string().uuid(), fingerprint: fingerprintSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("account.device.cancel"), requestId: z.string().uuid() }).strict(),
-  z.object({ version: z.literal(1), action: z.literal("account.recovery.restore"), filePath: rootSchema, code: recoveryCodeSchema, label: accountLabelSchema.optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("account.recovery.restore"), filePath: rootSchema.optional(), code: recoveryCodeSchema, label: accountLabelSchema.optional() }).strict(),
   z.object({version:z.literal(2),action:z.literal("memory.freshness"),root:rootSchema}).strict(),
   z.object({ version: z.literal(1), action: z.literal("projects.list") }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("settings.general.read") }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("settings.general.save"), settings: z.object({ autoInitializeProjects: z.boolean() }).strict() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("watcher.status") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("watcher.install") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("watcher.runtime-details") }).strict(),
@@ -187,16 +203,25 @@ const requestSchema = z.discriminatedUnion("action", [
   z.object({ version: z.literal(1), action: z.literal("projects.add"), root: rootSchema, initialize: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("projects.remove"), root: rootSchema, mode: z.enum(["list", "local", "everywhere"]).optional(), confirmed: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("project.overview"), root: rootSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("project.overview.preview"), root: rootSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("project.overview.narrative-status"), root: rootSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("project.trust.approve"), root: rootSchema, hash: z.string().regex(/^[a-f0-9]{64}$/), confirmed: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("project.sources"), root: rootSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("project.sources.check"), root: rootSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("ai.clients.status"), root: rootSchema.optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("ai.clients.connect"), client: z.enum(["claude", "codex"]) }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.clients.connect-claude-desktop"), root: rootSchema.optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.clients.ensure") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("ai.settings.read"), root: rootSchema.optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("ai.settings.save"), root: rootSchema.optional(), settings: aiSettingsSchema }).strict(),
-  z.object({ version: z.literal(1), action: z.literal("ai.connection.setKey"), root: rootSchema.optional(), connectionId: aiIdSchema, key: z.string().min(1).max(4096), saveToEnv: z.boolean().optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.connection.setKey"), root: rootSchema.optional(), connectionId: aiIdSchema, key: z.string().min(1).max(4096), saveToEnv: z.boolean().optional(), preferSaved: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("ai.connection.removeKey"), root: rootSchema.optional(), connectionId: aiIdSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("ai.connection.test"), connectionId: aiIdSchema }).strict(),
   z.object({ version: z.literal(1), action: z.literal("ai.models.list"), connectionId: aiIdSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.chatgpt.start"), connectionId: aiIdSchema, redirectUri: chatgptRedirectSchema }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("ai.chatgpt.exchange"), root: rootSchema.optional(), connectionId: aiIdSchema, redirectUri: chatgptRedirectSchema,
+    code: z.string().min(1).max(4096), verifier: z.string().regex(/^[A-Za-z0-9_-]{43}$/), nonce: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    clientId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/).optional(), scope: z.string().max(2000).optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("update.check") }).strict(),
   z.object({ version: z.literal(1), action: z.literal("update.download"), updateVersion: z.string().regex(/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/) }).strict(),
   z.object({ version: z.literal(1), action: z.literal("cloud.sync.status"), root: rootSchema }).strict(),
@@ -241,6 +266,8 @@ const requestSchema = z.discriminatedUnion("action", [
   z.object({ version: z.literal(1), action: z.literal("memory.ai.results"), root: rootSchema,mode:z.enum(["reconcile","wording"]).optional(), runId: z.string().min(1).max(256) }).strict(),
   z.object({ version: z.literal(1), action: z.literal("memory.ai.apply"), root: rootSchema,mode:z.enum(["reconcile","wording"]).optional(), runId: z.string().min(1).max(256), itemIds: z.array(z.string().min(1).max(512)).min(1).max(100_000), applyCorrections: z.boolean().optional(), forceOffline: z.boolean().optional() }).strict(),
   z.object({ version: z.literal(1), action: z.literal("memory.ai.revert"), root: rootSchema,mode:z.enum(["reconcile","wording"]).optional(), runId: z.string().min(1).max(256), forceOffline: z.boolean().optional() }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("memory.candidates.expired"), root: rootSchema, at: z.string().trim().min(1).max(64) }).strict(),
+  z.object({ version: z.literal(1), action: z.literal("memory.candidates.restore-expiry"), root: rootSchema, at: z.string().trim().min(1).max(64), ids: z.array(z.string().trim().min(1).max(256)).min(1).max(1000).optional() }).strict(),
   z.object({
     version: z.literal(1),
     action: z.literal("memory.review.resolve"),
@@ -281,7 +308,7 @@ const requestSchema = z.discriminatedUnion("action", [
 
 export class DesktopServiceError extends Error {
   constructor(
-    readonly code: "invalid-request" | "confirmation-required" | "not-registered" | "not-found" | "stale-review" | "stale-rule" | "busy" | "internal",
+    readonly code: DesktopFailure["error"]["code"],
     message: string
   ) {
     super(message);
@@ -324,19 +351,28 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
     }
     case "account.logout": return accountLogout();
     case "account.capabilities": return accountCapabilities(request.server);
-    case "account.challenge": return accountChallenge(request.server, request.email, request.purpose);
+    case "account.challenge": return await accountChallenge(request.server, request.email, request.purpose,
+      request.humanCode && request.humanVerifier ? { code: request.humanCode, verifier: request.humanVerifier } : undefined);
+    case "account.human.start": return accountHumanStart(request.server, request.redirectUri);
     case "account.verify": { const status = await accountVerify(request.server, request.email, request.challengeId, request.code); await bootstrapDesktopAccount(options, true, status); return status; }
     case "account.register": { const status = await accountRegister(request.server, request.email, request.challengeId, request.code, request.password); await bootstrapDesktopAccount(options, true, status); return status; }
     case "account.password.login": { const status = await accountPasswordLogin(request.server, request.email, request.password); await bootstrapDesktopAccount(options, true, status); return status; }
     case "account.password.set": return accountSetPassword(request.password, request.currentPassword);
     case "account.password.reset.verify": return accountResetVerify(request.server, request.challengeId, request.code);
     case "account.password.reset.complete": return accountResetComplete(request.server, request.resetToken, request.password);
-    case "account.passkey.start": return accountPasskeyStart(request.server, request.kind, request.redirectUri, request.label);
+    case "account.passkey.start": return await accountPasskeyStart(request.server, request.kind, request.redirectUri, request.label);
     case "account.passkey.exchange": { const status = await accountPasskeyExchange(request.server, request.kind, request.code, request.verifier, request.state); await bootstrapDesktopAccount(options, true, status); return status; }
     case "account.passkeys": return accountPasskeys();
-    case "account.passkey.remove": return accountPasskeyRemove(request.id);
+    case "account.passkey.remove": return await accountPasskeyRemove(request.id);
     case "account.vault.prepare": return vaultPrepare(request.filePath, request.label);
-    case "account.vault.confirm": { const result = await vaultConfirm(request.filePath, request.code); await bootstrapDesktopAccount(options, true); return result; }
+    case "account.vault.confirm": {
+      let result: { initialized: true };
+      if (request.vaultId && !request.filePath && !request.code) result = await cloudVaultConfirm(request.vaultId);
+      else if (!request.vaultId && request.filePath && request.code) result = await vaultConfirm(request.filePath, request.code);
+      else throw new DesktopServiceError("invalid-request", "Choose a recovery backup to finish setup.");
+      await bootstrapDesktopAccount(options, true);
+      return result;
+    }
     case "account.device.request": return deviceRequest(request.label);
     case "account.device.approve": return deviceApprove(request.fingerprint);
     case "account.device.complete": { const result = await deviceComplete(request.requestId, request.fingerprint); await bootstrapDesktopAccount(options, true); return result; }
@@ -352,6 +388,10 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
       catch (error) { throw new DesktopServiceError(error instanceof StaleRuleError ? "stale-rule" : "invalid-request", error instanceof Error ? error.message : "Global rules operation failed"); }
     case "projects.list":
       return listProjects(options);
+    case "settings.general.read":
+      return aiSettingsAction(() => loadGeneralSettings());
+    case "settings.general.save":
+      return aiSettingsAction(() => saveGeneralSettings(request.settings));
     case "watcher.status": {
       const status = globalWatchStatus();
       return options.watcherServiceStatus?.() ?? watcherServiceStatus(status.running, status.pid, status.build);
@@ -379,6 +419,25 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
     }
     case "project.overview":
       return projectOverview(requireRegisteredProject(request.root));
+    case "project.overview.preview": {
+      const project = desktopProject(requireRegisteredProject(request.root));
+      if (!project.available) throw new DesktopServiceError("not-found", "The project folder or its memory settings are unavailable.");
+      const { exists, summary } = readProjectBrief(project.root);
+      return { root: project.root, narrative: { exists, summary } };
+    }
+    case "project.overview.narrative-status": {
+      const project = requireRegisteredProject(request.root);
+      return timedOverviewRead(project.root, "overview-narrative", store => ({
+        status: getProjectSummaryStatus(project.root, { store, config: loadProjectConfig(project.root) })
+      }), true);
+    }
+    case "project.trust.approve": {
+      const project = requireRegisteredProject(request.root);
+      if (!request.confirmed) throw new DesktopServiceError("confirmation-required", "Review this project's settings and confirm before approving them.");
+      try { trustProjectSettings(project.root, request.hash); }
+      catch (error) { throw new DesktopServiceError("stale-review", error instanceof Error ? error.message : "The project's settings changed."); }
+      return pendingProjectSettings(project.root);
+    }
     case "project.sources":
       return canonicalDesktopRead(requireRegisteredProject(request.root).root, store => ({
         byType: store.countSourcesByType(),
@@ -388,13 +447,15 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
     case "project.sources.check":
       return checkProjectSources(requireRegisteredProject(request.root).root);
     case "ai.clients.status":
-      return aiClientStatus(request.root ? { root: requireRegisteredProject(request.root).root } : {});
+      return await checkedAiClientStatus(request.root ? { root: requireRegisteredProject(request.root).root } : {});
+    case "ai.clients.ensure":
+      return autoConnectAiClients({}, true);
     case "ai.settings.read":
       return readAiSettings(request.root ? requireRegisteredProject(request.root).root : undefined);
     case "ai.settings.save":
       return aiSettingsAction(() => saveAiSettings(request.settings as AiSettings, request.root ? requireRegisteredProject(request.root).root : undefined));
     case "ai.connection.setKey":
-      return aiSettingsAction(() => setConnectionKey(request.connectionId, request.key, request.saveToEnv === true, request.root ? requireRegisteredProject(request.root).root : undefined));
+      return aiSettingsAction(() => setConnectionKey(request.connectionId, request.key, request.saveToEnv === true, request.root ? requireRegisteredProject(request.root).root : undefined, request.preferSaved === true));
     case "ai.connection.removeKey":
       return aiSettingsAction(() => removeConnectionKey(request.connectionId, request.root ? requireRegisteredProject(request.root).root : undefined));
     case "ai.connection.test":
@@ -405,8 +466,18 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
       return aiSettingsAction(() => downloadUpdate(request.updateVersion));
     case "ai.models.list":
       return aiSettingsAction(() => listConnectionModels(request.connectionId));
+    case "ai.chatgpt.start":
+      return aiSettingsAction(() => startChatGptConnectionSignIn(request.connectionId, request.redirectUri));
+    case "ai.chatgpt.exchange":
+      return aiSettingsAction(() => finishChatGptConnectionSignIn(request.connectionId, {
+        code: request.code, verifier: request.verifier, nonce: request.nonce, redirectUri: request.redirectUri,
+        ...(request.clientId ? { clientId: request.clientId } : {}), ...(request.scope !== undefined ? { scope: request.scope } : {})
+      }, request.root ? requireRegisteredProject(request.root).root : undefined));
     case "ai.clients.connect":
       try { return connectAiClient(request.client); }
+      catch (error) { throw new DesktopServiceError("invalid-request", error instanceof Error ? error.message : "The connection could not be set up."); }
+    case "ai.clients.connect-claude-desktop":
+      try { return connectClaudeDesktop(request.root ? { root: requireRegisteredProject(request.root).root } : {}); }
       catch (error) { throw new DesktopServiceError("invalid-request", error instanceof Error ? error.message : "The connection could not be set up."); }
     case "cloud.sync.status": {
       const project = requireRegisteredProject(request.root);
@@ -453,11 +524,16 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
     }
     case "memory.freshness": {
       const project=requireRegisteredProject(request.root);
-      if(!retrievalEnabled())return canonicalDesktopRead(project.root,store=>({freshness:readCanonicalFreshness(store)}));
+      if (!retrievalEnabled()) return canonicalDesktopRead(project.root, store => ({ freshness: readCanonicalFreshness(store) }), true);
       scheduleRetrieval(project.root);return {freshness:readPublishedTiers(project.root).freshness};
     }
-    case "memory.detail":
-      return memoryDetail(requireRegisteredProject(request.root), request.id);
+    case "memory.detail": {
+      const project = requireRegisteredProject(request.root);
+      const detail = await memoryDetail(project, request.id);
+      // A person opening a candidate is using it; that keeps it from expiring (src/memory/usage.ts).
+      if (detail.kind === "candidate") noteMemoryUsage(project.root, [{ category: "candidate", id: detail.id, layer: detail.layer ?? "core" }]);
+      return detail;
+    }
     case "memory.history": return desktopKnowledgeRead(requireRegisteredProject(request.root).root,data=>memoryHistory(data,request.id,request.category,request));
     case "memory.handbook": return desktopKnowledgeRead(requireRegisteredProject(request.root).root,data=>readHandbook(data,{reach:request.reach??"project",owner:request.owner}));
     case "memory.topics.suggest": return desktopKnowledgeRead(requireRegisteredProject(request.root).root,data=>suggestHandbookTopics(data,{reach:request.reach??"project",owner:request.owner}));
@@ -496,6 +572,20 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
     }
     case "memory.review.resolve":
       return resolveDesktopMemoryReview(requireRegisteredProject(request.root), request);
+    case "memory.candidates.expired": {
+      // Checking a pass only reads, so it opens the database read-only instead of waiting
+      // behind a sync or AI review that holds the project lock.
+      const db = new DatabaseSync(join(requireRegisteredProject(request.root).root, ".code-butler", "memory.sqlite"), { readOnly: true });
+      try { db.exec("pragma busy_timeout = 5000"); return listCandidateExpiry({ db }, request.at); } finally { db.close(); }
+    }
+    case "memory.candidates.restore-expiry": {
+      const root = requireRegisteredProject(request.root).root;
+      return projectOperation(root, () => {
+        const store = openConfiguredMemoryStore(root);
+        store.init();
+        try { return restoreCandidateExpiry(store, { at: request.at, ids: request.ids }, "desktop"); } finally { store.close(); }
+      }).finally(() => { if (retrievalEnabled()) scheduleRetrieval(root); });
+    }
     case "memory.ai.preview": {
       const root = requireRegisteredProject(request.root).root;
       if (request.intentId) renewForegroundIntent(root, request.intentId);
@@ -644,6 +734,23 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
       return revokeSecretsDevice(request.deviceId);
     }
   } } catch (error) {
+    if (error instanceof CloudRecoveryError) throw new DesktopServiceError("invalid-request", error.message);
+    if ((request.action === "account.register" || (request.action === "account.challenge" && request.purpose === "register"))
+      && error instanceof AccountAlreadyRegisteredError) {
+      throw new DesktopServiceError("account-already-registered", error.message);
+    }
+    const addingPasskey = request.action === "account.passkey.start" && request.kind === "add";
+    if ((addingPasskey || request.action === "account.passkey.remove") && error instanceof EncryptionError) {
+      if (addingPasskey && error.httpStatus === 429) {
+        throw new DesktopServiceError("busy", "Too many passkey requests. Wait a few minutes, then try Add passkey again.");
+      }
+      if (error.httpStatus === 401 || (error.httpStatus === undefined && error.state === "authentication-required")) {
+        const message = addingPasskey
+          ? "Adding a passkey requires a recent login. Log out of Code Butler, log back in with your password, then try Add passkey again."
+          : "Removing a passkey requires a recent login. Log out of Code Butler, log back in with your password, then try removing the passkey again.";
+        throw new DesktopServiceError("invalid-request", message);
+      }
+    }
     if (!request.action.startsWith("secrets.") || error instanceof DesktopServiceError) throw error;
     if (error instanceof OperationDeferredError) throw new DesktopServiceError("busy", "Another project operation is active. Retry shortly.");
     if (error instanceof EncryptionError) throw new DesktopServiceError("invalid-request", `Sensitive file operation failed: ${error.state}.`);
@@ -655,11 +762,23 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
   }
 }
 
-export async function runDesktopMemoryReview(
+type DesktopReviewDependencies = MemoryReconciliationDependencies & { onWaiting?: (status: { operation?: ProjectOperationStatus; elapsedMs: number }) => void };
+
+/** A person pressed Start, so a connection limited to work they start may serve this review. */
+export function runDesktopMemoryReview(
   input: unknown,
   onProgress: (progress: ReconciliationProgress) => void,
   shouldStop: () => boolean,
-  dependencies: MemoryReconciliationDependencies & { onWaiting?: (status: { operation?: ProjectOperationStatus; elapsedMs: number }) => void } = {}
+  dependencies: DesktopReviewDependencies = {}
+) {
+  return withAiTrigger("user", () => runStartedMemoryReview(input, onProgress, shouldStop, dependencies));
+}
+
+async function runStartedMemoryReview(
+  input: unknown,
+  onProgress: (progress: ReconciliationProgress) => void,
+  shouldStop: () => boolean,
+  dependencies: DesktopReviewDependencies
 ) {
   let request: z.infer<typeof aiRunSchema>;
   try { request = aiRunSchema.parse(input); }
@@ -766,7 +885,7 @@ async function addProject(root: string, initialize: boolean, options: DesktopSer
       }
       const installed = inspection.status === "ready" ? undefined : await (options.initializeProject ?? initializeProjectMemory)(canonical, options.initializationOptions);
       const project = desktopProject(registerWatchedProject(canonical));
-      const warnings = [...(installed?.warnings ?? [])];
+      const warnings = [...(installed?.warnings ?? []), ...overviewTrustWarning(canonical)];
       return {
         project,
         initialized: installed !== undefined,
@@ -806,6 +925,9 @@ async function bootstrapDesktopAccount(options: DesktopServiceOptions, force = f
 }
 
 function ensureDesktopGlobalWatcher(): void {
+  // Packaged apps use the runtime installer so a desktop request cannot
+  // register a competing watcher while the shared runtime is switching.
+  if (process.env.CODE_BUTLER_MANAGED_DESKTOP_RUNTIME === "1") return;
   const cwd = globalConfigDir();
   const watchOptions = {
     cwd,
@@ -904,60 +1026,105 @@ async function checkProjectSources(root: string): Promise<DesktopSourceCheck> {
 }
 
 /**
- * The daily AI review re-checks some flagged memories and automatic promotion makes corroborated
- * candidates durable; each runs only when enabled, and the review only with a review model set up.
+ * The daily AI review re-checks flagged memories and unconfirmed candidates, and automatic promotion
+ * makes corroborated candidates durable and expires the rest; each runs only when enabled, and the
+ * review only with a review model that may run unattended (Claude Code reviews only when started).
  */
-function overviewAutomation(root: string, config?: ProjectConfig): Pick<DesktopProjectOverview, "automation"> {
+function overviewAutomation(root: string, config?: ProjectConfig, lastExpiry?: CandidateExpiryPass): Pick<DesktopProjectOverview, "automation"> {
   try {
     const project = config ?? loadProjectConfig(root);
     let reviewModel = true;
     try { assertJobConfigured(project, "review"); } catch { reviewModel = false; }
+    const enabled = reviewModel && automaticReviewPolicy(project).enabled;
+    const onDemand = enabled && runsOnlyWhenStarted(jobModel(project, "review"));
     const promotion = project.promotion.automatic;
-    return { automation: { aiReview: reviewModel && automaticReviewPolicy(project).enabled, promotion: promotion.enabled && promotion.coreCandidates } };
+    return {
+      automation: {
+        aiReview: enabled && !onDemand,
+        ...(onDemand ? { aiReviewOnDemand: true } : {}),
+        promotion: promotion.enabled && promotion.coreCandidates,
+        candidateExpiryDays: promotion.candidateExpiryDays ?? DEFAULT_CANDIDATE_EXPIRY_DAYS,
+        ...restorableExpiry(lastExpiry)
+      }
+    };
   } catch { return {}; }
+}
+
+/** How long the overview offers to restore an expiry pass. */
+const EXPIRY_RESTORE_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * The last expiry pass from the synced review rows, on any device, while recent and not
+ * fully restored. The published index carries it, so the overview needs no store open.
+ */
+function restorableExpiry(pass: CandidateExpiryPass | undefined): { lastExpiry?: CandidateExpiryPass } {
+  if (!pass || pass.restorable === 0 || Date.now() - Date.parse(pass.at) > EXPIRY_RESTORE_WINDOW_MS) return {};
+  return { lastExpiry: pass };
 }
 
 async function projectOverview(project: WatchedProject & { lastRun?: DesktopProject["lastRun"]; lastCloudRun?: DesktopProject["lastCloudRun"] }): Promise<DesktopProjectOverview> {
   if(retrievalEnabled()) {
     scheduleRetrieval(project.root);
     return withPublishedIndex(project.root,()=>{
-      const {summary:memory,status}=readPublishedSummary(project.root); const brief=readProjectBrief(project.root);
+      const {summary:memory,status,lastExpiry}=readPublishedSummary(project.root); const brief=readProjectBrief(project.root);
       const {counts:tiers,freshness}=readPublishedTiers(project.root);
       const working=readPublishedTierPage(project.root,{tier:"working",limit:3}).items as import("../retrieval/tiers.js").WorkingMemory[];
-      return {project:desktopProject(project),narrative:{exists:brief.exists,summary:brief.summary,status:status ?? getProjectSummaryStatus(project.root)},memory,tiers,working,freshness,cloud:cloudStatusForProject(project),...overviewAutomation(project.root)};
+      return {project:desktopProject(project),narrative:{exists:brief.exists,summary:brief.summary,status:status ?? getProjectSummaryStatus(project.root)},memory,tiers,working,freshness,cloud:cloudStatusForProject(project),...overviewAutomation(project.root,undefined,lastExpiry),...overviewTrust(project.root)};
     });
   }
-  const requestStarted = performance.now();
-  return projectOperation(project.root, () => {
-    const workStarted = performance.now();
-    const store = openConfiguredMemoryStore(project.root);
-    store.init();
-    try { return withReadCache(() => {
-      const config = loadProjectConfig(project.root);
-      const brief = readProjectBrief(project.root);
-      const memory = store.getProjectSummary();
-      const workingPage=readCanonicalTierPage(store,{tier:"working",limit:3});
-      let status;
-      try {
-        status = getProjectSummaryStatus(project.root, { store, config, projectState: memory });
-      } catch {
-        // A missing Git executable or temporarily unavailable source must not block local browsing.
-        status = getProjectSummaryStatus(project.root);
-      }
-      const result = {
-        project: desktopProject(project),
-        narrative: { exists: brief.exists, summary: brief.summary, status },
-        memory,
-        tiers:workingPage.counts,working:workingPage.items as import("../retrieval/tiers.js").WorkingMemory[],freshness:workingPage.freshness,
-        cloud: cloudStatusForProject(project),
-        ...overviewAutomation(project.root, config)
-      };
-      return result;
-    }); } finally {
-      try { store.close(); }
-      finally { recordDesktopTiming("overview", workStarted - requestStarted, performance.now() - workStarted); }
-    }
+  return timedOverviewRead(project.root, "overview", store => {
+    const config = loadProjectConfig(project.root);
+    const brief = readProjectBrief(project.root);
+    const memory = store.getProjectSummary();
+    const { counts: tiers, items: working, freshness } = readCanonicalOverviewTiers(store);
+    return {
+      project: desktopProject(project),
+      narrative: { exists: brief.exists, summary: brief.summary },
+      memory, tiers, working, freshness,
+      cloud: cloudStatusForProject(project),
+      ...overviewAutomation(project.root, config, latestCandidateExpiry(store)),
+      ...overviewTrust(project.root)
+    };
   });
+}
+
+async function timedOverviewRead<T extends DesktopResult>(
+  root: string, phase: "overview" | "overview-narrative",
+  work: (store: ReturnType<typeof openConfiguredMemoryStore>) => T, skipIfBusy = false
+): Promise<T> {
+  const requested = performance.now();
+  let entered: number | undefined;
+  let outcome: "ok" | "busy" | "error" = "ok";
+  try {
+    return await projectOperation(root, () => {
+      entered = performance.now();
+      const store = openConfiguredMemoryStore(root);
+      try {
+        store.init();
+        return withReadCache(() => work(store));
+      } finally {
+        store.close();
+      }
+    }, { skipIfBusy });
+  } catch (error) {
+    outcome = error instanceof OperationDeferredError ? "busy" : "error";
+    throw error;
+  } finally {
+    const ended = performance.now();
+    recordDesktopTiming(phase, (entered ?? ended) - requested, entered === undefined ? 0 : ended - entered, outcome);
+  }
+}
+
+function overviewTrustWarning(root: string): string[] {
+  return overviewTrust(root).trust ? ["This repository's .code-butler/ folder has settings that apply only once you approve them. Review them on the project overview."] : [];
+}
+
+/** Settings awaiting approval, so the overview can offer to review them; a read failure never blocks the overview. */
+function overviewTrust(root: string): { trust?: PendingProjectSettings } {
+  try {
+    const pending = pendingProjectSettings(root);
+    return pending.status === "untrusted" ? { trust: pending } : {};
+  } catch { return {}; }
 }
 
 async function refreshProjectNarrative(
@@ -966,7 +1133,8 @@ async function refreshProjectNarrative(
   options: ProjectSummaryOperationOptions = {}
 ) {
   try {
-    return await projectOperation(project.root, async () => {
+    // A person asked for this refresh, so a connection limited to work they start may serve it.
+    return await withAiTrigger("user", () => projectOperation(project.root, async () => {
       const store = openConfiguredMemoryStore(project.root);
       store.init();
       try {
@@ -986,7 +1154,7 @@ async function refreshProjectNarrative(
       } finally {
         store.close();
       }
-    });
+    }));
   } catch (error) {
     if (error instanceof DesktopServiceError) throw error;
     throw new DesktopServiceError("invalid-request", error instanceof Error ? error.message : "Project summary refresh failed.");
@@ -1118,12 +1286,15 @@ export function desktopSuccess(result: DesktopResult) {
 }
 
 /** Reads share one read-cache scope, so per-file and per-source lookups run once per request. */
-function canonicalDesktopRead<T extends DesktopResult>(root:string,read:(store:ReturnType<typeof openConfiguredMemoryStore>)=>T):Promise<T>{
-  return canonicalDesktopStore(root,store=>withReadCache(()=>read(store)));
+function canonicalDesktopRead<T extends DesktopResult>(root:string,read:(store:ReturnType<typeof openConfiguredMemoryStore>)=>T, skipIfBusy = false):Promise<T>{
+  return canonicalDesktopStore(root,store=>withReadCache(()=>read(store)), skipIfBusy);
 }
 
-function canonicalDesktopStore<T extends DesktopResult>(root:string,work:(store:ReturnType<typeof openConfiguredMemoryStore>)=>T):Promise<T>{
-  return projectOperation(root,()=>{const store=openConfiguredMemoryStore(root);store.init();try{return work(store);}finally{store.close();}});
+function canonicalDesktopStore<T extends DesktopResult>(root:string,work:(store:ReturnType<typeof openConfiguredMemoryStore>)=>T, skipIfBusy = false):Promise<T>{
+  return projectOperation(root, () => {
+    const store = openConfiguredMemoryStore(root);
+    try { store.init(); return work(store); } finally { store.close(); }
+  }, { skipIfBusy });
 }
 
 async function desktopKnowledgeMutation<T extends DesktopResult>(root:string,write:(store:ReturnType<typeof openConfiguredMemoryStore>)=>T):Promise<T>{

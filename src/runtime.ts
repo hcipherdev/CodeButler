@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { globalConfigDir } from "./config.js";
 import { atomicJson, readJson } from "./cloud/state.js";
 
-export interface BuildInfo { version: string; buildId: string; builtAt: string }
+/** `distribution: "store"` marks a Microsoft Store MSIX build, which the Store updates instead of the in-app updater. */
+export interface BuildInfo { version: string; buildId: string; builtAt: string; distribution?: "store" }
 declare const __BUTLER_BUILD__: BuildInfo | undefined;
 export const buildInfo: BuildInfo = typeof __BUTLER_BUILD__ !== "undefined" ? __BUTLER_BUILD__! : (() => {
   try { return JSON.parse(readFileSync(new URL("./build-info.json", import.meta.url), "utf8")) as BuildInfo; }
@@ -57,6 +58,21 @@ export function registerRuntime(record: RuntimeRecord): () => void {
   const path = join(runtimeDirectory(), `${record.token}.json`);
   mkdirSync(runtimeDirectory(), { recursive: true }); atomicJson(path, record);
   return () => { try { unlinkSync(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } };
+}
+/** Read runtime registrations without reaping them or starting a process. */
+export function readRuntimeRecords(config = globalConfigDir()): RuntimeRecord[] {
+  const directory = join(config, "runtimes");
+  try {
+    return readdirSync(directory).filter(name => /^[a-f0-9-]{36}\.json$/i.test(name)).flatMap(name => {
+      try {
+        const record = readJson<RuntimeRecord>(join(directory, name));
+        return record && Number.isSafeInteger(record.pid) && record.pid > 0 && `${record.token}.json` === name ? [record] : [];
+      } catch { return []; }
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
 }
 export function runtimeDiagnostics(): RuntimeRecord[] {
   if (!existsSync(runtimeDirectory())) return [];

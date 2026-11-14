@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createMemoryOrigin } from "../src/memory/origin.js";
 import { CORE_LAYER } from "../src/memory/layer.js";
-import { ensureProjectConfig, loadProjectConfig } from "../src/config.js";
+import { ensureProjectConfig, loadProjectConfig, trustProjectSettings } from "../src/config.js";
 import {
   createEmbeddingEndpointHash,
   createProviderFingerprint,
@@ -135,6 +135,8 @@ describe("automatic sync", () => {
         2
       )
     );
+    // The fixture stands for settings this device's owner wrote.
+    trustProjectSettings(rootDir);
 
     return { rootDir, repoDir, codexDir, claudeDir };
   }
@@ -236,6 +238,7 @@ describe("automatic sync", () => {
     const codeButlerHome = makeTempDir();
     tempDirs.push(codeButlerHome);
     vi.stubEnv("CODE_BUTLER_HOME", codeButlerHome);
+    trustProjectSettings(rootDir);
     git(repoDir, ["checkout", "-b", "feature/sync-memory"]);
     const store = openMemoryStore(rootDir);
     store.init();
@@ -461,6 +464,7 @@ describe("automatic sync", () => {
     const sources = rawConfig.sources as Record<string, Record<string, unknown>>;
     sources.claude = { ...sources.claude, projectOnly: false };
     writeFileSync(configPath, JSON.stringify(rawConfig, null, 2));
+    trustProjectSettings(rootDir);
 
     const store = openMemoryStore(rootDir);
     store.init();

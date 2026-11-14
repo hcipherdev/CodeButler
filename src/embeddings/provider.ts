@@ -1,6 +1,7 @@
 import { isIP } from "node:net";
 
 import { redactSensitiveText } from "../privacy/redaction.js";
+import { projectEnvView } from "../project-env.js";
 import type {
   EmbeddingBatchResult,
   EmbeddingConfig,
@@ -34,7 +35,7 @@ export function createOpenAICompatibleEmbeddingProvider(
   const endpointHash = createEmbeddingEndpointHash(endpoint);
   const providerKey = createProviderKey(endpointHash, config.model);
   const fetchImplementation = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
-  const env = options.env ?? process.env;
+  const env = options.env ?? projectEnvView(config.envRoot);
 
   return {
     endpointHash,

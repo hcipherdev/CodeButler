@@ -60,6 +60,7 @@ import {
   listOperations
 } from "../operations/log.js";
 import { initializeSchema } from "./migrations.js";
+import { ensureSharedChangeTriggers } from "./shared-changes.js";
 import {
   openLocalMemoryDatabase,
   invalidateLocalMemoryQuality,
@@ -859,6 +860,7 @@ export function openMemoryStore(rootDir: string, options: OpenMemoryStoreOptions
       const before = readMainSchemaVersion(db);
       if (before < 20) seedLegacyMemoryQuality(db, localDb);
       initializeSchema(db, databasePath, backupRetention === undefined ? {} : { backupRetention });
+      ensureSharedChangeTriggers(db);
       if (before < 20) {
         invalidateLocalMemoryQuality(localDb);
         pruneLocalMemoryQuality(db, localDb);

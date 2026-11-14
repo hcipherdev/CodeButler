@@ -1,4 +1,5 @@
 import { chatCompletion } from "../ai/chat.js";
+import { parseFencedJson } from "../json.js";
 import { SCOPE_GUIDANCE } from "../memory/scope.js";
 import {
   investigationPlanDecisionSchema,
@@ -49,7 +50,7 @@ export function createOpenAICompatibleInvestigator(
           state: summarizePlannerState(state)
         }
       );
-      const parsed = investigationPlanDecisionSchema.parse(JSON.parse(content));
+      const parsed = investigationPlanDecisionSchema.parse(parseFencedJson(content));
       return parsed;
     },
     async synthesizeAnswer(state) {
@@ -62,7 +63,7 @@ export function createOpenAICompatibleInvestigator(
           state: summarizePlannerState(state)
         }
       );
-      const parsed = investigationSynthesisSchema.parse(JSON.parse(content));
+      const parsed = investigationSynthesisSchema.parse(parseFencedJson(content));
       return parsed;
     }
   };

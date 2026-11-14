@@ -2,20 +2,24 @@ import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
 
-export type EncryptionState = "storage-full" | "request-too-large" | "upgrade-required" | "lease-expired" | "authentication-required" | "locked" | "enrollment-required" | "revoked" | "recovery-required" | "conflict" | "incompatible-format" | "verification-failed";
+export type EncryptionState = "storage-full" | "request-too-large" | "upgrade-required" | "lease-expired" | "authentication-required" | "locked" | "enrollment-required" | "revoked" | "recovery-required" | "conflict" | "incompatible-format" | "verification-failed" | "email-not-allowed" | "human-check-required";
 export class EncryptionError extends Error {
-  constructor(readonly state: EncryptionState, readonly details?: unknown) {
+  constructor(readonly state: EncryptionState, readonly details?: unknown, readonly httpStatus?: number) {
     const guidance:Record<EncryptionState,string>={
       "storage-full":"Cloud storage full. Inspect cloud storage usage or wait for cleanup.","request-too-large":"The transfer exceeds the server request limit.","upgrade-required":"Upgrade Butler to use this project.","lease-expired":"Transfer lease expired; retry sync.",
       "authentication-required":"Run code-butler cloud login.","enrollment-required":"Run code-butler cloud init or cloud device request.",
       locked:"Unlock secure storage and check that the native helper is installed.",revoked:"Enroll again from an approved device, or use cloud recovery restore.",
       "recovery-required":"Verify your recovery kit before continuing.",conflict:"Retry, or inspect cloud status and resolve the conflicting changes.",
-      "incompatible-format":"Upgrade Butler and enable a fresh encrypted project.","verification-failed":"Sync stopped before application; local memories remain available."
+      "incompatible-format":"Upgrade Butler and enable a fresh encrypted project.","verification-failed":"Sync stopped before application; local memories remain available.",
+      "email-not-allowed":"This server does not accept sign-ups from disposable email addresses. Use a permanent address.",
+      "human-check-required":"The browser check did not finish or expired. Try again."
     };
-    const usage=details as {usageBytes?:number;limitBytes?:number}|undefined;
+    const usage=details as {usageBytes?:number;limitBytes?:number;unsupportedPlatform?:string}|undefined;
     const capacity=state==="storage-full" && Number.isFinite(usage?.usageBytes) && Number.isFinite(usage?.limitBytes)
       ? ` Vault usage ${(usage!.usageBytes!/1048576).toFixed(1)} / ${(usage!.limitBytes!/1048576).toFixed(1)} MiB.` : "";
-    super(`Encrypted sync: ${state}. ${guidance[state]}${capacity}`);
+    const platform=state==="locked" && usage?.unsupportedPlatform
+      ? ` This release has no native helper for ${usage.unsupportedPlatform}: cloud sync and keychain key storage are unavailable there, and Butler reads model keys from .env files.` : "";
+    super(`Encrypted sync: ${state}. ${platform ? platform.trim() : guidance[state]}${capacity}`);
   }
 }
 const MAX_IPC = 32 * 1024 * 1024;

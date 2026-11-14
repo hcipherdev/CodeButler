@@ -1,11 +1,13 @@
-// Tests the ai.settings.*, ai.connection.* and ai.models.list desktop actions in src/desktop/service.ts and src/desktop/ai-settings.ts.
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+// Tests the ai.settings.*, ai.connection.*, ai.chatgpt.* and ai.models.list desktop actions in src/desktop/service.ts and src/desktop/ai-settings.ts.
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setKeychainStoreForTests } from "../../src/ai/credentials.js";
 import { handleDesktopRequest } from "../../src/desktop/service.js";
-import { listConnectionModels, testConnection } from "../../src/desktop/ai-settings.js";
+import { listConnectionModels, testConnection, type AiSettingsView } from "../../src/desktop/ai-settings.js";
 import { cleanupTempDir, makeTempDir } from "../helpers/temp.js";
+import { loadGlobalJobSettings } from "../../src/config.js";
+import { resolveApiKey, resolveAwsSettings } from "../../src/ai/credentials.js";
 
 let directory: string;
 let home: string;
@@ -36,6 +38,109 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); setKeychainStoreForTests(undefined); cleanupTempDir(directory); });
 
 describe("desktop AI settings", () => {
+  it("shows effective AWS values and makes explicit edits override the environment for this provider", async () => {
+    const tiers = { fast: { connection: "existing", model: "example" } };
+    await call("ai.settings.save", { settings: { connections: { existing: { kind: "anthropic-aws", workspaceId: "old-saved-workspace", region: "old-saved-region" } }, tiers } });
+    const before = await call<AiSettingsView>("ai.settings.read");
+    expect(before.connections[0]!.awsSettings).toEqual({ workspaceId: "wrkspc_test", region: "us-east-1", workspaceIdSource: "environment", regionSource: "environment" });
+    const after = await call<AiSettingsView>("ai.settings.save", { settings: { connections: { existing: { kind: "anthropic-aws", workspaceId: "edited-workspace", region: "eu-west-1", preferSavedAwsSettings: true } }, tiers } });
+    expect(after.connections[0]!.awsSettings).toEqual({ workspaceId: "edited-workspace", region: "eu-west-1", workspaceIdSource: "saved", regionSource: "saved" });
+    expect(resolveAwsSettings(loadGlobalJobSettings().models!.extraction)).toEqual({ workspaceId: "edited-workspace", region: "eu-west-1" });
+    expect(process.env.AWS_REGION).toBe("us-east-1"); expect(process.env.ANTHROPIC_AWS_WORKSPACE_ID).toBe("wrkspc_test");
+  });
+
+  it("uses an explicitly replaced key even when an older key is inherited from the environment", async () => {
+    const tiers = { fast: { connection: "existing", model: "example" } };
+    await call("ai.settings.save", { settings: { connections: { existing: { kind: "anthropic-aws" } }, tiers } });
+    const after = await call<AiSettingsView>("ai.connection.setKey", { connectionId: "existing", key: "new-app-key", preferSaved: true });
+    expect(after.connections[0]).toMatchObject({ keySource: "keychain", preferSavedKey: true });
+    expect(await resolveApiKey(loadGlobalJobSettings().models!.extraction)).toBe("new-app-key");
+    expect(process.env.ANTHROPIC_AWS_API_KEY).toBe("aws-secret-value"); expect(JSON.stringify(after)).not.toContain("new-app-key");
+    await call("ai.settings.save", { settings: { connections: { existing: { kind: "anthropic-aws", label: "Renamed" } }, tiers } });
+    expect(await resolveApiKey(loadGlobalJobSettings().models!.extraction)).toBe("new-app-key");
+  });
+
+  it("uses the app's .env copy after replacement when the keychain is unavailable and the shell still has an old key", async () => {
+    vi.stubEnv("TEST_PROVIDER_KEY", "old-shell-key");
+    setKeychainStoreForTests({ get: async () => undefined, set: async () => { throw new Error("unavailable"); }, delete: async () => {} });
+    const tiers = { fast: { connection: "existing", model: "example" } };
+    await call("ai.settings.save", { settings: { connections: { existing: { kind: "openai", apiKeyEnv: "TEST_PROVIDER_KEY" } }, tiers } });
+    const after = await call<AiSettingsView>("ai.connection.setKey", { connectionId: "existing", key: "new-file-key", saveToEnv: true, preferSaved: true });
+    vi.stubEnv("TEST_PROVIDER_KEY", "old-shell-key");
+    expect(await resolveApiKey(loadGlobalJobSettings().models!.extraction)).toBe("new-file-key");
+    expect(after.connections[0]).toMatchObject({ keyInEnv: true, keyInKeychain: false, preferSavedKey: true });
+    expect(JSON.stringify(after)).not.toContain("new-file-key");
+  });
+  it("repairs missing workspace and region on an existing provider without replacing its key or job choices", async () => {
+    for (const name of ["ANTHROPIC_AWS_API_KEY", "ANTHROPIC_AWS_WORKSPACE_ID", "AWS_REGION"]) vi.stubEnv(name, "");
+    const tiers = { fast: { connection: "existing", model: "fast", maxTokens: 1000 }, smart: { connection: "existing", model: "smart" } };
+    const jobs = { review: { connection: "existing", model: "custom", maxTokens: 2000 } };
+    await call("ai.settings.save", { settings: { connections: { existing: { kind: "anthropic-aws" } }, tiers, jobs } });
+    const before = await call<AiSettingsView>("ai.connection.setKey", { connectionId: "existing", key: "fixture-key" });
+    expect(before.connections[0]!.missing).toEqual(["ANTHROPIC_AWS_WORKSPACE_ID", "AWS_REGION"]);
+    const after = await call<AiSettingsView>("ai.settings.save", { settings: { connections: { existing: { kind: "anthropic-aws", label: "Fixed AWS", workspaceId: "workspace-fixed", region: "eu-west-1" } }, tiers, jobs } });
+    expect(after.connections).toHaveLength(1); expect(after.connections[0]).toMatchObject({ id: "existing", label: "Fixed AWS", keySaved: true, keySource: "keychain", missing: [] });
+    expect(after.tiers).toEqual(tiers); expect(after.jobs).toEqual(jobs); expect(secrets.existing).toBe("fixture-key");
+    expect(JSON.stringify(after)).not.toContain("fixture-key");
+  });
+
+  it("keeps an environment-only saved key usable when its variable name is edited", async () => {
+    vi.stubEnv("OLD_PROVIDER_KEY", ""); vi.stubEnv("NEW_PROVIDER_KEY", "");
+    const tiers = { fast: { connection: "existing", model: "example" } };
+    await call("ai.settings.save", { settings: { connections: { existing: { kind: "openai", apiKeyEnv: "OLD_PROVIDER_KEY" } }, tiers } });
+    await call("ai.connection.setKey", { connectionId: "existing", key: "fixture-secret", saveToEnv: true });
+    // Simulate a machine where .env was the only credential store that accepted the key.
+    const config = JSON.parse(readFileSync(join(home, "config.json"), "utf8")); delete config.ai.connections.existing.keyUpdatedAt; secrets = {};
+    writeFileSync(join(home, "config.json"), JSON.stringify(config));
+    const after = await call<AiSettingsView>("ai.settings.save", { settings: { connections: { existing: { kind: "openai", apiKeyEnv: "NEW_PROVIDER_KEY" } }, tiers } });
+    expect(after.connections[0]).toMatchObject({ id: "existing", keySaved: true, keyInEnv: true, keyInKeychain: false, keySource: "env", keyEnvName: "NEW_PROVIDER_KEY", missing: [] });
+    expect(readFileSync(join(home, ".env"), "utf8")).toContain("NEW_PROVIDER_KEY=fixture-secret");
+    expect(readFileSync(join(home, ".env"), "utf8")).not.toContain("OLD_PROVIDER_KEY=");
+    expect(process.env.NEW_PROVIDER_KEY).toBe("fixture-secret"); expect(process.env.OLD_PROVIDER_KEY).toBeUndefined();
+    expect(JSON.stringify(after)).not.toContain("fixture-secret"); expect(after.tiers).toEqual(tiers);
+  });
+
+  it("keeps a shared original variable for another provider when editing a saved-key variable", async () => {
+    vi.stubEnv("SHARED_PROVIDER_KEY", ""); vi.stubEnv("NEW_PROVIDER_KEY", "");
+    await call("ai.settings.save", { settings: { connections: { first: { kind: "openai", apiKeyEnv: "SHARED_PROVIDER_KEY" }, second: { kind: "openai", apiKeyEnv: "SHARED_PROVIDER_KEY" } }, tiers: { fast: { connection: "first", model: "example" } } } });
+    await call("ai.connection.setKey", { connectionId: "first", key: "fixture-shared", saveToEnv: true });
+    await call("ai.settings.save", { settings: { connections: { first: { kind: "openai", apiKeyEnv: "NEW_PROVIDER_KEY" }, second: { kind: "openai", apiKeyEnv: "SHARED_PROVIDER_KEY" } } } });
+    const text = readFileSync(join(home, ".env"), "utf8"); expect(text).toContain("SHARED_PROVIDER_KEY=fixture-shared"); expect(text).toContain("NEW_PROVIDER_KEY=fixture-shared");
+  });
+
+  it("refuses a conflicting destination variable before changing settings or credentials", async () => {
+    vi.stubEnv("OLD_PROVIDER_KEY", ""); vi.stubEnv("NEW_PROVIDER_KEY", "");
+    await call("ai.settings.save", { settings: { connections: { existing: { kind: "openai", apiKeyEnv: "OLD_PROVIDER_KEY" } }, tiers: { fast: { connection: "existing", model: "example" } } } });
+    await call("ai.connection.setKey", { connectionId: "existing", key: "fixture-first", saveToEnv: true });
+    writeFileSync(join(home, ".env"), readFileSync(join(home, ".env"), "utf8") + "NEW_PROVIDER_KEY=fixture-other\n");
+    const config = readFileSync(join(home, "config.json"), "utf8"), env = readFileSync(join(home, ".env"), "utf8");
+    await expect(call("ai.settings.save", { settings: { connections: { existing: { kind: "openai", apiKeyEnv: "NEW_PROVIDER_KEY" } } } })).rejects.toThrow("already has a different key");
+    expect(readFileSync(join(home, "config.json"), "utf8")).toBe(config); expect(readFileSync(join(home, ".env"), "utf8")).toBe(env);
+  });
+
+  it.each([false, true])("rolls back the copied key if edited settings fail validation (empty destination: %s)", async emptyDestination => {
+    vi.stubEnv("OLD_PROVIDER_KEY", ""); vi.stubEnv("NEW_PROVIDER_KEY", "");
+    await call("ai.settings.save", { settings: { connections: { existing: { kind: "openai", apiKeyEnv: "OLD_PROVIDER_KEY" } }, tiers: { fast: { connection: "existing", model: "example" } } } });
+    await call("ai.connection.setKey", { connectionId: "existing", key: "fixture-first", saveToEnv: true });
+    if (emptyDestination) writeFileSync(join(home, ".env"), readFileSync(join(home, ".env"), "utf8") + "NEW_PROVIDER_KEY=\n");
+    const config = readFileSync(join(home, "config.json"), "utf8"), env = readFileSync(join(home, ".env"), "utf8");
+    await expect(call("ai.settings.save", { settings: { connections: { existing: { kind: "openai", apiKeyEnv: "NEW_PROVIDER_KEY", baseUrl: "not-a-url" } } } })).rejects.toThrow();
+    expect(readFileSync(join(home, "config.json"), "utf8")).toBe(config);
+    expect(readFileSync(join(home, ".env"), "utf8")).toBe(env.replace("NEW_PROVIDER_KEY=\n", ""));
+    expect(process.env.NEW_PROVIDER_KEY).toBe(""); expect(process.env.OLD_PROVIDER_KEY).toBe("fixture-first");
+  });
+  it("keeps a custom endpoint's saved key reachable when resetting its variable to the default", async () => {
+    vi.stubEnv("OLD_PROVIDER_KEY", ""); vi.stubEnv("OPENAI_COMPATIBLE_API_KEY", "");
+    const connection = { kind: "openai-compatible", baseUrl: "https://custom.test/v1", apiKeyEnv: "OLD_PROVIDER_KEY" };
+    const tiers = { fast: { connection: "existing", model: "example" } };
+    await call("ai.settings.save", { settings: { connections: { existing: connection }, tiers } });
+    await call("ai.connection.setKey", { connectionId: "existing", key: "fixture-custom", saveToEnv: true });
+    const { apiKeyEnv: _old, ...rest } = connection;
+    const after = await call<AiSettingsView>("ai.settings.save", { settings: { connections: { existing: rest }, tiers } });
+    expect(after.connections[0]).toMatchObject({ apiKeyEnv: "OPENAI_COMPATIBLE_API_KEY", keyInEnv: true, keySource: "env" });
+    expect(after.effective.find(job => job.job === "extraction")).toMatchObject({ keySource: "env", ok: true });
+  });
+
   it("shows legacy profiles as an imported setup and adopts them on the first save, keeping the old keys in the file", async () => {
     writeFileSync(join(home, "config.json"), JSON.stringify(awsProfiles));
     const view = await call<View>("ai.settings.read");
@@ -150,5 +255,23 @@ describe("desktop AI settings", () => {
 
     const rejecting = (async () => ({ ok: false, status: 401, json: async () => ({}) })) as unknown as typeof fetch;
     await expect(testConnection("openrouter", rejecting)).resolves.toEqual({ ok: false, detail: "The provider rejected the key." });
+  });
+
+  it("shows a ChatGPT plan connection as waiting for sign-in, keeps sign-in markers server-side and deletes its sign-in with it", async () => {
+    writeFileSync(join(home, "config.json"), JSON.stringify({ ai: { connections: { chatgpt: { kind: "chatgpt", keyUpdatedAt: "2026-11-01T00:00:00.000Z", accountLabel: "person@example.com" } } } }));
+    const view = await call<View & { presets: Array<{ kind: string; auth: string }>; connections: Array<{ id: string; accountLabel?: string }> }>("ai.settings.read");
+    expect(view.presets.find(preset => preset.kind === "chatgpt")).toMatchObject({ auth: "chatgpt" });
+    expect(view.presets.find(preset => preset.kind === "claude-code")).toMatchObject({ auth: "claude-cli" });
+    expect(view.connections.find(connection => connection.id === "chatgpt")).toMatchObject({ keySource: "keychain", accountLabel: "person@example.com" });
+    // The page cannot forge or drop the sign-in when it saves other changes.
+    await call("ai.settings.save", { settings: { connections: { chatgpt: { kind: "chatgpt", label: "Work plan" } }, tiers: {} } });
+    const stored = JSON.parse(readFileSync(join(home, "config.json"), "utf8")).ai.connections.chatgpt;
+    expect(stored).toMatchObject({ label: "Work plan", keyUpdatedAt: "2026-11-01T00:00:00.000Z", accountLabel: "person@example.com" });
+    await expect(call("ai.settings.save", { settings: { connections: { chatgpt: { kind: "chatgpt", accountLabel: "forged@example.com" } } } })).rejects.toThrow();
+    mkdirSync(join(home, "ai-auth"), { recursive: true });
+    writeFileSync(join(home, "ai-auth", "chatgpt.json"), JSON.stringify({ version: 1, clientId: "oaiapp_x" }));
+    await call("ai.settings.save", { settings: { connections: {}, tiers: {} } });
+    expect(existsSync(join(home, "ai-auth", "chatgpt.json"))).toBe(false);
+    await expect(call("ai.chatgpt.start", { connectionId: "chatgpt", redirectUri: "http://127.0.0.1:1455/auth/callback" })).rejects.toThrow(/no longer exists/);
   });
 });

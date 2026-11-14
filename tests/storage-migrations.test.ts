@@ -32,7 +32,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(24);
+    expect(CURRENT_SCHEMA_VERSION).toBe(26);
     expect(store.db.prepare("pragma table_info(source_failures)").all()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ name: "adapter" }),
@@ -114,7 +114,7 @@ describe("ordered storage migrations", () => {
       ])
     );
     const migrationOperations = store.listOperations({ operationType: "migration" });
-    expect(migrationOperations).toHaveLength(16);
+    expect(migrationOperations).toHaveLength(18);
     expect(migrationOperations).toEqual(expect.arrayContaining([
       expect.objectContaining({
         operationType: "migration",
@@ -466,7 +466,7 @@ describe("ordered storage migrations", () => {
     const store = openMemoryStore(rootDir);
     store.init();
 
-    expect(CURRENT_SCHEMA_VERSION).toBe(24);
+    expect(CURRENT_SCHEMA_VERSION).toBe(26);
     expect(store.db.prepare("select count(*) as count from sources").get()).toEqual(before.sources);
     expect(store.db.prepare("select count(*) as count from chunks").get()).toEqual(before.chunks);
     expect(store.db.prepare("select count(*) as count from memories").get()).toEqual(before.memories);

@@ -1,4 +1,4 @@
-// Tests runAutomaticReview(), selectAutoReviewTargets(), automaticReviewSkipReason() and launchAutomaticReviewIfDue() in src/memory/auto-review.ts with an injected investigator.
+// Tests runAutomaticReview() (including waiting candidates and repeated uncertain verdicts), selectAutoReviewTargets(), automaticReviewSkipReason() and launchAutomaticReviewIfDue() in src/memory/auto-review.ts with an injected investigator.
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -61,6 +61,15 @@ function staleCandidate(store: MemoryStore, key: string, title: string): MemoryC
   });
 }
 
+/** An unflagged single-source core candidate whose evidence commit exists. */
+function activeCandidate(store: MemoryStore, key: string, title: string, confidence: number): MemoryCandidate {
+  store.addCommit({ hash: `${key}-commit`, authorName: "T", authorEmail: "t@example.com", authoredAt: "2026-10-01T00:00:00.000Z", message: `Add ${key}`, changedFiles: [], diffSummary: `+ ${key}` });
+  return store.upsertMemoryCandidate({
+    type: "decision", title, summary: `${title} for the upload pipeline.`, reason: "Recorded during the upload work.", confidence,
+    evidence: [{ sourceType: "commit", sourceId: `${key}-commit` }], relatedFiles: [], dedupeKey: key
+  });
+}
+
 /** Answers by title prefix: Keep → current, Old → obsolete, Fix → changed, Meh → low_value, else uncertain. */
 function investigator(): MemoryReconciliationProvider & { requests: number } {
   const fake = {
@@ -82,7 +91,7 @@ function investigator(): MemoryReconciliationProvider & { requests: number } {
 }
 
 describe("automatic review", () => {
-  it("applies current and obsolete verdicts and leaves corrections and low-value calls for a person", async () => {
+  it("applies current and obsolete verdicts, drops low-value candidates, and leaves corrections for a person", async () => {
     const root = project();
     const ids = withStore(root, (store) => ({
       keep: staleCandidate(store, "keep", "Keep resumable uploads").id,
@@ -93,14 +102,14 @@ describe("automatic review", () => {
     withStore(root, (store) => expect(store.readMemoryCandidate(ids.keep)!.qualityReasons).toContain("stale_related_file_evidence"));
 
     const result = await runAutomaticReview(root, loadProjectConfig(root), { provider: investigator() });
-    expect(result.state).toMatchObject({ outcome: "reviewed", counts: { checked: 4, verified: 1, retired: 1, leftForReview: 2 } });
+    expect(result.state).toMatchObject({ outcome: "reviewed", counts: { checked: 4, verified: 1, retired: 2, leftForReview: 1, kept: 0 } });
     expect(readAutomaticReviewState(root)?.runId).toBe(result.state!.runId);
 
     withStore(root, (store) => {
       expect(store.readMemoryCandidate(ids.keep)!.qualityStatus).toBe("active");
       expect(store.readMemoryCandidate(ids.old)!.qualityStatus).toBe("quarantined");
       expect(store.readMemoryCandidate(ids.fix)!.qualityStatus).toBe("needs_review");
-      expect(store.readMemoryCandidate(ids.meh)!.qualityStatus).toBe("needs_review");
+      expect(store.readMemoryCandidate(ids.meh)!.qualityStatus).toBe("quarantined");
       const decision = planAutomaticPromotions(store, loadProjectConfig(root) as ProjectConfig).decisions.find((item) => item.memoryId === ids.keep)!;
       expect(decision.decision).toBe("promote");
       expect(decision.reasonCodes).toContain("ai_verified_current");
@@ -126,6 +135,50 @@ describe("automatic review", () => {
 
       expect(selectAutoReviewTargets(store, 100)).toEqual([{ category: "promoted", id: durable.id }, { category: "candidate", id: flagged.id }]);
       expect(selectAutoReviewTargets(store, 1)).toHaveLength(1);
+    });
+  });
+
+  it("asks about waiting core candidates after flagged memories, only at the single-source bar", () => {
+    const root = project();
+    withStore(root, (store) => {
+      const flagged = staleCandidate(store, "flagged", "Keep flagged fact");
+      const waiting = activeCandidate(store, "waiting", "Keep waiting fact", 0.92);
+      activeCandidate(store, "weak", "Keep weak fact", 0.7);
+      const lowConfidence = activeCandidate(store, "low", "Keep low fact", 0.5);
+
+      // Below 0.6 a candidate is flagged low_confidence, which the review can now settle.
+      expect(selectAutoReviewTargets(store, 100).map((ref) => ref.id)).toEqual([flagged.id, lowConfidence.id]);
+      expect(selectAutoReviewTargets(store, 100, new Date(), { candidateMinConfidence: 0.9 }).map((ref) => ref.id))
+        .toEqual([flagged.id, lowConfidence.id, waiting.id]);
+    });
+  });
+
+  it("confirms a waiting candidate for the next promotion pass and drops a low-value one", async () => {
+    const root = project();
+    const ids = withStore(root, (store) => ({
+      keep: activeCandidate(store, "keep", "Keep chunked uploads", 0.95).id,
+      meh: activeCandidate(store, "meh", "Meh upload naming", 0.95).id
+    }));
+    const result = await runAutomaticReview(root, loadProjectConfig(root), { provider: investigator() });
+    expect(result.state).toMatchObject({ counts: { checked: 2, verified: 1, retired: 1 } });
+    withStore(root, (store) => {
+      const decision = planAutomaticPromotions(store, loadProjectConfig(root) as ProjectConfig).decisions.find((item) => item.memoryId === ids.keep)!;
+      expect(decision.decision).toBe("promote");
+      expect(store.readMemoryCandidate(ids.meh)!.qualityStatus).toBe("quarantined");
+    });
+  });
+
+  it("keeps a durable memory judged uncertain three times and stops asking about it", async () => {
+    const root = project();
+    const id = withStore(root, (store) => store.promoteMemoryCandidate(staleCandidate(store, "unsure", "Unclear upload rule").id).id);
+    const start = Date.now(), at = (days: number) => () => new Date(start + days * 24 * 60 * 60 * 1000);
+    for (const [days, kept] of [[0, 0], [15, 0], [30, 1]] as const) {
+      const result = await runAutomaticReview(root, loadProjectConfig(root), { provider: investigator(), now: at(days) });
+      expect(result.state?.counts).toMatchObject({ checked: 1, uncertain: 1, kept });
+    }
+    withStore(root, (store) => {
+      expect(store.readMemory(id)!.qualityStatus).toBe("active");
+      expect(selectAutoReviewTargets(store, 100, at(60)())).toEqual([]);
     });
   });
 

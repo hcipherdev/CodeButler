@@ -22,13 +22,17 @@ export function recordUnexpectedDesktopError(error: unknown, phase: string): str
   } catch { return undefined; }
 }
 
-export function recordDesktopTiming(phase: "overview" | "search", gateWaitMs: number, workMs: number): void {
+export function recordDesktopTiming(
+  phase: "overview" | "overview-narrative" | "search",
+  gateWaitMs: number, workMs: number,
+  outcome?: "ok" | "busy" | "error"
+): void {
   try {
     const directory = join(globalConfigDir(), "logs");
     const path = join(directory, "desktop-performance.log");
     mkdirSync(directory, { recursive: true });
     try { if (statSync(path).size > 1_000_000) writeFileSync(path, ""); } catch { /* A new log has no size yet. */ }
     appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), phase,
-      gateWaitMs: Math.round(gateWaitMs), workMs: Math.round(workMs) })}\n`);
+      gateWaitMs: Math.round(gateWaitMs), workMs: Math.round(workMs), outcome })}\n`);
   } catch { /* Timing must never prevent a desktop read. */ }
 }

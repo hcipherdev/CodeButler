@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative, isAbsolute } from "node:path";
 import { z } from "zod";
-import { globalConfigDir } from "../config.js";
+import { globalConfigDir, trustedProjectConfigFiles } from "../config.js";
 import { ruleActions, verificationSubjects, type Rule } from "./format.js";
 import { listRules, readRulePaths, type ListedRule } from "./store.js";
 import { globalRulesRoot } from "./identity.js";
@@ -35,11 +35,13 @@ const describeAttestation = (entry: AttestationEntry, bodyHash: string, now: Dat
 const KNOWN_SUBJECTS = 10;
 const aliases: Record<string, string> = { windows: "win32", macos: "darwin", mac: "darwin", pwsh: "powershell", "powershell.exe": "powershell", "cmd.exe": "cmd" };
 const normalized = (value: string): string => aliases[value.toLowerCase()] ?? value.toLowerCase();
+/** A repo can only switch rules off or exclude them once this device's owner approves; see project-trust.ts. */
 function policy(root: string) {
   let result: Record<string, unknown> = {};
-  for (const path of [join(globalConfigDir(), "config.json"), join(root, ".code-butler", "config.json"), join(root, ".code-butler", "config.local.json")]) {
-    if (!existsSync(path)) continue;
-    const value = JSON.parse(readFileSync(path, "utf8")) as { globalRules?: unknown };
+  const globalPath = join(globalConfigDir(), "config.json");
+  const project = trustedProjectConfigFiles(root);
+  const files = [existsSync(globalPath) ? JSON.parse(readFileSync(globalPath, "utf8")) as { globalRules?: unknown } : {}, project.shared, project.local];
+  for (const value of files) {
     if (value.globalRules !== undefined) result = { ...result, ...globalRulesPolicySchema.partial().parse(value.globalRules) };
   }
   return globalRulesPolicySchema.parse(result);

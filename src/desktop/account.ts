@@ -4,8 +4,9 @@ import { isAbsolute, join, resolve } from "node:path";
 import { AccountClient } from "../cloud/account-client.js";
 import { EncryptionError } from "../cloud/crypto-helper.js";
 import { NativeSecurity } from "../cloud/native-security.js";
-import { restoreRecovery, rotateVault } from "../cloud/vault-client.js";
-import { atomicJson, readJson, serverUrl } from "../cloud/state.js";
+import { CloudRecoveryError, restoreCloudRecovery, restoreRecovery, rotateVault } from "../cloud/vault-client.js";
+import type { VaultState } from "../cloud/protocol-types.js";
+import { atomicJson, defaultCloudServer, readJson, serverUrl } from "../cloud/state.js";
 import { globalConfigDir } from "../config.js";
 import { automaticSyncStatus } from "./bootstrap.js";
 
@@ -25,6 +26,8 @@ export interface DesktopAccountStatus {
   limitBytes?: number;
   passwordSet?: boolean;
   passkeyCount?: number;
+  cloudRecoverySupported?: boolean;
+  cloudRecovery?: true;
   pendingRequest?: { requestId: string; fingerprint: string; expiresAt: number };
   automaticSync?: import("./bootstrap.js").AccountBootstrapResult;
 }
@@ -61,7 +64,7 @@ function writeRecoveryKit(filePath: string, kit: unknown): void {
 
 export async function localAccountStatus(): Promise<DesktopAccountStatus> {
   const selection = selected();
-  if (!selection?.server) return { signedIn: false, verified: false, connection: "signed-out", device: "none" };
+  if (!selection?.server) return { server: defaultCloudServer(), signedIn: false, verified: false, connection: "signed-out", device: "none" };
   const server = serverUrl(selection.server);
   const security = NativeSecurity.forServer(server);
   const tokens = await security.invoke<{ accountId: string } | null>("tokens-read");
@@ -87,8 +90,11 @@ export async function accountSummary(): Promise<DesktopAccountStatus> {
     atomicJson(selectionPath(), { server: local.server, email: profile.email });
     const result: DesktopAccountStatus = { ...local, email: profile.email, accountId: profile.id, createdAt: profile.createdAt,
       passwordSet: profile.passwordSet, passkeyCount: profile.passkeyCount, verified: true, connection: "online" };
+    let remoteVaultFound = false;
     try {
-      const vaultState = await client.request<{ descriptor: { vaultId: string } }>("/v2/vault/state", "GET", undefined, false);
+      const vaultState = await client.request<VaultState>("/v2/vault/state", "GET", undefined, false);
+      remoteVaultFound = true;
+      if (vaultState.cloudRecovery) result.cloudRecovery = true;
       const localState = await client.security.status();
       if (localState.descriptor?.vaultId !== vaultState.descriptor.vaultId || localState.descriptor?.accountId !== profile.id) {
         result.device = "not-enrolled";
@@ -97,13 +103,18 @@ export async function accountSummary(): Promise<DesktopAccountStatus> {
       }
       await client.refreshVault();
       const vault = await client.vaultSummary();
-      Object.assign(result, { device: "enrolled", ...vault });
+      Object.assign(result, { device: vaultState.cloudRecovery && !localState.recoveryReady ? "setup-pending" : "enrolled", ...vault });
     } catch (error) {
       if (error instanceof EncryptionError && error.state === "revoked") result.device = "revoked";
       else if (error instanceof EncryptionError && error.state === "enrollment-required") {
-        result.device = local.pendingRequest ? "not-enrolled" : local.device === "setup-pending" ? "setup-pending" : "none";
+        result.device = remoteVaultFound || local.pendingRequest ? "not-enrolled" : local.device === "setup-pending" ? "setup-pending" : "none";
+        if (result.device !== "not-enrolled") {
+          const capabilities = await client.capabilities().catch(() => undefined);
+          if (capabilities) result.cloudRecoverySupported = capabilities.cloudRecovery === 1;
+        }
       }
-      else if (local.device === "enrolled") result.verified = false;
+      // Without a verified vault response, a fresh computer must not be offered first-device initialization.
+      else result.verified = false;
     }
     return result;
   } catch (error) {
@@ -111,11 +122,15 @@ export async function accountSummary(): Promise<DesktopAccountStatus> {
   }
 }
 
-export function accountCapabilities(server: string): Promise<{ registrationEnabled: boolean; passwordEnabled: boolean; passkeyEnabled: boolean }> {
-  return new AccountClient(serverUrl(server)).capabilities();
+export async function accountCapabilities(server: string): Promise<{ registrationEnabled: boolean; passwordEnabled: boolean; passkeyEnabled: boolean; humanCheck: "turnstile" | null }> {
+  const caps = await new AccountClient(serverUrl(server)).capabilities();
+  return { registrationEnabled: caps.registrationEnabled, passwordEnabled: caps.passwordEnabled, passkeyEnabled: caps.passkeyEnabled, humanCheck: caps.humanCheck ?? null };
 }
-export function accountChallenge(server: string, email: string, purpose: "register" | "login" | "reset"): Promise<{ challengeId: string; expiresAt: number }> {
-  return new AccountClient(serverUrl(server)).challenge(email, purpose);
+export function accountChallenge(server: string, email: string, purpose: "register" | "login" | "reset", human?: { code: string; verifier: string }): Promise<{ challengeId: string; expiresAt: number }> {
+  return new AccountClient(serverUrl(server)).challenge(email, purpose, human);
+}
+export function accountHumanStart(server: string, redirectUri: string): Promise<{ url: string; verifier: string; state: string }> {
+  return new AccountClient(serverUrl(server)).humanStart(redirectUri);
 }
 export async function accountVerify(server: string, email: string, challengeId: string, code: string): Promise<DesktopAccountStatus> {
   const normalizedServer = serverUrl(server);
@@ -171,7 +186,7 @@ export async function accountLogout(): Promise<{ remoteRevoked: boolean }> {
   if (!selection?.server) return { remoteRevoked: true };
   return { remoteRevoked: await new AccountClient(selection.server).logout() };
 }
-export async function vaultPrepare(filePath: string, label = hostname()): Promise<{ code: string }> {
+export async function vaultPrepare(filePath?: string, label = hostname()): Promise<{ code: string; vaultId?: string }> {
   const client = clientForSelected();
   const local = await client.security.status();
   const tokens = await client.tokens();
@@ -179,14 +194,19 @@ export async function vaultPrepare(filePath: string, label = hostname()): Promis
     throw new Error("This computer has secure vault state for another account on this server. Use its recovery file on a separate device profile.");
   }
   try {
-    await client.request("/v2/vault/state", "GET", undefined, false);
-    throw new Error("This account already has a vault. Enroll this device or restore access.");
+    const remote = await client.request<VaultState>("/v2/vault/state", "GET", undefined, false);
+    if (filePath !== undefined || !remote.cloudRecovery || local.descriptor?.vaultId !== remote.descriptor.vaultId
+      || local.device?.id !== remote.descriptor.firstDevice.id || local.recoveryReady) {
+      throw new Error("This account already has a vault. Enroll this device or restore access.");
+    }
   } catch (error) {
     if (!(error instanceof EncryptionError && error.state === "enrollment-required")) throw error;
+    if (filePath === undefined && (await client.capabilities()).cloudRecovery !== 1) throw new Error("This server does not support cloud recovery backups.");
   }
   const status = await client.initialize(label);
-  if (status.recoveryReady) throw new Error("This vault is already initialized.");
+  if (status.recoveryReady || !status.descriptor || status.descriptor.accountId !== tokens.accountId) throw new Error("This vault is already initialized or the account has changed.");
   const exported = await client.security.invoke<{ kit: unknown; code: string }>("recovery-export");
+  if (filePath === undefined) return { code: exported.code, vaultId: status.descriptor.vaultId };
   writeRecoveryKit(filePath, exported.kit);
   return { code: exported.code };
 }
@@ -194,6 +214,17 @@ export async function vaultConfirm(filePath: string, code: string): Promise<{ in
   const client = clientForSelected();
   await client.security.invoke("recovery-confirm", { kit: readRecoveryKit(filePath), code });
   await client.publishInitialization();
+  return { initialized: true };
+}
+export async function cloudVaultConfirm(vaultId: string): Promise<{ initialized: true }> {
+  try {
+    await clientForSelected().publishCloudRecoveryInitialization(vaultId);
+  } catch (error) {
+    if (error instanceof EncryptionError && error.state === "conflict") {
+      throw new CloudRecoveryError("This account already has a different vault or recovery backup. Check Devices & recovery.", { cause: error });
+    }
+    throw new CloudRecoveryError("Could not finish saving the cloud recovery backup. Check your connection and try again with the same code.", { cause: error });
+  }
   return { initialized: true };
 }
 export async function deviceRequest(label = hostname()): Promise<{ requestId: string; fingerprint: string; expiresAt: number }> {
@@ -222,7 +253,9 @@ export async function deviceCancel(requestId: string): Promise<{ status: "none" 
   const client = clientForSelected();
   return client.cancelEnrollment(requestId);
 }
-export async function recoveryRestore(filePath: string, code: string, label = hostname()): Promise<{ restored: true }> {
-  await restoreRecovery(clientForSelected(), recoveryPath(filePath), code, label);
+export async function recoveryRestore(filePath: string | undefined, code: string, label = hostname()): Promise<{ restored: true }> {
+  const client = clientForSelected();
+  if (filePath === undefined) await restoreCloudRecovery(client, code, label);
+  else await restoreRecovery(client, recoveryPath(filePath), code, label);
   return { restored: true };
 }

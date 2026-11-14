@@ -7,6 +7,7 @@ import { projectOperation } from "../cloud/client.js";
 import { binding } from "../cloud/state.js";
 import { requestAutomaticSync } from "../cloud/sync-owner.js";
 import { createEmbeddingEndpointHash, createProviderKey } from "../embeddings/fingerprint.js";
+import { parseFencedJson } from "../json.js";
 import { openConfiguredMemoryStore } from "../storage/open-configured-store.js";
 import { openLocalMemoryDatabase } from "../storage/local-memory.js";
 import type { MemoryStore } from "../storage/store.js";
@@ -192,7 +193,7 @@ export async function runMemoryWording(root: string, input: {
                 else {
                     if (response.content.length > 65536)
                         throw new Error("AI returned oversized wording");
-                    item.wording.after = validateWordingProposal(item.wording.before, JSON.parse(response.content), payload.type);
+                    item.wording.after = validateWordingProposal(item.wording.before, parseFencedJson(response.content), payload.type);
                     item.state = "planned";
                     item.error = undefined;
                 }

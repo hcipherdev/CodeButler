@@ -11,6 +11,7 @@ import type {
   OperationActor,
   ProjectConfig
 } from "../types.js";
+import { DEFAULT_CANDIDATE_EXPIRY_DAYS } from "../config.js";
 import type { MemoryStore } from "../storage/store.js";
 import { withTransaction } from "../storage/transactions.js";
 import { CORE_LAYER, layerLabel, parseLayer } from "./layer.js";
@@ -27,7 +28,9 @@ import { suggestBranchMemoryTriage, type BranchTriageState } from "./branch-tria
 import { suggestMemoryLayerPromotions } from "./layer-promotion.js";
 import { updateMemoryStatus } from "./lifecycle-service.js";
 import { peerLayers } from "./peer-layer.js";
-import { currentMemoryReview } from "./review-state.js";
+import { lastAttentionDay } from "./usage.js";
+import { compensateMemoryReview, resolveMemoryReview } from "./review.js";
+import { createMemoryReviewContext, currentMemoryReview, effectiveTerminalMemoryReview } from "./review-state.js";
 
 /**
  * Bumping this re-opens every stored decision, including deferrals a previous
@@ -77,6 +80,8 @@ export interface AutomaticPromotionSummary {
   converged: number;
   deferred: number;
   skipped: number;
+  /** Core candidates discarded for staying uncorroborated past candidateExpiryDays. */
+  expired: number;
   warnings: string[];
 }
 
@@ -295,6 +300,7 @@ export function runAutomaticPromotions(
     converged: 0,
     deferred: 0,
     skipped: 0,
+    expired: 0,
     warnings: []
   };
   for (const decision of plan.decisions) {
@@ -309,7 +315,202 @@ export function runAutomaticPromotions(
       summary.warnings.push(`Automatic promotion could not be applied for one ${decision.category} memory`);
     }
   }
+  // After promotion, so a candidate corroborated in this pass is promoted rather than expired.
+  if (plan.enabled) {
+    try { summary.expired = expireUnconfirmedCandidates(store, config, input.now).expired; }
+    catch { summary.warnings.push("Unconfirmed candidates could not be expired"); }
+  }
   return summary;
+}
+
+/**
+ * Whether a core candidate still lacks the corroboration the core-candidate rule promotes on:
+ * no current verification and fewer than two independent sources. The daily AI review asks
+ * about these (src/memory/auto-review.ts); the rest expire.
+ */
+export function awaitsCorroboration(store: MemoryStore, memory: MemoryCandidate): boolean {
+  if (parseLayer(memory.layer ?? CORE_LAYER).kind !== "core") return false;
+  if (new Set(memory.evidence.map((reference) => reference.sourceId)).size >= 2) return false;
+  const review = currentMemoryReview(store, "candidate", memory);
+  return !(review?.action === "verify" && review.current);
+}
+
+/** Reason prefix of expiry discards; with actor, action and time it identifies one expiry pass. */
+export const CANDIDATE_EXPIRY_REASON_PREFIX = "Unconfirmed after ";
+/** Below this many durable memories the candidates are most of what a project remembers, so none expire. */
+const EXPIRY_MIN_DURABLE = 10;
+
+export interface CandidateExpiryResult {
+  expired: number;
+  /** The pass's review time, shared by every discard it wrote; absent when nothing expired. */
+  at?: string | undefined;
+}
+
+/**
+ * Discards candidates that automatic promotion has left unpromoted, and nobody has used,
+ * for candidateExpiryDays active days, so the review queue drains without a person.
+ *
+ * The clock starts at the later of the candidate's last change and its last attention
+ * (src/memory/usage.ts: an agent was handed it, or an AI review proposed a correction), on
+ * any device. It counts active days, not calendar days, so time away does not count:
+ * - a shared (`core`) candidate counts days on which any synced device imported evidence
+ *   (`sources` syncs with its original import time);
+ * - this device's own (`device:` layer) candidate counts only days this device imported
+ *   evidence (local_activity_days), so an idle machine never expires its own.
+ *
+ * Nothing expires while the project has fewer than EXPIRY_MIN_DURABLE durable memories. A
+ * candidate someone has reviewed, one with an undone review (an undone expiry must stay
+ * undone), and a quarantined one (it is cleared by hand) are left alone. The discard is an
+ * ordinary system review, shared like the candidate; restoreCandidateExpiry undoes a pass.
+ */
+export function expireUnconfirmedCandidates(store: MemoryStore, config: ProjectConfig, now?: string | undefined): CandidateExpiryResult {
+  const policy = config.promotion.automatic;
+  const days = policy.candidateExpiryDays ?? DEFAULT_CANDIDATE_EXPIRY_DAYS;
+  if (!policy.enabled || policy.coreCandidates === false || days <= 0) return { expired: 0 };
+  const durable = store.listMemories({ lifecycleStatus: "current", qualityStatus: "all", layer: "core", limit: null }).length;
+  if (durable < EXPIRY_MIN_DURABLE) return { expired: 0 };
+  const peers = new Set(peerLayers(store));
+  const candidates = store.listMemoryCandidates({ promotionState: "candidate", qualityStatus: "all", limit: null })
+    .flatMap((memory): Array<{ memory: MemoryCandidate; clock: "shared" | "local" }> => {
+      if (memory.qualityStatus === "quarantined") return [];
+      const layer = memory.layer ?? CORE_LAYER, kind = parseLayer(layer).kind;
+      if (kind === "core") return [{ memory, clock: "shared" }];
+      return kind === "device" && !peers.has(layer) ? [{ memory, clock: "local" }] : [];
+    });
+  if (candidates.length === 0) return { expired: 0 };
+  const sharedDays = (store.db.prepare("select distinct substr(created_at, 1, 10) as day from sources order by day").all() as Array<{ day: string }>)
+    .map((row) => row.day);
+  const localDays = (store.localDb.prepare("select day from local_activity_days order by day").all() as Array<{ day: string }>)
+    .map((row) => row.day);
+  // Days strictly after the last touch; the touching day itself does not count.
+  const activeDaysSince = (sorted: string[], day: string) => sorted.length - upperBound(sorted, day);
+  const reviewedByPerson = store.db.prepare(
+    `select 1 from memory_review_resolutions r
+      where r.memory_id = ? and r.category = 'candidate'
+        and (r.actor in ('desktop', 'cli', 'mcp')
+          or exists (select 1 from memory_review_resolution_compensations c where c.resolution_id = r.id))
+      limit 1`
+  );
+  const correctionPending = store.localDb.prepare(
+    `select 1 from memory_reconciliation_items
+      where memory_id = ? and category = 'candidate' and state = 'awaiting_correction_approval' limit 1`
+  );
+  const at = now ?? new Date().toISOString();
+  let expired = 0;
+  for (const { memory, clock } of candidates) {
+    const attention = lastAttentionDay(store, "candidate", memory.id);
+    const touched = attention !== undefined && attention > memory.updatedAt.slice(0, 10) ? attention : memory.updatedAt.slice(0, 10);
+    if (activeDaysSince(clock === "shared" ? sharedDays : localDays, touched) < days) continue;
+    if (reviewedByPerson.get(memory.id) || correctionPending.get(memory.id)) continue;
+    if (effectiveTerminalMemoryReview(store, "candidate", memory) !== undefined) continue;
+    resolveMemoryReview(store, {
+      memoryId: memory.id,
+      category: "candidate",
+      action: "discard",
+      reason: `${CANDIDATE_EXPIRY_REASON_PREFIX}${days} active days: not confirmed or used in that time.`,
+      reviewToken: createMemoryReviewContext(store, "candidate", memory).reviewToken,
+      now: at
+    }, "system");
+    expired += 1;
+  }
+  return expired ? { expired, at } : { expired };
+}
+
+/** Marks today active for this device's own candidates; sync calls it when it imported evidence. */
+export function recordLocalActivityDay(store: MemoryStore, at: string): void {
+  store.localDb.prepare("insert or ignore into local_activity_days (day) values (?)").run(at.slice(0, 10));
+}
+
+/** Index of the first entry greater than value in a sorted list. */
+function upperBound(sorted: string[], value: string): number {
+  let low = 0, high = sorted.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (sorted[mid]! <= value) low = mid + 1; else high = mid;
+  }
+  return low;
+}
+
+export interface CandidateExpiryPass {
+  at: string;
+  /** Candidates the pass discarded. */
+  count: number;
+  /** Of those, the ones still discarded by an expiry. */
+  restorable: number;
+}
+
+const EXPIRY_DISCARDS = `r.category = 'candidate' and r.action = 'discard' and r.actor = 'system' and r.reason like ? || '%'`;
+const NOT_UNDONE = "not exists (select 1 from memory_review_resolution_compensations c where c.resolution_id = r.id)";
+
+/**
+ * The most recent expiry pass, from the shared review rows, so any device sees it. Counts
+ * are per candidate: two devices that expired the same candidate before syncing wrote two
+ * discards for it, and both must be undone to restore it.
+ */
+export function latestCandidateExpiry(store: Pick<MemoryStore, "db">): CandidateExpiryPass | undefined {
+  const latest = store.db.prepare(`select max(r.reviewed_at) as at from memory_review_resolutions r where ${EXPIRY_DISCARDS}`)
+    .get(CANDIDATE_EXPIRY_REASON_PREFIX) as { at: string | null } | undefined;
+  if (!latest?.at) return undefined;
+  const ids = passMemoryIds(store, latest.at);
+  const restorable = ids.filter((id) => store.db.prepare(
+    `select 1 from memory_review_resolutions r where ${EXPIRY_DISCARDS} and r.memory_id = ? and ${NOT_UNDONE} limit 1`
+  ).get(CANDIDATE_EXPIRY_REASON_PREFIX, id)).length;
+  return { at: latest.at, count: ids.length, restorable };
+}
+
+function passMemoryIds(store: Pick<MemoryStore, "db">, at: string): string[] {
+  return (store.db.prepare(`select distinct r.memory_id as id from memory_review_resolutions r where ${EXPIRY_DISCARDS} and r.reviewed_at = ?`)
+    .all(CANDIDATE_EXPIRY_REASON_PREFIX, at) as Array<{ id: string }>).map((row) => row.id);
+}
+
+export interface ExpiredCandidate { id: string; type: string; title: string; summary: string; restored: boolean }
+
+/**
+ * The candidates one expiry pass discarded (the latest by default), so a person can check
+ * them before restoring. It only reads plain rows, so the desktop can run it on a read-only
+ * connection without waiting for a sync to finish.
+ */
+export function listCandidateExpiry(store: Pick<MemoryStore, "db">, at?: string): { at?: string | undefined; candidates: ExpiredCandidate[] } {
+  const pass = at ?? latestCandidateExpiry(store)?.at;
+  if (pass === undefined) return { candidates: [] };
+  const candidates = passMemoryIds(store, pass).flatMap((id) => {
+    const candidate = store.db.prepare("select type, title, summary from memory_candidates where id = ?").get(id) as
+      { type: string; title: string; summary: string } | undefined;
+    if (!candidate) return [];
+    const restored = !store.db.prepare(
+      `select 1 from memory_review_resolutions r where ${EXPIRY_DISCARDS} and r.memory_id = ? and ${NOT_UNDONE} limit 1`
+    ).get(CANDIDATE_EXPIRY_REASON_PREFIX, id);
+    return [{ id, type: candidate.type, title: candidate.title, summary: candidate.summary, restored }];
+  });
+  return { at: pass, candidates };
+}
+
+/**
+ * Restores the candidates one expiry pass discarded (the latest by default, or just `ids`), undoing every
+ * expiry discard on them, including a duplicate another device wrote before syncing.
+ * Restored candidates carry an undone review, so later passes leave them alone.
+ */
+export function restoreCandidateExpiry(
+  store: MemoryStore,
+  input: { at?: string | undefined; ids?: readonly string[] | undefined; now?: string | undefined } = {},
+  actor: OperationActor = "cli"
+): { at?: string | undefined; restored: number } {
+  const at = input.at ?? latestCandidateExpiry(store)?.at;
+  if (at === undefined) return { restored: 0 };
+  const chosen = input.ids ? new Set(input.ids) : undefined;
+  let restored = 0;
+  withTransaction(store.db, () => {
+    for (const memoryId of passMemoryIds(store, at).filter((id) => !chosen || chosen.has(id))) {
+      const resolutions = (store.db.prepare(
+        `select r.id from memory_review_resolutions r where ${EXPIRY_DISCARDS} and r.memory_id = ? and ${NOT_UNDONE}`
+      ).all(CANDIDATE_EXPIRY_REASON_PREFIX, memoryId) as Array<{ id: string }>).map((row) => row.id);
+      for (const resolutionId of resolutions) {
+        compensateMemoryReview(store, { resolutionId, reason: "Restored an unconfirmed-candidate expiry.", now: input.now }, actor);
+      }
+      if (resolutions.length) restored += 1;
+    }
+  });
+  return { at, restored };
 }
 
 export interface UndoAutomaticPromotionsInput {

@@ -27,7 +27,8 @@ export type DesktopRequest =
   | import("../rules/desktop.js").RulesDesktopRequest
   | { version: 1; action: "account.status" | "account.summary" | "account.logout" | "account.bootstrap" | "account.enrollment.poll" | "account.devices" | "account.secrets.review" }
   | { version: 1; action: "account.capabilities"; server: string }
-  | { version: 1; action: "account.challenge"; server: string; email: string; purpose: "register" | "login" | "reset" }
+  | { version: 1; action: "account.challenge"; server: string; email: string; purpose: "register" | "login" | "reset"; humanCode?: string; humanVerifier?: string }
+  | { version: 1; action: "account.human.start"; server: string; redirectUri: string }
   | { version: 1; action: "account.verify"; server: string; email: string; challengeId: string; code: string }
   | { version: 1; action: "account.register"; server: string; email: string; challengeId: string; code: string; password: string }
   | { version: 1; action: "account.password.login"; server: string; email: string; password: string }
@@ -38,14 +39,14 @@ export type DesktopRequest =
   | { version: 1; action: "account.passkey.exchange"; server: string; kind: "login" | "add"; code: string; verifier: string; state: string }
   | { version: 1; action: "account.passkeys" }
   | { version: 1; action: "account.passkey.remove"; id: string }
-  | { version: 1; action: "account.vault.prepare"; filePath: string; label?: string }
-  | { version: 1; action: "account.vault.confirm"; filePath: string; code: string }
+  | { version: 1; action: "account.vault.prepare"; filePath?: string; label?: string }
+  | { version: 1; action: "account.vault.confirm"; filePath?: string; code?: string; vaultId?: string }
   | { version: 1; action: "account.device.request"; label?: string }
   | { version: 1; action: "account.device.approve"; fingerprint: string }
   | { version: 1; action: "account.device.complete"; requestId: string; fingerprint: string }
   | { version: 1; action: "account.device.revoke"; deviceId: string; confirmed?: boolean }
   | { version: 1; action: "account.device.cancel"; requestId: string }
-  | { version: 1; action: "account.recovery.restore"; filePath: string; code: string; label?: string }
+  | { version: 1; action: "account.recovery.restore"; filePath?: string; code: string; label?: string }
   | { version:2; action:"memory.freshness"; root:string }
   | ({ version:2; action:"memory.page"; root:string } & import("../retrieval/tiers.js").TierInput)
   | { version:2; action:"memory.tiers"; root:string }
@@ -54,6 +55,8 @@ export type DesktopRequest =
   | ({version:1; action:"memory.working.candidate"; root:string} & import("../memory/working.js").WorkingCandidateInput)
   | {version:1; action:"memory.promote-project"; root:string; id:string; category:"candidate"|"promoted"; reason:string}
   | { version: 1; action: "projects.list" }
+  | { version: 1; action: "settings.general.read" }
+  | { version: 1; action: "settings.general.save"; settings: import("../config.js").GeneralSettings }
   | { version: 1; action: "watcher.status" }
   | { version: 1; action: "watcher.install" }
   | { version: 1; action: "watcher.runtime-details" }
@@ -61,18 +64,25 @@ export type DesktopRequest =
   | { version: 1; action: "projects.add"; root: string; initialize?: boolean }
   | { version: 1; action: "projects.remove"; root: string; mode?: "list" | "local" | "everywhere"; confirmed?: boolean }
   | { version: 1; action: "project.overview"; root: string }
+  | { version: 1; action: "project.overview.preview"; root: string }
+  | { version: 1; action: "project.overview.narrative-status"; root: string }
+  | { version: 1; action: "project.trust.approve"; root: string; hash: string; confirmed?: boolean }
   | { version: 1; action: "project.sources"; root: string }
   | { version: 1; action: "project.sources.check"; root: string }
   | { version: 1; action: "ai.clients.status"; root?: string }
   | { version: 1; action: "ai.settings.read"; root?: string }
   | { version: 1; action: "ai.settings.save"; root?: string; settings: import("../types.js").AiSettings }
-  | { version: 1; action: "ai.connection.setKey"; root?: string; connectionId: string; key: string; saveToEnv?: boolean }
+  | { version: 1; action: "ai.connection.setKey"; root?: string; connectionId: string; key: string; saveToEnv?: boolean; preferSaved?: boolean }
   | { version: 1; action: "ai.connection.removeKey"; root?: string; connectionId: string }
   | { version: 1; action: "ai.connection.test"; connectionId: string }
   | { version: 1; action: "ai.models.list"; connectionId: string }
+  | { version: 1; action: "ai.chatgpt.start"; connectionId: string; redirectUri: string }
+  | { version: 1; action: "ai.chatgpt.exchange"; root?: string; connectionId: string; redirectUri: string; code: string; verifier: string; nonce: string; clientId?: string; scope?: string }
   | { version: 1; action: "update.check" }
   | { version: 1; action: "update.download"; updateVersion: string }
   | { version: 1; action: "ai.clients.connect"; client: import("./ai-clients.js").AiClient }
+  | { version: 1; action: "ai.clients.connect-claude-desktop"; root?: string }
+  | { version: 1; action: "ai.clients.ensure" }
   | { version: 1; action: "cloud.sync.status"; root: string }
   | { version: 1; action: "cloud.projects.list"; refresh?: boolean }
   | { version: 1; action: "cloud.project.inspect"; root: string; refresh?: boolean }
@@ -88,6 +98,8 @@ export type DesktopRequest =
   | { version: 1; action: "project.summary.refresh"; root: string; force?: boolean }
   | { version: 1; action: "memory.search"; root: string; query: string; qualityStatus?: MemoryQualityStatus | "all"; offset?: number; limit?: number }
   | { version: 1; action: "memory.detail"; root: string; id: string }
+  | { version: 1; action: "memory.candidates.expired"; root: string; at: string }
+  | { version: 1; action: "memory.candidates.restore-expiry"; root: string; at: string; ids?: string[] }
   | { version: 1; action: "memory.review.resolve"; root: string; memoryId: string; category: "candidate" | "promoted"; reviewAction: MemoryReviewAction; reason?: string; reviewToken?: string; correction?: MemoryCorrectionInput }
   | { version: 1; action: "memory.ai.preview"; root: string; mode?: "reconcile"; selection: DesktopReconciliationSelection; intentId?: string }
   | { version: 1; action: "memory.ai.preview"; root: string; mode: "wording"; selection: WordingSelection; intentId?: string }
@@ -204,23 +216,36 @@ export interface DesktopSourceCheck {
   waiting: number;
 }
 
+export interface DesktopProjectOverviewPreview {
+  root: string;
+  narrative: { exists: boolean; summary: string };
+}
+
 export interface DesktopProjectOverview {
   project: DesktopProject;
   narrative: {
     exists: boolean;
     summary: string;
-    status: ProjectSummaryStatus;
+    status?: ProjectSummaryStatus;
   };
   memory: ProjectSummary;
   cloud: DesktopCloudStatus;
   tiers?: import("../retrieval/tiers.js").MemoryTierCounts;
   working?: import("../retrieval/tiers.js").WorkingMemory[];
   freshness?: import("../retrieval/index.js").RetrievalFreshness;
+  /** The repository's own settings that wait for approval on this device; absent when nothing does. */
+  trust?: import("../config.js").PendingProjectSettings;
   /** What clears review reminders without a person, so the overview can say what happens next. */
-  automation?: { aiReview: boolean; promotion: boolean };
+  automation?: {
+    aiReview: boolean; aiReviewOnDemand?: boolean; promotion: boolean; candidateExpiryDays?: number;
+    /** A recent expiry pass that can still be restored in one step. */
+    lastExpiry?: { at: string; count: number; restorable: number };
+  };
 }
 
 export type DesktopResult =
+  | ReturnType<typeof import("../memory/automatic-promotion.js").restoreCandidateExpiry>
+  | ReturnType<typeof import("../memory/automatic-promotion.js").listCandidateExpiry>
   | ReturnType<typeof import("../memory/topics.js").previewHandbookTopic>
   | ReturnType<typeof import("../memory/events.js").memoryHistory>
   | ReturnType<typeof import("../memory/topics.js").readHandbook>
@@ -231,14 +256,14 @@ export type DesktopResult =
   | ReturnType<typeof import("../memory/export.js").exportMemoryHandbook>
   | import("../rules/desktop.js").RulesDesktopResult
   | DesktopAccountStatus
-  | { registrationEnabled: boolean; passwordEnabled: boolean; passkeyEnabled: boolean }
+  | { registrationEnabled: boolean; passwordEnabled: boolean; passkeyEnabled: boolean; humanCheck: "turnstile" | null }
   | { challengeId: string; expiresAt: number }
   | { resetToken: string; expiresAt: number }
   | { reset: true } | { removed: true }
   | { url: string; verifier: string; state: string }
   | Array<{ id: string; name: string; createdAt: number; lastUsed?: number }>
   | { remoteRevoked: boolean }
-  | { code: string }
+  | { code: string; vaultId?: string }
   | { initialized: true } | { enrolled: true } | { cancelled: true } | { restored: true }
   | { approved: true } | { revoked: true }
   | { status: "none" | "pending" | "enrolled" | "cancelled" | "expired" | "revoked"; expiresAt?: number }
@@ -255,21 +280,27 @@ export type DesktopResult =
   | ReturnType<typeof import("../memory/working.js").createWorkingCandidate>
   | ReturnType<typeof import("../memory/layer-service.js").updateMemoryLayer>
   | DesktopProjectList
+  | import("../config.js").GeneralSettings
   | DesktopWatcherStatus
   | { processes: RuntimeRecord[] }
   | DesktopProjectInspection
   | DesktopProjectAddResult
   | DesktopProject
   | DesktopProjectOverview
+  | DesktopProjectOverviewPreview
+  | { status: ProjectSummaryStatus }
+  | import("../config.js").PendingProjectSettings
   | DesktopProjectSources
   | DesktopSourceCheck
   | import("./ai-clients.js").AiClientStatus
+  | import("./ai-clients.js").AutoConnectOutcome[]
   | import("./ai-settings.js").AiSettingsView
   | import("./ai-settings.js").ConnectionTestResult
   | import("./updater.js").UpdateStatus
   | { version: string; file: string }
   | Awaited<ReturnType<typeof import("./ai-settings.js").listConnectionModels>>
   | import("./ai-clients.js").AiClientConnection
+  | { changed: boolean }
   | DesktopCloudStatus
   | import("../cloud/project-connections.js").CloudProjectList
   | import("../cloud/project-connections.js").ProjectConnectionInspection
@@ -305,7 +336,7 @@ export interface DesktopFailure {
   version: 1;
   ok: false;
   error: {
-    code: "invalid-request" | "confirmation-required" | "not-registered" | "not-found" | "stale-review" | "stale-rule" | "busy" | "internal";
+    code: "invalid-request" | "confirmation-required" | "not-registered" | "not-found" | "stale-review" | "stale-rule" | "busy" | "timeout" | "cancelled" | "internal" | "account-already-registered";
     message: string;
   };
 }

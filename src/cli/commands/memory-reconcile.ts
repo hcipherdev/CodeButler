@@ -1,3 +1,4 @@
+import { withAiTrigger } from "../../ai/usage.js";
 import {
   applyMemoryReconciliation,
   planMemoryReconciliation,
@@ -25,14 +26,15 @@ export async function runMemoryReconcileCommand(
     const qualityFilter = parseQualityFilter(value(rest, "--quality"));
     const limitRaw = value(rest, "--limit");
     const limit = limitRaw === undefined ? 20 : limitRaw === "all" ? null : positiveInteger(limitRaw, "--limit");
-    const run = await planMemoryReconciliation(cwd, {
+    // Typed by a person, so a connection limited to work they start may serve it.
+    const run = await withAiTrigger("user", () => planMemoryReconciliation(cwd, {
       queue,
       qualityFilter,
       limit,
       maxRequests: optionalPositiveInteger(rest, "--max-requests"),
       tokenBudget: optionalPositiveInteger(rest, "--token-budget"),
       concurrency: optionalPositiveInteger(rest, "--concurrency")
-    }, { now: options.now });
+    }, { now: options.now }));
     outputRun(run, rest.includes("--json"), stdout);
     return 0;
   }
@@ -47,12 +49,12 @@ export async function runMemoryReconcileCommand(
       values: ["--run"],
       booleans: ["--stale-only", "--retry-failed", "--retry-uncertain", "--json"]
     });
-    const run = await replanMemoryReconciliation(cwd, {
+    const run = await withAiTrigger("user", () => replanMemoryReconciliation(cwd, {
       runId: requiredValue(rest, "--run"),
       staleOnly: rest.includes("--stale-only"),
       retryFailed: rest.includes("--retry-failed"),
       retryUncertain: rest.includes("--retry-uncertain")
-    }, { now: options.now });
+    }, { now: options.now }));
     outputRun(run, rest.includes("--json"), stdout);
     return 0;
   }

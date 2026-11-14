@@ -23,9 +23,12 @@ export function registerSourceToolGroup(
     inputSchema: agentRecordInputSchema.shape
   }, async input => asJsonContent(await handlers.record_rule_attestation(agentRecordInputSchema.parse(input))));
   server.registerTool("current_project", {
-    description: "Report which project-local Code Butler store this MCP server is using.",
-    inputSchema: {}
-  }, async () => asJsonContent(await handlers.current_project()));
+    description: "Report which project-local Code Butler store this MCP server is using. When it reports no project, call it again with projectRoot set to your current working directory.",
+    inputSchema: {
+      projectRoot: z.string().trim().min(1).max(4096).optional()
+        .describe("Absolute path of your current working directory. Only needed when no project is reported.")
+    }
+  }, async ({ projectRoot }) => asJsonContent(await handlers.current_project(projectRoot ? { projectRoot } : {})));
 
   server.registerTool("search_project_memory", {
     description: "Search local project memory. Promoted memories are returned ahead of raw source matches." + SCOPE_GUIDANCE,

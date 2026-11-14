@@ -1,4 +1,5 @@
 import { EncryptionError } from "./crypto-helper.js";
+import { isNetworkUnavailable } from "./network.js";
 import { saveBinding, type Binding } from "./state.js";
 
 export type CloudSyncCondition =
@@ -39,11 +40,7 @@ export function classifyCloudSyncError(error: unknown): ClassifiedCloudSyncError
   if (/checksum|fingerprint mismatch|integrity|corrupt|verification failed|foreign_key_check|quick_check/i.test(message)) {
     return { condition: "integrity-failure", message };
   }
-  const code = (error as { code?: unknown } | null)?.code;
-  if (
-    (typeof code === "string" && ["ECONNRESET", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT", "EAI_AGAIN"].includes(code)) ||
-    /offline|unavailable|network|timed out|timeout|fetch failed/i.test(message)
-  ) {
+  if (isNetworkUnavailable(error) || /offline|unavailable|network|timed out|timeout/i.test(message)) {
     return { condition: "offline-network", message };
   }
   return { condition: "deferred", message };

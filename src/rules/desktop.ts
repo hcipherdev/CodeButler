@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { withAiTrigger } from "../ai/usage.js";
 import { ruleSchema, ruleIdSchema, verificationSchema } from "./format.js";
 import { captureRulesFiles, createRule, deleteRule, listRules, resolveRuleConflict, setRuleEnabled, updateRule, StaleRuleError } from "./store.js";
 import { decodeRulesFiles, stateHash } from "./merge.js";
@@ -34,7 +35,8 @@ export interface RulesDesktopDependencies extends RuleAssistanceDependencies { s
 export async function handleRulesDesktopRequest(request: RulesDesktopRequest, options: RulesDesktopDependencies = {}): Promise<RulesDesktopResult> {
   switch (request.action) {
     case "rules.assistance.status": return ruleAssistanceStatus();
-    case "rules.draft": return draftGlobalRule(request.description, options);
+    // A person asked for this draft, so a connection limited to work they start may serve it.
+    case "rules.draft": return withAiTrigger("user", () => draftGlobalRule(request.description, options));
     case "rules.list": return rulesDesktopList();
     case "rules.create": return createRule(request.input, undefined, request.expectedRevision);
     case "rules.update": {

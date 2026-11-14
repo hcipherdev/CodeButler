@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { globalConfigDir, loadAiBudget } from "../config.js";
@@ -27,11 +27,26 @@ export interface AiUsageSummary {
 }
 
 export const AI_BUDGET_REASON = "Daily AI budget reached; background AI work resumes tomorrow";
+export const AI_PLAN_LIMIT_REASON = "ChatGPT plan usage limit reached; background AI work resumes later";
 const RETAIN_DAYS = 90;
+/** OpenAI says not to guess when a plan limit resets, so background work simply checks again later. */
+const PLAN_PAUSE_MS = 30 * 60_000;
+
+/** Work that waits instead of failing: queued evidence stays queued and nothing is recorded as an error. */
+export class AiPausedError extends Error {}
 
 /** Background work never prompts anyone, so it is the work a daily cap protects. */
-export class AiBudgetExceededError extends Error {
+export class AiBudgetExceededError extends AiPausedError {
   constructor() { super(AI_BUDGET_REASON); this.name = "AiBudgetExceededError"; }
+}
+
+/** The person's ChatGPT plan, or this app's share of it, is used up for now. */
+export class AiPlanLimitError extends AiPausedError {
+  constructor(message = AI_PLAN_LIMIT_REASON) { super(message); this.name = "AiPlanLimitError"; }
+}
+
+export function isAiPauseReason(reason: string | undefined): boolean {
+  return reason === AI_BUDGET_REASON || reason === AI_PLAN_LIMIT_REASON;
 }
 
 const triggerContext = new AsyncLocalStorage<AiTrigger>();
@@ -44,6 +59,11 @@ export function withAiTrigger<T>(trigger: AiTrigger, work: () => T): T {
 /** Watcher passes, and the review they launch, carry the watcher token; everything else was asked for. */
 export function currentAiTrigger(): AiTrigger {
   return triggerContext.getStore() ?? (process.env.CODE_BUTLER_WATCH_TOKEN ? "background" : "user");
+}
+
+/** Only a trigger set with withAiTrigger; the watch-token fallback above does not count. */
+export function explicitAiTrigger(): AiTrigger | undefined {
+  return triggerContext.getStore();
 }
 
 /** CODE_BUTLER_AI_USAGE_DIR lets the test suite keep its calls out of the real ledger. */
@@ -127,12 +147,50 @@ export function aiBudgetExhausted(limit = loadAiBudget(), now = new Date(), dire
   return limit !== null && backgroundTokensToday(now, directory) >= limit;
 }
 
-/** Background work checks this before each model batch, so queued work waits for tomorrow instead of failing. */
-export function backgroundBudgetPaused(): boolean {
-  return currentAiTrigger() === "background" && aiBudgetExhausted();
+type PausedModel = { connectionId?: string | undefined } | undefined;
+
+function planPauseFile(directory: string): string { return join(directory, "plan-pauses.json"); }
+
+function readPlanPauses(directory: string): Record<string, string> {
+  try {
+    const value = JSON.parse(readFileSync(planPauseFile(directory), "utf8")) as unknown;
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, string> : {};
+  } catch { return {}; }
 }
 
-/** Throws before a background call once today's allowance is used; user-started calls always run. */
-export function assertAiBudget(trigger = currentAiTrigger()): void {
-  if (trigger === "background" && aiBudgetExhausted()) throw new AiBudgetExceededError();
+/** Background calls on this connection wait a while after the plan reported its limit. */
+export function recordPlanPause(connectionId: string, now = new Date(), directory = usageDirectory()): void {
+  try {
+    const pauses = readPlanPauses(directory);
+    for (const [id, until] of Object.entries(pauses)) if (!(Date.parse(until) > now.getTime())) delete pauses[id];
+    pauses[connectionId] = new Date(now.getTime() + PLAN_PAUSE_MS).toISOString();
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(planPauseFile(directory), `${JSON.stringify(pauses)}\n`, { mode: 0o600 });
+  } catch { /* A missed pause only means one more refused call. */ }
+}
+
+export function planPaused(connectionId: string | undefined, now = new Date(), directory = usageDirectory()): boolean {
+  if (!connectionId) return false;
+  const until = readPlanPauses(directory)[connectionId];
+  return until !== undefined && Date.parse(until) > now.getTime();
+}
+
+/** Why background work on this model should wait, or undefined when it may run. */
+export function backgroundPauseReason(model?: PausedModel): string | undefined {
+  if (currentAiTrigger() !== "background") return undefined;
+  if (aiBudgetExhausted()) return AI_BUDGET_REASON;
+  if (planPaused(model?.connectionId)) return AI_PLAN_LIMIT_REASON;
+  return undefined;
+}
+
+/** Background work checks this before each model batch, so queued work waits instead of failing. */
+export function backgroundBudgetPaused(model?: PausedModel): boolean {
+  return backgroundPauseReason(model) !== undefined;
+}
+
+/** Throws before a background call once today's allowance or the plan is used up; user-started calls always run. */
+export function assertAiBudget(trigger = currentAiTrigger(), model?: PausedModel): void {
+  if (trigger !== "background") return;
+  if (aiBudgetExhausted()) throw new AiBudgetExceededError();
+  if (planPaused(model?.connectionId)) throw new AiPlanLimitError();
 }

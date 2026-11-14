@@ -15,7 +15,9 @@ import { loadProjectConfig } from "../config.js";
 import { findPublishedMemories, searchPublishedMemory } from "./search.js";
 import { memoryHistory, memoryMovement, type KnowledgeSnapshot } from "../memory/events.js";
 import { readHandbook, readHandbookTopic } from "../memory/topics.js";
+import { assertMcpProjectAvailable, automaticProjectInitializationEnabled } from "../mcp/project-binding.js";
 export async function createPublishedMemoryServer(root: string, options: ProjectMemoryServerOptions): Promise<ProjectMemoryServer> {
+    assertMcpProjectAvailable(root, options.autoInit);
     (await import("../rules/identity.js")).assertOrdinaryProject(root);
     const server = new McpServer({ name: "project-memory", version: "1.0.0" }, { instructions: GLOBAL_RULES_INSTRUCTIONS });
     let closing = false;
@@ -60,7 +62,7 @@ export async function createPublishedMemoryServer(root: string, options: Project
         }
         if (name === "summarize_memory_health")
             return withPublishedIndex(root, () => ({ ...readPublishedHealth(root) as object, freshness: readPublishedSummary(root).freshness }));
-        const result = await callCanonicalTool(root, name, input, server.server.getClientVersion());
+        const result = await callCanonicalTool(root, name, input, options.clientInfo ? options.clientInfo() : server.server.getClientVersion());
         if (name === "sync_project_memory" || /^(remember_|update_|resolve_|apply_|revert_|delete_|prune_|refresh_)/.test(name))
             await requestRetrievalRefresh(root, true);
         return result;
@@ -75,7 +77,7 @@ export async function createPublishedMemoryServer(root: string, options: Project
         } });
     registerProjectMemoryHandlers(server, handlers);
     const startup = async () => {
-        if (options.autoInit !== false) {
+        if (automaticProjectInitializationEnabled(options.autoInit)) {
             try {
                 await callCanonicalTool(root, "__project_setup", {});
                 console.error(`Code Butler project setup ${readProjectSetupStatus(root).status}: ${root}`);
@@ -84,14 +86,14 @@ export async function createPublishedMemoryServer(root: string, options: Project
         if (closing) return;
         try { await requestRetrievalRefresh(root, true, loadProjectConfig(root).sync.autoSyncOnServerStart); }
         finally {
-            if (!closing && options.autoInit !== false && readProjectSetupStatus(root).status === "ready") {
+            if (!closing && automaticProjectInitializationEnabled(options.autoInit) && readProjectSetupStatus(root).status === "ready") {
                 enrich();
                 if (!enrichmentTimer) { enrichmentTimer = setInterval(enrich, 60_000); enrichmentTimer.unref(); }
             }
         }
     };
     if (!options.deferStartupSync) await startup();
-    return { server, cloudManaged: true,
+    return { server, handlers, cloudManaged: true,
         // Legacy programmatic inspection is explicit; normal MCP reads never access this getter.
         get store() { if (!inspectionStore) {
             inspectionStore = openConfiguredMemoryStore(root);

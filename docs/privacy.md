@@ -30,10 +30,10 @@ Unsafe regular expressions are rejected when configuration loads. Code Butler ne
 LLM extraction, investigation, review and summary enrichment send redacted coding-agent transcripts, commit messages and diffs to a model provider. Code Butler does this only for a provider you chose:
 
 - a connection saved in the desktop app's AI models settings;
-- an `extractor`, `investigator` or profile block you wrote in a Code Butler config file;
+- an `extractor`, `investigator` or profile block you wrote in a Code Butler config file (a repository's own `.code-butler/` settings count once you approve them; see below);
 - a local server (`localhost` or a loopback address), which needs no opt-in.
 
-The built-in default (OpenAI, using `OPENAI_API_KEY`) stays off when its key merely sits in your shell environment, even though many developers export that variable for other tools. Putting the key in Code Butler's own `.env` file counts as choosing it. To allow the default for one project on this device:
+The built-in default (OpenAI, using `OPENAI_API_KEY`) stays off when its key merely sits in your shell environment, even though many developers export that variable for other tools. Putting the key in Code Butler's own `.env` file (the global one, or an approved project one) counts as choosing it. To allow the default for one project on this device:
 
 ```bash
 code-butler config remote-models on    # or: code-butler init --allow-remote-models
@@ -44,6 +44,30 @@ code-butler config remote-models status
 The choice is stored as `privacy.allowRemoteModels` in `.code-butler/config.local.json`, which is never synced. `code-butler init` asks on a terminal; MCP auto-setup and the background watcher never turn it on. `code-butler doctor` reports when the default model is waiting for this opt-in. Projects where extraction already ran on this device before the opt-in existed are recorded as opted in once, on their next sync.
 
 Deterministic directives, manual decisions, Git and log import, and search work without any model.
+
+## Repository settings need approval
+
+Anyone who can commit to a repository can also commit its `.code-butler/` folder, including `config.local.json` and `.env`. Code Butler sets itself up in any repository an agent opens, so it treats these settings as the repository author's rather than yours until you approve them on this device:
+
+- `extractor` and `investigator` connection fields (`provider`, `baseUrl`, `apiKeyEnv`, `workspaceIdEnv`, `regionEnv`, `cliPath`, and the other connection fields). Choosing a `profile` or `model` needs no approval.
+- `embeddings.provider`, `embeddings.baseUrl` and `embeddings.apiKeyEnv`;
+- `privacy.allowRemoteModels: true` and `privacy.allowRemoteEmbeddings: true`. Turning either off needs no approval.
+- `sources.git.repoPath` outside the project, `sources.codex.roots` / `sources.claude.roots` beyond the default log folders, and `projectOnly: false`;
+- `globalRules.enabled: false` and `globalRules.exclude`;
+- the project `.env` file.
+
+Until you approve them, Code Butler ignores these settings and uses your global configuration. In the desktop app, the project overview shows a **Project settings need your approval** card. **Review settings** lists every setting with its value; the `.env` file is listed by key names only. **Approve on this device** applies exactly what is listed. If the files change while the dialog is open, it asks you to review again.
+
+Adding a project in the desktop app, or running `code-butler init`, also says when a repository arrives with settings that need approval. `code-butler doctor`, `current_project` and `summarize_project_brief` report what is being ignored. From a terminal:
+
+```bash
+code-butler config trust status    # lists each setting; .env shows names only
+code-butler config trust approve
+```
+
+The approval is stored in `~/.config/code-butler/trusted-projects/` as a hash, so any later change, including one pulled from Git, needs approving again. Code Butler's own writes, such as `config remote-models on`, keep an approved project approved. Projects registered with the background watcher before this release are approved as they are, once.
+
+Even in an approved project, Code Butler reads from the project `.env` only the key names that project's models use. It never sets anything in the process environment, and it always ignores names that change how programs run (`CODE_BUTLER_*`, `GIT_*`, `NODE_*`, `PATH`, `LD_*`, `DYLD_*`, proxy and certificate variables, and similar).
 
 ## Administrative commands
 

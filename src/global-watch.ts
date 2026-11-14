@@ -1,18 +1,21 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { existsSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { globalConfigDir } from "./config.js";
+import { DEFAULT_LOG_RETENTION, globalConfigDir } from "./config.js";
 import { assertOrdinaryProject, globalRulesRoot, isGlobalRulesRoot } from "./rules/identity.js";
 import { watcherOwnsProjectGate, withProjectGate } from "./cloud/gate.js";
 import { activeForegroundIntent } from "./cloud/foreground.js";
 import { localCloudChangeStamp } from "./cloud/client.js";
 import { secretBinding } from "./secrets/state.js";
+import { secretFolderStamp } from "./secrets/files.js";
 import { pruneEncryptedCaches } from "./cloud/encrypted-coordinator.js";
 import { NativeSecurity } from "./cloud/native-security.js";
 import { automaticSyncQueue, automaticSyncStatus, requestAutomaticSyncIfAbsent, requestLocalChangeSync } from "./cloud/sync-owner.js";
-import { atomicJson, binding, canonicalRoot, readJson, sha256, stateDirectory } from "./cloud/state.js";
+import { atomicJson, binding, canonicalRoot, defaultCloudServer, readJson, sha256, stateDirectory } from "./cloud/state.js";
+import { GLOBAL_WATCH_LOG_NAMES, runLogDirectoryMaintenance } from "./maintenance/artifacts.js";
 import { newRuntimeRecord, processIsLive, registerRuntime, type BuildInfo, type RuntimeRecord } from "./runtime.js";
 import { errorOutcome, type OperationOutcome, type OperationStage } from "./cloud/outcome.js";
 import { migrateRegisteredCheckouts } from "./cloud/checkout-repair.js";
@@ -20,10 +23,46 @@ import { checkoutNeedsRepair } from "./cloud/checkout-path.js";
 import { readSyncProgress } from "./cloud/sync-progress.js";
 
 export interface WatchedProject { root: string; registeredAt: string; previousRoots?: string[]; cloud?: { server: string; vaultId: string; projectId: string; projectIdentity?: string } }
-export interface WatchPassResult extends OperationOutcome { stages?: Partial<Record<OperationStage, OperationOutcome>> }
+/**
+ * `secretsIdle` reports a secrets check that found nothing to sync, and `ingestionIdle` a memory
+ * pass that found nothing new; either lets the next one of its kind wait longer.
+ */
+export interface WatchPassResult extends OperationOutcome { stages?: Partial<Record<OperationStage, OperationOutcome>>; secretsIdle?: true; ingestionIdle?: true }
 export interface WatchRunStatus { root: string; checkedAt: string; ok: boolean; error?: string; outcome?: OperationOutcome["outcome"]; stage?: OperationStage; lastSuccessAt?: string; stages?: WatchPassResult["stages"]; retryCount?: number; nextRetryAt?: number }
 export type WatchJobKind = "full" | "cloud";
 const MAX_PROJECT_WORKERS = 2;
+/** While offline, the network is checked after this long, doubling up to the cap. */
+const OFFLINE_FIRST_PROBE_MS = 30_000;
+const OFFLINE_MAX_PROBE_MS = 10 * 60_000;
+const LOG_MAINTENANCE_MS = 60 * 60_000;
+/** Secrets and remote memory are checked a minute after a change, then less often while nothing changes, up to the cap. */
+const QUIET_DELAY_MS = 60_000;
+const QUIET_MAX_DELAY_MS = 5 * 60_000;
+function secretsEnabled(root: string): boolean {
+  try { return !!secretBinding(root)?.enabled; } catch { return false; }
+}
+/** Memory passes that find nothing new stretch from the watch interval up to this. */
+const IDLE_FULL_MAX_DELAY_MS = 5 * 60_000;
+/**
+ * The wait before the next check: the base after a change or failure, doubling while checks
+ * find nothing, up to the cap. Cloud checks start at a minute; memory passes at the interval.
+ */
+export function nextQuietDelay(previousMs: number | undefined, idle: boolean, baseMs = QUIET_DELAY_MS, maxMs = QUIET_MAX_DELAY_MS): number {
+  // A base above the cap (a long --interval) is never shortened by going quiet.
+  return idle ? Math.min(Math.max(maxMs, baseMs), (previousMs ?? baseMs) * 2) : baseMs;
+}
+/** What a memory sync changed, if anything: a pull moves the revision, a publish moves both. */
+export function cloudActivityMarker(root: string): string | undefined {
+  try { const cloud = binding(root); return cloud?.enabled ? `${cloud.revision}:${cloud.lastPublishedAt ?? ""}` : undefined; }
+  catch { return undefined; }
+}
+/** Whether `secrets/` changed since the last full sync recorded it; unknown counts as unchanged, as the schedule handles that. */
+export function secretsChangedLocally(root: string): boolean {
+  try {
+    const secrets = secretBinding(root);
+    return !!secrets?.enabled && !!secrets.idleCheck && secretFolderStamp(root) !== secrets.idleCheck.localStamp;
+  } catch { return false; }
+}
 export const globalWatchDirectory = (): string => join(globalConfigDir(), "watch");
 const projectDirectory = (): string => join(globalWatchDirectory(), "projects");
 const projectKey = (root: string): string => sha256(root);
@@ -82,6 +121,16 @@ export function listWatchedProjects(): WatchedProject[] {
       try { return [{ ...record, root: canonicalRoot(record.root) }]; } catch { return [record]; }
     } catch { return []; }
   }).sort((a, b) => a.root.localeCompare(b.root)).filter((record,index,records)=>records.findIndex(candidate=>candidate.root===record.root)===index);
+}
+
+/** Whether a live global watcher has this project registered, so it already syncs it every few minutes. */
+export function globalWatcherManages(root: string): boolean {
+  try {
+    const runner = readJson<RuntimeRecord>(join(globalWatchDirectory(), "runner.json"));
+    if (!runner || !Number.isInteger(runner.pid) || !processIsLive(runner)) return false;
+    const canonical = canonicalRoot(root);
+    return listWatchedProjects().some(project => project.root === canonical);
+  } catch { return false; }
 }
 
 export function globalWatchStatus(): { running: boolean; pid?: number; build?: BuildInfo; projects: (WatchedProject & { lastRun?: WatchRunStatus; lastCloudRun?: WatchRunStatus })[] } {
@@ -154,6 +203,26 @@ export interface GlobalWatchOptions {
   signal?: AbortSignal;
   log?: (line: string) => void;
   runProject?: (root: string, kind: WatchJobKind) => Promise<void | WatchPassResult>;
+  /** Whether `host` resolves again after a pass found no network; a DNS lookup by default. */
+  probeNetwork?: (host: string) => Promise<boolean>;
+  /** First wait before checking the network again; tests shorten it. */
+  offlineProbeMs?: number;
+}
+
+async function hostResolves(host: string): Promise<boolean> {
+  try {
+    await Promise.race([lookup(host), delay(5000, undefined, { ref: false }).then(() => { throw new Error("DNS lookup timed out"); })]);
+    return true;
+  } catch { return false; }
+}
+
+/** The cloud server a registered project syncs with, which is what the watcher needs to reach. */
+function networkProbeHost(roots: readonly string[]): string {
+  for (const root of roots) {
+    try { const cloud = binding(root); if (cloud?.enabled) return new URL(cloud.server).hostname; }
+    catch { /* An unreadable binding falls through to the next project. */ }
+  }
+  return new URL(defaultCloudServer()).hostname;
 }
 
 /** One process across all sessions; children isolate project env/provider credentials. */
@@ -163,8 +232,6 @@ export async function runGlobalWatch(options: GlobalWatchOptions): Promise<void>
   const directory = globalWatchDirectory();
   mkdirSync(directory, { recursive: true });
   await withProjectGate(directory, async () => {
-    migrateRegisteredCheckouts();
-    for (const project of listWatchedProjects()) if (existsSync(join(project.root, ".code-butler", "config.json")) && !checkoutNeedsRepair(project.root)) registerWatchedProject(project.root);
     const runnerPath = join(directory, "runner.json");
     const runtime = newRuntimeRecord("watcher");
     const token = runtime.token;
@@ -174,10 +241,21 @@ export async function runGlobalWatch(options: GlobalWatchOptions): Promise<void>
     const childOptions = { ...options, signal, runnerToken: token };
     const retries = new Map<string, { count: number; nextAt: number; failedAt: number }>();
     const nextFullAt = new Map<string, number>();
+    // How long the next memory pass waits: the interval after activity, stretching while passes find nothing.
+    const fullDelay = new Map<string, number>();
     const nextCloudCheckAt = new Map<string, number>();
     const nextSecretsRunAt = new Map<string, number>();
+    // How long the next secrets check waits: a minute after a change, stretching while checks find nothing.
+    const secretsDelay = new Map<string, number>();
+    // The same for checking other devices' memory: a remote check that pulled and published nothing stretches it.
+    const remoteDelay = new Map<string, number>();
+    const nextRemoteCheckAt = new Map<string, number>();
     const cacheChecked = new Set<string>();
     let nextAutomaticSetupAt = 0;
+    let nextLogMaintenanceAt = 0;
+    // Set when a pass could not reach the network at all; cloud jobs wait for one cheap check to pass instead of each retrying.
+    let offline: { since: number; nextProbeAt: number; probes: number } | undefined;
+    const firstProbeMs = options.offlineProbeMs ?? OFFLINE_FIRST_PROBE_MS;
     const onceRoots = options.once ? listWatchedProjects().map(project => project.root) : [];
     const completedOnce = new Set<string>();
     const active = new Map<string, { kind: WatchJobKind; promise: Promise<void> }>();
@@ -188,27 +266,43 @@ export async function runGlobalWatch(options: GlobalWatchOptions): Promise<void>
       } catch { /* Retry a temporarily unreadable stop request on the next tick. */ }
     }, 1000);
     try {
+      const activationPath = join(directory, "runtime-activation.json");
+      while (!signal.aborted && readJson<{ buildId: string }>(activationPath)?.buildId === runtime.build.buildId) {
+        await delay(250);
+      }
+      if (signal.aborted) return;
+      migrateRegisteredCheckouts();
+      for (const project of listWatchedProjects()) if (existsSync(join(project.root, ".code-butler", "config.json")) && !checkoutNeedsRepair(project.root)) registerWatchedProject(project.root);
       const launch = (root: string, kind: WatchJobKind): void => {
-        if (kind === "cloud" && secretBinding(root)?.enabled) nextSecretsRunAt.set(root, Date.now() + 60_000);
+        if (kind === "cloud" && secretsEnabled(root)) nextSecretsRunAt.set(root, Date.now() + QUIET_DELAY_MS);
         const promise = (async () => {
           const statusPath = join(directory, kind === "cloud" ? "cloud-status" : "status", `${projectKey(root)}.json`);
           const previous = readJson<WatchRunStatus>(statusPath);
           const lastSuccessAt = previous?.lastSuccessAt ?? (previous?.ok ? previous.checkedAt : undefined);
           const status: WatchRunStatus = { root, checkedAt: new Date().toISOString(), ok: false, ...(lastSuccessAt ? { lastSuccessAt } : {}) };
+          let network = false, secretsIdle = false, ingestionIdle = false;
+          const cloudBefore = kind === "cloud" ? cloudActivityMarker(root) : undefined;
           try {
             if (!existsSync(join(root, ".code-butler", "config.json"))) throw new Error("Project is unavailable or no longer initialized");
             const result = await (options.runProject ?? ((project, job) => runProjectChild(project, job, childOptions)))(root, kind);
             status.outcome = result?.outcome ?? "success";
             status.ok = status.outcome === "success";
-            if (result) { status.stage = result.stage; if (result.reason) status.error = result.reason; if (result.stages) status.stages = result.stages; }
+            if (result) { status.stage = result.stage; if (result.reason) status.error = result.reason; if (result.stages) status.stages = result.stages; network = !!result.network; secretsIdle = !!result.secretsIdle; ingestionIdle = !!result.ingestionIdle; }
           } catch (error) {
             const result = errorOutcome(error, "watcher");
-            status.outcome = result.outcome; status.stage = result.stage; status.error = result.reason!;
+            status.outcome = result.outcome; status.stage = result.stage; status.error = result.reason!; network = !!result.network;
           }
           status.checkedAt = new Date().toISOString();
           if (status.ok) status.lastSuccessAt = status.checkedAt;
           const retryKey = `${kind}:${root}`;
-          if (status.outcome === "deferred" || status.outcome === "failed" && kind === "cloud") {
+          if (network && !status.ok) {
+            // No per-project backoff: the shared offline state holds cloud jobs until the network is back.
+            retries.delete(retryKey);
+            if (!offline) {
+              offline = { since: Date.now(), nextProbeAt: Date.now() + firstProbeMs, probes: 0 };
+              options.log?.(`${status.checkedAt} Network unavailable (${status.error}); pausing cloud sync for all projects`);
+            }
+          } else if (status.outcome === "deferred" || status.outcome === "failed" && kind === "cloud") {
             const count = (retries.get(retryKey)?.count ?? 0) + 1;
             const base = status.outcome === "deferred" ? 2000 : 10000;
             const limit = status.outcome === "deferred" ? 60000 : 300000;
@@ -216,10 +310,27 @@ export async function runGlobalWatch(options: GlobalWatchOptions): Promise<void>
             retries.set(retryKey, { count, nextAt, failedAt: Date.now() });
             status.retryCount = count; status.nextRetryAt = nextAt;
           } else retries.delete(retryKey);
-          if (kind === "full") nextFullAt.set(root, Date.now() + interval * 1000);
+          if (kind === "full") {
+            // A pass that found nothing new waits longer, up to five minutes; anything else resets to the interval.
+            const delay = nextQuietDelay(fullDelay.get(root), status.ok && ingestionIdle, interval * 1000, IDLE_FULL_MAX_DELAY_MS);
+            fullDelay.set(root, delay);
+            nextFullAt.set(root, Date.now() + delay);
+          }
+          if (kind === "cloud" && secretsEnabled(root)) {
+            const delay = nextQuietDelay(secretsDelay.get(root), secretsIdle);
+            secretsDelay.set(root, delay);
+            nextSecretsRunAt.set(root, Date.now() + delay);
+          }
+          if (cloudBefore !== undefined) {
+            const delay = nextQuietDelay(remoteDelay.get(root), status.ok && cloudActivityMarker(root) === cloudBefore);
+            remoteDelay.set(root, delay);
+            nextRemoteCheckAt.set(root, Date.now() + delay);
+          }
           if (options.once) completedOnce.add(root);
           atomicJson(statusPath, status);
-          options.log?.(`${status.checkedAt} ${root} (${kind}): ${status.ok ? "updated" : status.error}`);
+          // The status file still records every pass; the log skips a failure that only repeats the last one.
+          const repeated = !status.ok && previous?.ok === false && previous.error === status.error;
+          if (!(network && !status.ok) && !repeated) options.log?.(`${status.checkedAt} ${root} (${kind}): ${status.ok ? kind === "full" && ingestionIdle ? "unchanged" : "updated" : status.error}`);
         })().finally(() => { active.delete(root); });
         active.set(root, { kind, promise });
       };
@@ -234,10 +345,31 @@ export async function runGlobalWatch(options: GlobalWatchOptions): Promise<void>
         const roots = options.once ? onceRoots : listWatchedProjects().map(project => project.root);
         const rulesRoot = globalRulesRoot();
         if (!options.once && existsSync(rulesRoot) && binding(rulesRoot)?.enabled) roots.push(rulesRoot);
+        if (Date.now() >= nextLogMaintenanceAt) {
+          nextLogMaintenanceAt = Date.now() + LOG_MAINTENANCE_MS;
+          try {
+            const pruned = runLogDirectoryMaintenance(join(directory, "logs"), GLOBAL_WATCH_LOG_NAMES, DEFAULT_LOG_RETENTION, { apply: true });
+            if (pruned.rotated || pruned.removed) options.log?.(`${new Date().toISOString()} Rotated watcher logs (rotated=${pruned.rotated}, removed=${pruned.removed})`);
+          } catch { /* Log upkeep retries within the hour's next check. */ }
+        }
+        if (offline && Date.now() >= offline.nextProbeAt) {
+          if (await (options.probeNetwork ?? hostResolves)(networkProbeHost(roots))) {
+            const minutes = Math.max(1, Math.round((Date.now() - offline.since) / 60_000));
+            options.log?.(`${new Date().toISOString()} Network back after ${minutes} min; resuming cloud sync`);
+            offline = undefined;
+            for (const key of [...retries.keys()]) if (key.startsWith("cloud:")) retries.delete(key);
+            nextCloudCheckAt.clear(); nextRemoteCheckAt.clear();
+          } else {
+            offline.probes += 1;
+            offline.nextProbeAt = Date.now() + Math.min(OFFLINE_MAX_PROBE_MS, firstProbeMs * 2 ** offline.probes);
+          }
+        }
         const now = Date.now();
         if (!options.once) for (const root of roots) {
           if ((nextCloudCheckAt.get(root) ?? 0) > now) continue;
           nextCloudCheckAt.set(root, now + 60_000);
+          // A local edit to secrets/ is due now, however long the quiet checks have stretched.
+          if (secretsChangedLocally(root)) { nextSecretsRunAt.set(root, 0); secretsDelay.delete(root); }
           try {
             const cloud = binding(root);
             if (!cloud?.enabled || checkoutNeedsRepair(root)) continue;
@@ -249,7 +381,8 @@ export async function runGlobalWatch(options: GlobalWatchOptions): Promise<void>
             const completed = automaticSyncStatus(root);
             // Local changes wait out the publish interval; a remote check meanwhile would publish them anyway.
             if (completed.lastLocalStamp !== localCloudChangeStamp(root)) requestLocalChangeSync(root);
-            else if (!automaticSyncQueue(root).pending) requestAutomaticSyncIfAbsent(root, "remote"); // Check for remote revisions.
+            // Check for remote revisions, less often while recent checks found none.
+            else if (!automaticSyncQueue(root).pending && (nextRemoteCheckAt.get(root) ?? 0) <= now) requestAutomaticSyncIfAbsent(root, "remote");
           } catch { /* A later sweep retries unavailable projects. */ }
         }
         while (active.size < MAX_PROJECT_WORKERS && !signal.aborted) {
@@ -265,7 +398,7 @@ export async function runGlobalWatch(options: GlobalWatchOptions): Promise<void>
             if (retry && kind === "cloud" && cloudRecoveredSince(root, retry.failedAt, saved)) { retries.delete(key); return 0; }
             return retry?.nextAt ?? 0;
           };
-          const urgent = options.once ? [] : available.flatMap(root => {
+          const urgent = options.once || offline ? [] : available.flatMap(root => {
             if (!existsSync(join(root, ".code-butler", "config.json")) || retryAt(root, "cloud") > now || checkoutNeedsRepair(root)) return [];
             const queue = automaticSyncQueue(root);
             const secretsDue = secretBinding(root)?.enabled && (nextSecretsRunAt.get(root) ?? 0) <= now;
@@ -297,13 +430,33 @@ const PROJECT_WATCH_IDLE_MS = 10 * 60 * 1000;
 /** Even while reporting progress (a large merge or upload), a pass is stopped after this long. */
 const PROJECT_WATCH_MAX_MS = 60 * 60 * 1000;
 const PROJECT_WATCH_RECHECK_MS = 60 * 1000;
+/** A gap this long between heartbeats means the event loop could not run: the machine slept. */
+const SLEEP_GAP_MS = 30 * 1000;
+
+/**
+ * Notices time a pass spent frozen by sleep, so waking from a Power Nap does not look like a
+ * stuck pass. Node's timers and monotonic clock on macOS keep counting during sleep, so the
+ * only reliable sign is a heartbeat that could not run on time.
+ */
+export class SleepTracker {
+  sleptMs = 0;
+  resumedAt: number | undefined;
+  constructor(private last: number) {}
+  observe(now: number): void {
+    const gap = now - this.last;
+    this.last = now;
+    if (gap > SLEEP_GAP_MS) { this.sleptMs += gap; this.resumedAt = now; }
+  }
+}
+
 /**
  * Whether a project pass should be stopped. Progress counts only once written after the pass
  * began, so a report left behind by an earlier, stopped worker cannot keep a stuck one alive.
+ * Time asleep counts toward neither limit, and waking gives the pass a fresh idle window.
  */
-export function projectWatchExpired(startedAt: number, progressAt: number | undefined, now: number): boolean {
-  if (now - startedAt >= PROJECT_WATCH_MAX_MS) return true;
-  return now - Math.max(startedAt, progressAt ?? 0) >= PROJECT_WATCH_IDLE_MS;
+export function projectWatchExpired(startedAt: number, progressAt: number | undefined, now: number, sleep: { sleptMs: number; resumedAt?: number | undefined } = { sleptMs: 0 }): boolean {
+  if (now - startedAt - sleep.sleptMs >= PROJECT_WATCH_MAX_MS) return true;
+  return now - Math.max(startedAt, progressAt ?? 0, sleep.resumedAt ?? 0) >= PROJECT_WATCH_IDLE_MS;
 }
 
 function runProjectChild(root: string, kind: WatchJobKind, options: GlobalWatchOptions & { runnerToken: string }): Promise<WatchPassResult> {
@@ -323,13 +476,18 @@ function runProjectChild(root: string, kind: WatchJobKind, options: GlobalWatchO
     let forceStop: ReturnType<typeof setTimeout> | undefined;
     // A cloud sync that keeps reporting progress is not stuck: stopping it mid-upload wastes the transfer.
     const startedAt = Date.now();
+    const sleep = new SleepTracker(startedAt);
     const expire = () => {
+      const now = Date.now();
+      // Timers due during sleep fire right after waking, possibly before the heartbeat below.
+      sleep.observe(now);
       const progress = readSyncProgress(root), progressAt = progress ? Date.parse(progress.updatedAt) : undefined;
-      if (projectWatchExpired(startedAt, Number.isFinite(progressAt) ? progressAt : undefined, Date.now())) { timedOut = true; child.kill(); }
+      if (projectWatchExpired(startedAt, Number.isFinite(progressAt) ? progressAt : undefined, now, sleep)) { timedOut = true; child.kill(); }
       else timer = setTimeout(expire, PROJECT_WATCH_RECHECK_MS);
     };
     let timer = setTimeout(expire, PROJECT_WATCH_IDLE_MS);
     const foregroundCheck = setInterval(() => {
+      sleep.observe(Date.now());
       if (preempted || !child.pid) return;
       const intent = activeForegroundIntent(root);
       if (!intent || Date.now() - intent.requestedAt < 120_000) return;

@@ -4,7 +4,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ensureProjectConfig, loadProjectConfig } from "../../src/config.js";
+import { ensureProjectConfig, loadProjectConfig, trustProjectSettings } from "../../src/config.js";
 import { readExtractedMemories } from "../../src/extract/parse.js";
 import { runExtractionCommand } from "../../src/cli/commands/extraction.js";
 import { openMemoryStore, type MemoryStore } from "../../src/storage/store.js";
@@ -61,6 +61,7 @@ function fixture(extraction: Record<string, number> = {}, messages = 3): Fixture
     extractor: { provider: "openai-compatible", baseUrl: "https://example.test/v1", model: "test", apiKeyEnv: "TEST_API_KEY" },
     extraction
   }));
+  trustProjectSettings(root);
   return { root, repo, log };
 }
 

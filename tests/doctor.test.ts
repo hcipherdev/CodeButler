@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { trustProjectSettings } from "../src/config.js";
 import { runDoctor } from "../src/doctor/service.js";
 import { openMemoryStore } from "../src/storage/store.js";
 import { createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey, encodeFloat32Vector } from "../src/embeddings/fingerprint.js";
@@ -80,6 +81,8 @@ describe("doctor service", () => {
         2
       )
     );
+    // The owner of this device wrote these provider settings.
+    trustProjectSettings(rootDir);
   }
 
   function writeFreshSummary(rootDir: string): void {
@@ -430,6 +433,7 @@ describe("doctor service", () => {
         investigator: { enabled: true, mode: "native-rlm", provider: "openai-compatible", baseUrl: "https://example.test/v1", model: "gpt-test", apiKeyEnv: "TEST_CODE_BUTLER_API_KEY" }
       })
     );
+    trustProjectSettings(rootDir);
     writeFreshSummary(rootDir);
     const store = openMemoryStore(rootDir);
     store.init();

@@ -20,6 +20,7 @@ import { withProjectGate } from "./gate.js";
 import { assertCheckoutReady } from "./checkout-path.js";
 import { adoptNewerNarrative } from "../project-summary/service.js";
 import { DatabaseSync } from "node:sqlite";
+import { readSharedChangeSignal } from "../storage/shared-changes.js";
 import { rmSync, writeFileSync } from "node:fs";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { z } from "zod";
@@ -47,7 +48,7 @@ import {
 import { atomicJson, atomicWrite, binding, connection, ensureCheckoutId, saveBinding, sha256, stateDirectory, type Binding, type Connection } from "./state.js";
 import { EncryptionError } from "./crypto-helper.js";
 import { AutomaticSyncOwner, requestAutomaticSync } from "./sync-owner.js";
-import { errorOutcome, type OperationOutcome } from "./outcome.js";
+import { errorOutcome, OperationDeferredError, type OperationOutcome } from "./outcome.js";
 import { recordCloudSyncError } from "./condition.js";
 import type { RuntimeRecord } from "../runtime.js";
 
@@ -131,8 +132,15 @@ export async function responseBytes(response: Response, limit = MAX_COMPRESSED):
   for await (const chunk of response.body) { size += chunk.length; if (size > limit) throw new Error("Cloud snapshot too large"); chunks.push(Buffer.from(chunk)); }
   return Buffer.concat(chunks);
 }
-export async function projectOperation<T>(root: string, work: () => T | Promise<T>, options: { waitMs?: number; name?: string } = {}): Promise<T> {
-  return withProjectGate(root, async () => { recoverApply(root); return work(); }, { name: "Project database operation", ...options });
+export async function projectOperation<T>(root: string, work: () => T | Promise<T>, options: { waitMs?: number; name?: string; background?: boolean; skipIfBusy?: boolean } = {}): Promise<T> {
+  return withProjectGate(root, async () => {
+    // Opportunistic reads have a short deadline. Leave any interrupted restore to a full operation.
+    if (options.skipIfBusy && existsSync(join(stateDirectory(root), "apply-journal.json"))) {
+      throw new OperationDeferredError("Project snapshot recovery is pending; the memory reader is busy");
+    }
+    recoverApply(root);
+    return work();
+  }, { name: "Project database operation", ...options });
 }
 function ensureDatabase(root: string): void { const store = openConfiguredMemoryStore(root); try { store.init(); } finally { store.close(); } }
 /** Reading config must never break sync: an unreadable file falls back to the default. */
@@ -549,12 +557,28 @@ export async function syncQuietly(root: string, warn: (line: string) => void = c
   try { const state = await cloudSync(root); if (state?.status === "conflict") warn(conflictMessage(state)); }
   catch (error) { warn(error instanceof Error ? error.message : "Cloud sync deferred"); }
 }
+/** The database's shared-write count, read without the store; undefined falls back to file times. */
+function sharedChangeSignal(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  let db: DatabaseSync | undefined;
+  try { db = new DatabaseSync(path, { readOnly: true }); return readSharedChangeSignal(db); }
+  catch { return undefined; }
+  finally { try { db?.close(); } catch { /* A failed close leaves nothing to keep. */ } }
+}
+/**
+ * Whether the project changed since a sync, as a stamp to compare. The database counts only
+ * writes a snapshot carries, so a watcher pass that records its last-synced time is no change;
+ * other project files count by size and time. A database without the counter falls back to
+ * its file times, which may queue a sync for nothing but never misses one.
+ */
 export function localCloudChangeStamp(root: string): string {
   const base = join(root, ".code-butler");
+  const shared = sharedChangeSignal(join(base, "memory.sqlite"));
   function scan(dir: string, prefix = ""): string[] {
     if (!existsSync(dir)) return [];
     return readdirSync(dir).sort().flatMap(name => {
       const path = prefix ? `${prefix}/${name}` : name;
+      if (shared && (path === "memory.sqlite" || path === "memory.sqlite-wal")) return [];
       // Include WAL as a change signal, although it never travels in snapshots.
       if (excluded(path) && path !== "memory.sqlite-wal") return [];
       // A WAL or shm file can vanish between readdir and lstat when its store closes; absent is no change.
@@ -567,7 +591,7 @@ export function localCloudChangeStamp(root: string): string {
       return stat.isDirectory() ? scan(join(dir, name), path) : [`${path}:${stat.size}:${stat.mtimeMs}`];
     });
   }
-  return sha256(scan(base).join("\n"));
+  return sha256([...(shared ? [`memory.sqlite:${shared}`] : []), ...scan(base)].join("\n"));
 }
 export interface CloudScheduler {
   (): Promise<void>;

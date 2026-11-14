@@ -63,22 +63,23 @@ function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
-interface AsyncGateHold { lock: string; owner: string; token: string; background: boolean; releasedMs: number }
+interface AsyncGateHold { lock: string; owner: string; token: string; background: boolean; skipIfBusy?: boolean; releasedMs: number }
 /** Async holds this context owns, so a holder can step aside during a long model call. */
 const asyncHolds = new AsyncLocalStorage<Map<string, AsyncGateHold>>();
 
-export async function withProjectGate<T>(root: string, work: () => Promise<T> | T, options: { allowRemoved?: boolean; waitMs?: number; name?: string; background?: boolean } = {}): Promise<T> {
+export async function withProjectGate<T>(root: string, work: () => Promise<T> | T, options: { allowRemoved?: boolean; waitMs?: number; name?: string; background?: boolean; skipIfBusy?: boolean } = {}): Promise<T> {
   root = canonicalRoot(root);
   if (!options.allowRemoved) assertProjectNotRemoved(root);
   if (held.getStore()?.has(root)) return work();
   const dir = join(root, ".code-butler"); mkdirSync(dir, { recursive: true });
   const lock = join(dir, ".cloud-operation.lock");
+  if (options.skipIfBusy && existsSync(lock)) throw new OperationDeferredError("Another local Butler operation is active");
   const token = randomUUID(); const owner = join(dir, `.cloud-owner-${token}`);
   const processStart = processStartIdentity(process.pid);
   writeFileSync(owner, JSON.stringify({ pid: process.pid, ...(processStart ? { processStart } : {}), token, name: options.name ?? "Other local operation", startedAt: new Date().toISOString(),
     ...(process.env.CODE_BUTLER_WATCH_TOKEN ? { watcherToken: process.env.CODE_BUTLER_WATCH_TOKEN } : {}) }), { flag: "wx", mode: 0o600 });
   const background = options.background ?? Boolean(process.env.CODE_BUTLER_WATCH_TOKEN);
-  const hold: AsyncGateHold = { lock, owner, token, background, releasedMs: 0 };
+  const hold: AsyncGateHold = { lock, owner, token, background, releasedMs: 0, ...(options.skipIfBusy ? { skipIfBusy: true } : {}) };
   const waitStarted=performance.now();
   try {
     await acquireGate(root, hold, Date.now() + (options.waitMs ?? 15000));
@@ -124,6 +125,7 @@ async function acquireGate(root: string, hold: AsyncGateHold, deadline: number):
   const { lock, owner } = hold;
   while (true) {
     if (hold.background && activeForegroundIntent(root)) {
+      if (hold.skipIfBusy) throw new OperationDeferredError("Another local Butler operation is active");
       if (Date.now() > deadline) throw new OperationDeferredError("Background operation deferred for foreground review");
       await delay(50);
       continue;
@@ -131,6 +133,8 @@ async function acquireGate(root: string, hold: AsyncGateHold, deadline: number):
     try { linkSync(owner, lock); break; }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // Polls can wait until a foreground operation or the watcher reaps a stale lock.
+      if (hold.skipIfBusy) throw new OperationDeferredError("Another local Butler operation is active");
       try {
         const value = JSON.parse(readFileSync(lock, "utf8")) as GateOwner;
         if (Number.isSafeInteger(value.pid) && typeof value.token === "string" && !lockOwnerAlive(value)) {

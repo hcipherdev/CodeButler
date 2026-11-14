@@ -4,12 +4,18 @@ import { installationDeviceId } from "../memory/origin.js";
 import { NativeSecurity, type SecurityStatus } from "./native-security.js";
 import { EncryptionError, type EncryptionState } from "./crypto-helper.js";
 import { canonical, DEVICE_NONCE_EXPIRED, documentHash, type EnrollmentRequest, type SignedDocument, type SignedVaultRecord } from "./identity-protocol.js";
-import type { AccountProfile, EnrollmentState, SessionTokens, VaultState } from "./protocol-types.js";
+import type { AccountProfile, EnrollmentState, RecoveryKit, SessionTokens, VaultState } from "./protocol-types.js";
 import { serverUrl, sha256 } from "./state.js";
 import { withProjectGate } from "./gate.js";
 import { projectCatalogId } from "./resource-identity.js";
 
 interface SessionSnapshot { tokens: SessionTokens | null; revision?: number; epoch?: number }
+
+export class AccountAlreadyRegisteredError extends Error {
+  constructor() {
+    super("An account already exists for this email. Log in, choose Forgot password, or use an email code if you haven’t set a password.");
+  }
+}
 
 /** Slowest sustained upload a request is allowed before it times out; small requests keep the base timeout. */
 const MIN_UPLOAD_BYTES_PER_SECOND = 64 * 1024;
@@ -46,13 +52,19 @@ export class AccountClient {
       this.networkTiming.downloadedBytes += size;
       // Encrypted objects can come back as binary frames; errors are always JSON.
       if (response.ok && response.headers.get("content-type") === "application/octet-stream") return Buffer.concat(chunks) as T;
-      let value: unknown; try { value = JSON.parse(Buffer.concat(chunks).toString()); } catch { throw new EncryptionError("incompatible-format"); }
+      let value: unknown;
+      try { value = JSON.parse(Buffer.concat(chunks).toString()); }
+      catch { throw new EncryptionError("incompatible-format", undefined, response.status); }
       if (!response.ok) {
+        if ((path === "/v2/auth/register" || path === "/v2/auth/challenge") && response.status === 409
+          && (value as { state?: unknown })?.state === "account-already-registered") {
+          throw new AccountAlreadyRegisteredError();
+        }
         const state = (value as { state?: EncryptionState }).state;
-        const allowed = ["storage-full", "request-too-large", "upgrade-required", "lease-expired", "authentication-required", "enrollment-required", "locked", "revoked", "recovery-required", "conflict", "incompatible-format", "verification-failed"];
+        const allowed = ["storage-full", "request-too-large", "upgrade-required", "lease-expired", "authentication-required", "enrollment-required", "locked", "revoked", "recovery-required", "conflict", "incompatible-format", "verification-failed", "email-not-allowed", "human-check-required"];
         const { details, error } = value as { details?: unknown; error?: unknown };
         throw new EncryptionError(state && allowed.includes(state) ? state : response.status === 409 ? "conflict" : response.status === 413 ? "request-too-large" : "verification-failed",
-          details ?? (error === DEVICE_NONCE_EXPIRED ? { nonce: "expired" } : undefined));
+          details ?? (error === DEVICE_NONCE_EXPIRED ? { nonce: "expired" } : undefined), response.status);
       }
       return value as T;
     } catch (error) {
@@ -60,10 +72,18 @@ export class AccountClient {
       throw error;
     } finally { this.networkTiming.milliseconds += performance.now() - started; }
   }
-  async challenge(email: string, purpose: "register" | "login" | "reset"): Promise<{ challengeId: string; expiresAt: number }> {
-    return this.send("/v2/auth/challenge", "POST", Buffer.from(canonical({ email, purpose })));
+  async challenge(email: string, purpose: "register" | "login" | "reset", human?: { code: string; verifier: string }): Promise<{ challengeId: string; expiresAt: number }> {
+    return this.send("/v2/auth/challenge", "POST", Buffer.from(canonical({ email, purpose, ...(human ? { humanCode: human.code, humanVerifier: human.verifier } : {}) })));
   }
-  async capabilities(): Promise<{ registrationEnabled: boolean; passwordEnabled: boolean; passkeyEnabled: boolean; projectCatalog?: number; deviceEnrollment?: number; accountSecrets?: number }> {
+  /** Starts the server's browser check; the returned code and this verifier then go with challenge(). */
+  async humanStart(redirectUri: string): Promise<{ url: string; verifier: string; state: string }> {
+    const verifier = randomBytes(32).toString("base64url"), state = randomBytes(32).toString("base64url");
+    const codeChallenge = Buffer.from(sha256(verifier), "hex").toString("base64url");
+    const result = await this.send<{ url: string }>("/v2/auth/human/start", "POST", Buffer.from(canonical({ redirectUri, state, codeChallenge })));
+    if (!result.url.startsWith(this.server + "/auth/human/")) throw new EncryptionError("verification-failed");
+    return { url: result.url, verifier, state };
+  }
+  async capabilities(): Promise<{ registrationEnabled: boolean; passwordEnabled: boolean; passkeyEnabled: boolean; humanCheck?: "turnstile" | null; projectCatalog?: number; deviceEnrollment?: number; accountSecrets?: number; cloudRecovery?: number }> {
     return this.send("/v2/auth/capabilities", "GET", Buffer.alloc(0));
   }
   async profile(): Promise<AccountProfile> {
@@ -266,6 +286,23 @@ export class AccountClient {
     if (!status.recoveryReady || !status.descriptor || !status.records[0]) throw new EncryptionError("recovery-required");
     const state = await this.request<VaultState>(`${this.vaultBase}/init`, "POST", { descriptor: status.descriptor, record: status.records[0] }, false);
     await this.security.invoke("accept", { records: state.records });
+  }
+  async publishCloudRecoveryInitialization(vaultId: string): Promise<void> {
+    const tokens = await this.tokens(), status = await this.security.status();
+    const { descriptor, records: [record] } = status;
+    if (this.vaultBase !== "/v2/vault" || !descriptor || descriptor.vaultId !== vaultId || descriptor.accountId !== tokens.accountId
+      || status.device?.id !== descriptor.firstDevice.id || !record) throw new EncryptionError("verification-failed");
+    if (status.recoveryReady) {
+      const state = await this.request<VaultState>("/v2/vault/state", "GET", undefined, false);
+      if (!state.cloudRecovery || documentHash(state.descriptor) !== documentHash(descriptor)) throw new EncryptionError("conflict");
+      return;
+    }
+    const exported = await this.security.invoke<{ kit: RecoveryKit; code: string }>("recovery-export");
+    await this.security.invoke("recovery-verify", exported);
+    const state = await this.request<VaultState>("/v2/vault/init", "POST", { descriptor, record, recoveryKit: exported.kit }, false);
+    if (!state.cloudRecovery || documentHash(state.descriptor) !== documentHash(descriptor)) throw new EncryptionError("verification-failed");
+    await this.security.invoke("accept", { records: state.records });
+    await this.security.invoke("recovery-confirm", exported);
   }
   async refreshVault(): Promise<SecurityStatus> {
     let local = await this.security.status().catch(error => {

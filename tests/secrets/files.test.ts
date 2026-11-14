@@ -1,10 +1,10 @@
-// Verifies binary secrets folder safety, three-way merge behavior, and atomic local application.
+// Verifies binary secrets folder safety, three-way merge behavior, atomic local application, and the change stamp secretFolderStamp() in src/secrets/files.ts.
 import { randomUUID } from "node:crypto";
 import { linkSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { applySecretFiles, captureSecretFolder, materializeSecretFiles, mergeSecretFiles, validateSecretManifest, validateSecretPath } from "../../src/secrets/files.js";
+import { applySecretFiles, captureSecretFolder, materializeSecretFiles, mergeSecretFiles, secretFolderStamp, validateSecretManifest, validateSecretPath } from "../../src/secrets/files.js";
 import { encryptedSecretsSync, secretsSyncStatus, setSecretsSyncEnabled } from "../../src/secrets/sync.js";
 import { saveSecretBinding, secretBinding } from "../../src/secrets/state.js";
 import { SecretFolderError } from "../../src/secrets/folder-error.js";
@@ -18,6 +18,32 @@ function put(root: string, path: string, bytes: Buffer): void {
   const parts = path.split("/"), file = parts.pop()!;
   const folder = join(root, "secrets", ...parts); mkdirSync(folder, { recursive: true }); writeFileSync(join(folder, file), bytes);
 }
+
+describe("secrets folder change stamp", () => {
+  it("stays the same until a file is added, edited, renamed or removed", () => {
+    const root = temp();
+    const absent = secretFolderStamp(root);
+    put(root, "nested/a.env", Buffer.from("A=1"));
+    const first = secretFolderStamp(root);
+    expect(first).toBeDefined(); expect(first).not.toBe(absent);
+    expect(secretFolderStamp(root)).toBe(first);
+    put(root, "nested/a.env", Buffer.from("A=12"));
+    const edited = secretFolderStamp(root);
+    expect(edited).not.toBe(first);
+    put(root, "b.env", Buffer.from("B=1"));
+    expect(secretFolderStamp(root)).not.toBe(edited);
+    rmSync(join(root, "secrets", "b.env"));
+    rmSync(join(root, "secrets", "nested"), { recursive: true });
+    expect(secretFolderStamp(root)).not.toBe(first);
+  });
+
+  it("gives no stamp for a folder the full sync would reject, so that sync runs and explains it", () => {
+    const root = temp();
+    put(root, "a.env", Buffer.from("A=1"));
+    symlinkSync(join(root, "secrets", "a.env"), join(root, "secrets", "link.env"));
+    expect(secretFolderStamp(root)).toBeUndefined();
+  });
+});
 
 describe("encrypted secrets file model", () => {
   it("is disabled by default and does not create or upload a folder", async () => {

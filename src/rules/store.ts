@@ -7,7 +7,7 @@ import { projectOperation } from "../cloud/client.js";
 import { atomicJson, atomicWrite, readJson, stateDirectory } from "../cloud/state.js";
 import { requestAutomaticSync } from "../cloud/sync-owner.js";
 import { globalRulesRoot, rulesDir } from "./identity.js";
-import { parseRuleFile, ruleIdSchema, serializeRule, type Rule, type RuleInput } from "./format.js";
+import { isRulesMetadataName, parseRuleFile, ruleIdSchema, serializeRule, type Rule, type RuleInput } from "./format.js";
 import { contentHash, filesRevision, decodeRulesFiles, encodeRulesFiles, conflictsIn, stateHash, type RuleFiles } from "./merge.js";
 
 export class StaleRuleError extends Error { constructor() { super("Rules changed since they were read. Reload before applying your edit."); this.name = "StaleRuleError"; } }
@@ -35,7 +35,7 @@ export function captureRulesFiles(root = globalRulesRoot()): RuleFiles {
     for (const name of readdirSync(dir).sort()) {
       const path = join(dir, name), relative = `${prefix}/${name}`, stat = lstatSync(path);
       if (stat.isSymbolicLink()) throw new Error("Rules paths must not contain symlinks");
-      if (name.endsWith(".tmp")) continue;
+      if (name.endsWith(".tmp") || isRulesMetadataName(name)) continue;
       if (stat.isDirectory()) walk(path, relative);
       else if (stat.isFile()) { if (stat.size > 16 * 1024) throw new Error(`${relative}: file exceeds 16 KiB`); files.set(relative, readFileSync(path)); }
       else throw new Error("Rules paths must be regular files");

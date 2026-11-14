@@ -3,11 +3,14 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 import { DEFAULT_BACKGROUND_DAILY_TOKENS, hasAiSettings, jobInvestigatorConfig, legacyJobModels, modelFields, resolveAiJobModels } from "./ai/models.js";
+import { CLAUDE_CODE_JOBS } from "./ai/connection-policy.js";
 import { isAiConnectionKind } from "./ai/providers.js";
-import { AI_JOBS, type AiSettings } from "./types.js";
+import { AI_JOBS, type AiJob, type AiSettings } from "./types.js";
 import type { ArtifactRetentionConfig, AutomaticReviewConfig, ExtractionConfig, ExtractorConfig, ExtractorConfigInput, InvestigatorConfig, InvestigatorConfigInput, LayerRetentionConfig, ProjectConfig, RedactionPatternConfig } from "./types.js";
 import { validateRedactionPattern } from "./privacy/policy.js";
 import { assertProjectNotRemoved } from "./cloud/removal-state.js";
+import { isReservedEnvName, markFilledFromGlobalEnv, setProjectEnv } from "./project-env.js";
+import { evaluateProjectTrust, migrateRegisteredProjects, recordProjectTrust, sensitiveProjectSettings, type ProjectTrust } from "./project-trust.js";
 
 interface ProjectConfigFile {
   globalRules?: { enabled?: boolean; exclude?: string[] };
@@ -52,6 +55,7 @@ interface ProjectConfigFile {
 type ProviderProfileConfig = Partial<ExtractorConfig>;
 
 interface GlobalConfigFile {
+  general?: GeneralSettings;
   globalRules?: { enabled?: boolean; exclude?: string[] };
   defaults?: {
     extractorProfile?: string | undefined;
@@ -66,6 +70,18 @@ interface GlobalConfigFile {
   investigator?: InvestigatorConfigInput;
   embeddings?: Partial<ProjectConfig["embeddings"]>;
   ai?: AiSettings;
+}
+
+/** Device-local preferences; repository settings cannot enable project initialization. */
+export interface GeneralSettings { autoInitializeProjects: boolean }
+
+export function loadGeneralSettings(): GeneralSettings {
+  return { autoInitializeProjects: loadGlobalConfig().general?.autoInitializeProjects ?? false };
+}
+
+export function saveGeneralSettings(settings: GeneralSettings): GeneralSettings {
+  saveGlobalConfigSection("general", settings);
+  return loadGeneralSettings();
 }
 
 type ProviderKind = "extractor" | "investigator";
@@ -169,11 +185,15 @@ export function loadAiBudget(): number | null {
  * every other key. Written atomically, so the watcher never reads half a file.
  */
 export function saveGlobalAiSettings(settings: AiSettings): void {
+  saveGlobalConfigSection("ai", settings);
+}
+
+function saveGlobalConfigSection(section: "ai" | "general", settings: AiSettings | GeneralSettings): void {
   const globalDir = globalConfigDir();
   mkdirSync(globalDir, { recursive: true });
   const configPath = join(globalDir, "config.json");
   const current = existsSync(configPath) ? readConfigObject(configPath) : {};
-  const next = { ...current, ai: settings };
+  const next = { ...current, [section]: settings };
   validateGlobalConfigFile(next);
   const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
   const fd = openSync(temporary, "wx", 0o600);
@@ -199,9 +219,7 @@ export function projectLocalConfigPath(rootDir: string): string {
 
 /** This device's recorded answer, if any. Consent covers this device's keys and logs, so it is never synced. */
 export function readRemoteModelConsent(rootDir: string): boolean | undefined {
-  const localConfigPath = projectLocalConfigPath(rootDir);
-  if (!existsSync(localConfigPath)) return undefined;
-  const value = readConfigObject(localConfigPath).privacy;
+  const value = trustedProjectConfigFiles(rootDir).local.privacy;
   return isConfigRecord(value) && typeof value.allowRemoteModels === "boolean" ? value.allowRemoteModels : undefined;
 }
 
@@ -211,7 +229,7 @@ export function setRemoteModelConsent(rootDir: string, allowed: boolean): string
   const local = existsSync(localConfigPath) ? readConfigObject(localConfigPath) : {};
   const next = { ...local, privacy: { ...(isConfigRecord(local.privacy) ? local.privacy : {}), allowRemoteModels: allowed } };
   validateProjectConfigFile(next);
-  writeConfigObject(localConfigPath, next);
+  keepingTrust(rootDir, () => writeConfigObject(localConfigPath, next));
   return localConfigPath;
 }
 
@@ -286,22 +304,115 @@ export function migrateSharedConfigToLocal(rootDir: string, options: { apply: bo
   }
 
   if (options.apply) {
-    writeConfigObject(sharedConfigPath, nextShared);
-    writeConfigObject(localConfigPath, nextLocal);
+    keepingTrust(rootDir, () => {
+      writeConfigObject(sharedConfigPath, nextShared);
+      writeConfigObject(localConfigPath, nextLocal);
+    });
   }
   return result;
 }
 
+/** The repo's config.json and config.local.json as written, validated; neither file is created. */
+function readRepoConfigFiles(rootDir: string, configPath = join(rootDir, ".code-butler", "config.json")): { shared: ConfigObject; local: ConfigObject } {
+  const read = (path: string): ConfigObject => {
+    if (!existsSync(path)) return {};
+    const raw = readFileSync(path, "utf8");
+    const value: unknown = raw.trim().length > 0 ? JSON.parse(raw) : {};
+    validateProjectConfigFile(value);
+    return value as ConfigObject;
+  };
+  return { shared: read(configPath), local: read(projectLocalConfigPath(rootDir)) };
+}
+
+function projectTrustOf(rootDir: string, shared: ConfigObject, local: ConfigObject): ProjectTrust {
+  const home = homedir();
+  const settings = sensitiveProjectSettings(rootDir, mergeConfigFiles(shared, local) as ConfigObject, {
+    codex: defaultCodexRoots(home),
+    claude: [join(home, ".claude", "projects")]
+  });
+  const envPath = join(rootDir, ".code-butler", ".env");
+  const envBytes = existsSync(envPath) ? readFileSync(envPath) : undefined;
+  const hasEnvValues = Boolean(envBytes?.toString("utf8").split(/\r?\n/).some(line => parseEnvLine(line)?.[1].trim()));
+  const trust = evaluateProjectTrust(rootDir, settings, hasEnvValues ? envBytes : undefined);
+  if (trust.status !== "untrusted") return trust;
+  migrateRegisteredProjects(root => trustProjectSettings(root));
+  return evaluateProjectTrust(rootDir, settings, hasEnvValues ? envBytes : undefined);
+}
+
+/**
+ * Whether the repo's own `.code-butler/` files set anything this device's owner has to approve
+ * (see project-trust.ts), and if so, whether they have.
+ */
+export function readProjectTrust(rootDir: string): ProjectTrust {
+  const { shared, local } = readRepoConfigFiles(rootDir);
+  return projectTrustOf(rootDir, shared, local);
+}
+
+/**
+ * Approves the repo's current sensitive settings on this device; any later change needs approving
+ * again. With `expectedHash`, approves only what the person was shown, never a file changed since.
+ */
+export function trustProjectSettings(rootDir: string, expectedHash?: string): ProjectTrust {
+  const trust = readProjectTrust(rootDir);
+  if (expectedHash !== undefined && trust.hash !== expectedHash) throw new Error("The project's settings changed after they were shown. Review them again before approving.");
+  if (trust.status === "none-needed") return trust;
+  recordProjectTrust(rootDir, trust);
+  return { ...trust, status: "trusted" };
+}
+
+export interface PendingProjectSettings {
+  status: ProjectTrust["status"];
+  hash: string;
+  /** Each setting as written in the repo; the .env file is listed by key name only. */
+  settings: Array<{ path: string; value: string }>;
+  envNames: string[];
+}
+
+/** What approving would apply, as shown to the person before they approve. */
+export function pendingProjectSettings(rootDir: string): PendingProjectSettings {
+  const { shared, local } = readRepoConfigFiles(rootDir);
+  const trust = projectTrustOf(rootDir, shared, local);
+  const settings = trust.paths.filter(path => path !== ".env").map(path => ({
+    path,
+    value: JSON.stringify(getNested(local, path) ?? getNested(shared, path)) ?? "null"
+  }));
+  const envPath = join(rootDir, ".code-butler", ".env");
+  const envNames = trust.paths.includes(".env") && existsSync(envPath)
+    ? readFileSync(envPath, "utf8").split(/\r?\n/).flatMap(line => { const parsed = parseEnvLine(line); return parsed?.[1].trim() ? [parsed[0]] : []; })
+    : [];
+  return { status: trust.status, hash: trust.hash, settings, envNames };
+}
+
+/** The repo's config files with every setting awaiting approval removed. */
+export function trustedProjectConfigFiles(rootDir: string): { shared: ConfigObject; local: ConfigObject; trust: ProjectTrust } {
+  const { shared, local } = readRepoConfigFiles(rootDir);
+  const trust = projectTrustOf(rootDir, shared, local);
+  if (trust.status !== "untrusted") return { shared, local, trust };
+  return { shared: withoutPaths(shared, trust.paths), local: withoutPaths(local, trust.paths), trust };
+}
+
+function withoutPaths(config: ConfigObject, paths: string[]): ConfigObject {
+  const result = cloneConfig(config);
+  for (const path of paths) if (path !== ".env") deleteNested(result, path);
+  return result;
+}
+
+/** Butler's own edits to approved settings stay approved; they never approve someone else's pending change. */
+function keepingTrust(rootDir: string, write: () => void): void {
+  const before = readProjectTrust(rootDir).status;
+  write();
+  if (before === "untrusted") return;
+  const after = readProjectTrust(rootDir);
+  if (after.status === "untrusted") recordProjectTrust(rootDir, after);
+}
+
 function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
-  const butlerEnvKeys = new Set([...loadProjectEnv(rootDir), ...loadGlobalEnv()]);
-  const raw = readFileSync(configPath, "utf8");
-  const parsedValue: unknown = raw.trim().length > 0 ? JSON.parse(raw) : {};
-  validateProjectConfigFile(parsedValue);
-  const localConfigPath = projectLocalConfigPath(rootDir);
-  const localValue: unknown = existsSync(localConfigPath)
-    ? JSON.parse(readFileSync(localConfigPath, "utf8").trim() || "{}")
-    : {};
-  validateProjectConfigFile(localValue);
+  const files = readRepoConfigFiles(rootDir, configPath);
+  const trust = projectTrustOf(rootDir, files.shared, files.local);
+  const parsedValue = trust.status === "untrusted" ? withoutPaths(files.shared, trust.paths) : files.shared;
+  const localValue = trust.status === "untrusted" ? withoutPaths(files.local, trust.paths) : files.local;
+  const projectEnv = trust.status === "trusted" ? readProjectEnv(rootDir) : new Map<string, string>();
+  const butlerEnvKeys = new Set([...projectEnv.keys(), ...loadGlobalEnv()]);
   const globalConfig = loadGlobalConfig();
   const globalSettings = globalProjectConfig(globalConfig);
   const parsed = mergeConfigFiles(
@@ -315,7 +426,7 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
   const claude = parsed.sources?.claude ?? {};
   const deterministic = parsed.deterministic ?? {};
 
-  return {
+  const config: ProjectConfig = {
     configPath,
     globalRules: { enabled: parsed.globalRules?.enabled ?? true, exclude: parsed.globalRules?.exclude ?? [] },
     sources: {
@@ -340,7 +451,8 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
     },
     ...resolveProjectModels(defaults, globalConfig, parsed, mergeConfigFiles(parsedValue as ProjectConfigFile, localValue as ProjectConfigFile), {
       allowRemoteModels: parsed.privacy?.allowRemoteModels === true,
-      butlerEnvKeys
+      butlerEnvKeys,
+      projectChoicesCount: trust.status === "trusted"
     }),
     promotion: {
       ...defaults.promotion,
@@ -425,8 +537,26 @@ function readProjectConfig(rootDir: string, configPath: string): ProjectConfig {
         ...defaults.deterministic.triggers,
         ...(deterministic.triggers ?? {})
       }
-    }
+    },
+    trust: { status: trust.status, ignored: trust.status === "untrusted" ? trust.paths : [] }
   };
+
+  // Keys come from this project's .env only for this project's models, never through process.env.
+  const envRoot = rootDir;
+  config.extractor = { ...config.extractor, envRoot };
+  config.investigator = { ...config.investigator, envRoot };
+  config.embeddings = { ...config.embeddings, envRoot };
+  if (config.models) for (const job of AI_JOBS) config.models[job] = { ...config.models[job], envRoot };
+  const referenced = new Set<string>();
+  for (const model of [config.extractor, config.investigator, ...Object.values(config.models ?? {})]) {
+    const aws = model.provider === "anthropic-aws";
+    for (const name of [model.apiKeyEnv, model.workspaceIdEnv ?? (aws ? "ANTHROPIC_AWS_WORKSPACE_ID" : ""), model.regionEnv ?? (aws ? "AWS_REGION" : "")]) {
+      if (name) referenced.add(name);
+    }
+  }
+  if (config.embeddings.apiKeyEnv) referenced.add(config.embeddings.apiKeyEnv);
+  setProjectEnv(envRoot, new Map([...projectEnv].filter(([name]) => referenced.has(name))));
+  return config;
 }
 
 function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
@@ -486,7 +616,8 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
         mergedBranches: true,
         deviceMemories: true,
         coreCandidates: true,
-        singleSourceMinConfidence: 0.9
+        singleSourceMinConfidence: 0.9,
+        candidateExpiryDays: DEFAULT_CANDIDATE_EXPIRY_DAYS
       }
     },
     sync: {
@@ -530,7 +661,7 @@ function defaultConfig(rootDir: string, configPath: string): ProjectConfig {
         device: { maxIdleDays: null }
       },
       artifacts: {
-        logs: { maxBytes: 5 * 1024 * 1024, maxFiles: 3 },
+        logs: { ...DEFAULT_LOG_RETENTION },
         projectSummaryBackups: { maxFiles: 5 },
         recoveryBackups: { maxFiles: 2, minAgeDays: 2 },
         cloudHandles: { reapStale: true }
@@ -559,6 +690,30 @@ export function validateProjectConfigFile(value: unknown): void {
     assertKnownKeys(rules, new Set(["enabled", "exclude"]), "globalRules");
     if (rules.enabled !== undefined && typeof rules.enabled !== "boolean") throw new Error("globalRules.enabled must be boolean");
     if (rules.exclude !== undefined && (!Array.isArray(rules.exclude) || rules.exclude.length > 1000 || rules.exclude.some(id => typeof id !== "string" || id.length > 96))) throw new Error("globalRules.exclude must be rule ids");
+  }
+  for (const section of ["extractor", "investigator"] as const) {
+    const block = optionalConfigSection(value, section);
+    if (!block) continue;
+    for (const key of ["apiKeyEnv", "workspaceIdEnv", "regionEnv"] as const) {
+      // An empty apiKeyEnv means a local server that needs no key.
+      if (block[key] === undefined || (key === "apiKeyEnv" && block[key] === "")) continue;
+      if (typeof block[key] !== "string" || !ENV_NAME.test(block[key] as string)) throw new Error(`${section}.${key} must be an environment variable name`);
+    }
+    if (block.baseUrl !== undefined && !isValidEmbeddingBaseUrl(block.baseUrl)) throw new Error(`${section}.baseUrl must be an HTTP(S) URL without credentials`);
+    if (block.cliPath !== undefined && (!isNonemptyString(block.cliPath) || block.cliPath.length > 1024)) throw new Error(`${section}.cliPath must be a file path`);
+  }
+  const sources = optionalConfigSection(value, "sources");
+  if (sources) {
+    for (const [adapter, source] of Object.entries(sources)) {
+      const at = `sources.${adapter}`;
+      if (adapter !== "git" && adapter !== "codex" && adapter !== "claude") throw new Error(`${at} is not a known source`);
+      if (!isConfigRecord(source)) throw new Error(`${at} must be an object`);
+      if (source.repoPath !== undefined && !isNonemptyString(source.repoPath)) throw new Error(`${at}.repoPath must be a path`);
+      if (source.roots !== undefined && (!Array.isArray(source.roots) || source.roots.some(root => !isNonemptyString(root)))) throw new Error(`${at}.roots must be an array of paths`);
+      for (const key of ["enabled", "projectOnly", "includeDefaultRoots", "hookInstall"] as const) {
+        if (source[key] !== undefined && typeof source[key] !== "boolean") throw new Error(`${at}.${key} must be a boolean`);
+      }
+    }
   }
   const retrieval = optionalConfigSection(value, "retrieval");
   if (retrieval) {
@@ -653,6 +808,12 @@ export function validateProjectConfigFile(value: unknown): void {
   if (retention) validateRetentionConfig(retention);
 }
 
+/** Days an uncorroborated core candidate may sit idle before automatic promotion discards it. */
+export const DEFAULT_CANDIDATE_EXPIRY_DAYS = 30;
+
+/** Watcher log limits, for projects and for the global watcher, which has no project config. */
+export const DEFAULT_LOG_RETENTION = { maxBytes: 5 * 1024 * 1024, maxFiles: 3 } as const;
+
 export const DEFAULT_AUTOMATIC_REVIEW_CONFIG: AutomaticReviewConfig = {
   enabled: true,
   dailyItems: 100,
@@ -682,9 +843,14 @@ function validateGlobalConfigFile(value: unknown): void {
   if (!isConfigRecord(value)) throw new Error("Global config must be an object");
   assertKnownKeys(
     value,
-    new Set(["defaults", "profiles", "sources", "extractor", "investigator", "embeddings", "globalRules", "ai"]),
+    new Set(["defaults", "profiles", "sources", "extractor", "investigator", "embeddings", "globalRules", "ai", "general"]),
     "global config"
   );
+  if (value.general !== undefined) {
+    if (!isConfigRecord(value.general)) throw new Error("global.general must be an object");
+    assertKnownKeys(value.general, new Set(["autoInitializeProjects"]), "global.general");
+    if (typeof value.general.autoInitializeProjects !== "boolean") throw new Error("global.general.autoInitializeProjects must be a boolean");
+  }
   if (value.ai !== undefined) validateAiSettings(value.ai, "ai", true);
   if (value.globalRules !== undefined) validateProjectConfigFile({ globalRules: value.globalRules });
 
@@ -757,7 +923,7 @@ function validateAiSettings(value: unknown, path: string, global: boolean): void
       const at = `${path}.connections.${id}`;
       if (!AI_ID.test(id)) throw new Error(`${at}: connection ids use lowercase letters, digits and hyphens`);
       if (!isConfigRecord(connection)) throw new Error(`${at} must be an object`);
-      assertKnownKeys(connection, new Set(["kind", "label", "baseUrl", "apiKeyEnv", "workspaceIdEnv", "regionEnv", "workspaceId", "region", "keyUpdatedAt", "keySavedToEnv", "dataCollection"]), at);
+      assertKnownKeys(connection, new Set(["kind", "label", "baseUrl", "apiKeyEnv", "workspaceIdEnv", "regionEnv", "workspaceId", "region", "keyUpdatedAt", "keySavedToEnv", "dataCollection", "accountLabel", "cliPath", "preferSavedKey", "preferSavedAwsSettings"]), at);
       if (!isAiConnectionKind(connection.kind)) throw new Error(`${at}.kind is not a supported provider`);
       if (connection.label !== undefined && (typeof connection.label !== "string" || connection.label.length > 80)) throw new Error(`${at}.label must be at most 80 characters`);
       if (connection.baseUrl !== undefined && !isValidEmbeddingBaseUrl(connection.baseUrl)) throw new Error(`${at}.baseUrl must be an HTTP(S) URL without credentials`);
@@ -768,12 +934,18 @@ function validateAiSettings(value: unknown, path: string, global: boolean): void
       for (const key of ["workspaceId", "region", "keyUpdatedAt"] as const) {
         if (connection[key] !== undefined && (!isNonemptyString(connection[key]) || (connection[key] as string).length > 200)) throw new Error(`${at}.${key} must be a short string`);
       }
+      for (const key of ["preferSavedKey", "preferSavedAwsSettings"] as const) {
+        if (connection[key] !== undefined && typeof connection[key] !== "boolean") throw new Error(`${at}.${key} must be boolean`);
+      }
       if (connection.keySavedToEnv !== undefined && connection.keySavedToEnv !== true) throw new Error(`${at}.keySavedToEnv must be true when set`);
       if (connection.dataCollection !== undefined && connection.dataCollection !== "allow" && connection.dataCollection !== "deny") throw new Error(`${at}.dataCollection must be allow or deny`);
+      if (connection.accountLabel !== undefined && (!isNonemptyString(connection.accountLabel) || connection.accountLabel.length > 320)) throw new Error(`${at}.accountLabel must be a short string`);
+      if (connection.cliPath !== undefined && (!isNonemptyString(connection.cliPath) || connection.cliPath.length > 1024)) throw new Error(`${at}.cliPath must be a file path`);
     }
   }
+  const connectionKind = (id: unknown) => isConfigRecord(connections) && typeof id === "string" && isConfigRecord(connections[id]) ? connections[id].kind : undefined;
   const knownConnection = (id: unknown) => !global || (isConfigRecord(connections) && typeof id === "string" && Object.prototype.hasOwnProperty.call(connections, id));
-  const validateChoice = (choice: unknown, at: string, allowTier: boolean): void => {
+  const validateChoice = (choice: unknown, at: string, allowTier: boolean, job?: AiJob): void => {
     if (!isConfigRecord(choice)) throw new Error(`${at} must be an object`);
     if (allowTier && choice.tier !== undefined) {
       assertKnownKeys(choice, new Set(["tier"]), at);
@@ -784,6 +956,10 @@ function validateAiSettings(value: unknown, path: string, global: boolean): void
     if (!isNonemptyString(choice.connection) || !knownConnection(choice.connection)) throw new Error(`${at}.connection must name a configured connection`);
     if (!isNonemptyString(choice.model) || choice.model.length > 200) throw new Error(`${at}.model must be a model id`);
     if (choice.maxTokens !== undefined && !isPositiveInteger(choice.maxTokens)) throw new Error(`${at}.maxTokens must be a positive integer`);
+    // A tier also serves background jobs, which Claude Code never runs.
+    if (connectionKind(choice.connection) === "claude-code" && (!job || !CLAUDE_CODE_JOBS.includes(job))) {
+      throw new Error(`${at}: Claude Code can only be chosen for AI review, wording, summary or rules drafting`);
+    }
   };
   if (value.tiers !== undefined) {
     if (!isConfigRecord(value.tiers)) throw new Error(`${path}.tiers must be an object`);
@@ -793,7 +969,7 @@ function validateAiSettings(value: unknown, path: string, global: boolean): void
   if (value.jobs !== undefined) {
     if (!isConfigRecord(value.jobs)) throw new Error(`${path}.jobs must be an object`);
     assertKnownKeys(value.jobs, new Set(AI_JOBS), `${path}.jobs`);
-    for (const [job, choice] of Object.entries(value.jobs)) validateChoice(choice, `${path}.jobs.${job}`, true);
+    for (const [job, choice] of Object.entries(value.jobs)) validateChoice(choice, `${path}.jobs.${job}`, true, job as AiJob);
   }
   if (value.budgets !== undefined) {
     if (!isConfigRecord(value.budgets)) throw new Error(`${path}.budgets must be an object`);
@@ -823,7 +999,7 @@ function validatePromotionConfig(promotion: Record<string, unknown>): void {
   const automatic = promotion.automatic;
   assertKnownKeys(
     automatic,
-    new Set(["enabled", "mode", "minScore", "mergedBranches", "deviceMemories", "coreCandidates", "singleSourceMinConfidence"]),
+    new Set(["enabled", "mode", "minScore", "mergedBranches", "deviceMemories", "coreCandidates", "singleSourceMinConfidence", "candidateExpiryDays"]),
     "promotion.automatic"
   );
   for (const flag of ["enabled", "mergedBranches", "deviceMemories", "coreCandidates"] as const) {
@@ -840,6 +1016,9 @@ function validatePromotionConfig(promotion: Record<string, unknown>): void {
   if (automatic.singleSourceMinConfidence !== undefined && !isUnitInterval(automatic.singleSourceMinConfidence)) {
     throw new Error("promotion.automatic.singleSourceMinConfidence must be a number between 0 and 1");
   }
+  if (automatic.candidateExpiryDays !== undefined && !isNonNegativeInteger(automatic.candidateExpiryDays)) {
+    throw new Error("promotion.automatic.candidateExpiryDays must be a non-negative integer");
+  }
 }
 
 function isUnitInterval(value: unknown): value is number {
@@ -848,7 +1027,7 @@ function isUnitInterval(value: unknown): value is number {
 
 function optionalConfigSection(
   config: Record<string, unknown>,
-  name: "retrieval" | "embeddings" | "privacy" | "retention" | "promotion" | "globalRules" | "extraction" | "review"
+  name: "retrieval" | "embeddings" | "privacy" | "retention" | "promotion" | "globalRules" | "extraction" | "review" | "extractor" | "investigator" | "sources"
 ): Record<string, unknown> | undefined {
   const value = config[name];
   if (value === undefined) return undefined;
@@ -1053,14 +1232,16 @@ function resolveProjectModels(
   projectOnly: ProjectConfigFile,
   consent: RemoteModelConsent
 ): Pick<ProjectConfig, "extractor" | "investigator" | "models" | "aiBudget"> {
+  // A repo's own provider choice is its author's, not this device owner's, until the owner approves the repo.
+  const choices = (kind: ProviderKind) => consent.projectChoicesCount ? parsed[kind] : globalConfig[kind];
   const legacyExtractor = withConsentRequirement(
     resolveProviderConfig("extractor", defaults.extractor, globalConfig, parsed.extractor),
-    providerChosenByUser("extractor", globalConfig, parsed.extractor),
+    providerChosenByUser("extractor", globalConfig, choices("extractor")),
     consent
   );
   const legacyInvestigator = withConsentRequirement(
     resolveProviderConfig("investigator", defaults.investigator, globalConfig, parsed.investigator),
-    providerChosenByUser("investigator", globalConfig, parsed.investigator),
+    providerChosenByUser("investigator", globalConfig, choices("investigator")),
     consent
   );
   const legacy = legacyJobModels(legacyExtractor, legacyInvestigator);
@@ -1087,6 +1268,8 @@ interface RemoteModelConsent {
   allowRemoteModels: boolean;
   /** Variables given a value in Butler's own .env files; a key put there was meant for Butler. */
   butlerEnvKeys: ReadonlySet<string>;
+  /** Whether this device's owner approved the repo's settings, so its provider choices count as theirs. */
+  projectChoicesCount: boolean;
 }
 
 /**
@@ -1255,15 +1438,23 @@ function globalProjectConfig(config: GlobalConfigFile): ProjectConfigFile {
 }
 
 function loadGlobalEnv(): Set<string> {
-  return loadEnvFile(join(globalConfigDir(), ".env"));
+  return loadEnvFile(join(globalConfigDir(), ".env"), markFilledFromGlobalEnv);
 }
 
-function loadProjectEnv(rootDir: string): Set<string> {
-  return loadEnvFile(join(rootDir, ".code-butler", ".env"));
+/** A trusted project's .env values, never written to process.env; names that change how programs run are dropped. */
+function readProjectEnv(rootDir: string): Map<string, string> {
+  const values = new Map<string, string>();
+  const envPath = join(rootDir, ".code-butler", ".env");
+  if (!existsSync(envPath)) return values;
+  for (const line of readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const parsed = parseEnvLine(line);
+    if (parsed && parsed[1].trim() && !isReservedEnvName(parsed[0])) values.set(parsed[0], parsed[1]);
+  }
+  return values;
 }
 
 /** Returns the names the file gives a value, whether or not the environment already had one. */
-function loadEnvFile(envPath: string): Set<string> {
+function loadEnvFile(envPath: string, filled?: (key: string) => void): Set<string> {
   const defined = new Set<string>();
   if (!existsSync(envPath)) return defined;
   const lines = readFileSync(envPath, "utf8").split(/\r?\n/);
@@ -1274,6 +1465,7 @@ function loadEnvFile(envPath: string): Set<string> {
     if (value.trim()) defined.add(key);
     if (process.env[key] === undefined || process.env[key] === "") {
       process.env[key] = value;
+      filled?.(key);
     }
   }
   return defined;
@@ -1310,6 +1502,18 @@ export function setGlobalEnvValue(name: string, value: string | undefined): stri
   try { renameSync(temporary, envPath); }
   catch (error) { rmSync(temporary, { force: true }); throw error; }
   return previous;
+}
+
+/** Read a stored global .env value without substituting a shell or project override. Never return it to the desktop. */
+export function storedGlobalEnvValue(name: string): string | undefined {
+  const path = join(globalConfigDir(), ".env");
+  if (!existsSync(path)) return undefined;
+  let value: string | undefined;
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const parsed = parseEnvLine(line);
+    if (parsed?.[0] === name) value = parsed[1];
+  }
+  return value;
 }
 
 function ensureProjectGitignore(rootDir: string): void {

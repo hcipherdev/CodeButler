@@ -63,6 +63,23 @@ describe("AI credentials", () => {
     expect(credentialStatus({ ...aws, workspaceId: undefined })).toMatchObject({ ok: false, missing: ["TEST_AWS_WS"] });
   });
 
+  it("uses explicit workspace and region edits while leaving legacy environment precedence intact", () => {
+    vi.stubEnv("TEST_AWS_WS", "from-environment"); vi.stubEnv("TEST_AWS_REGION", "us-east-1");
+    const config: ExtractorConfig = { provider: "anthropic-aws", model: "m", apiKeyEnv: "TEST_AWS_KEY", workspaceIdEnv: "TEST_AWS_WS", regionEnv: "TEST_AWS_REGION", workspaceId: "saved-workspace", region: "eu-west-1" };
+    expect(resolveAwsSettings(config)).toEqual({ workspaceId: "from-environment", region: "us-east-1" });
+    expect(resolveAwsSettings({ ...config, preferSavedAwsSettings: true })).toEqual({ workspaceId: "saved-workspace", region: "eu-west-1" });
+    expect(resolveAwsSettings({ ...config, workspaceId: undefined, preferSavedAwsSettings: true })).toEqual({ workspaceId: "from-environment", region: "eu-west-1" });
+  });
+
+  it("uses an explicitly replaced key instead of an older environment key", async () => {
+    vi.stubEnv("TEST_OPENROUTER_KEY", "old-shell-key");
+    const { store } = fakeStore({ openrouter: "new-saved-key" }); setKeychainStoreForTests(store);
+    const config = openrouter({ keyUpdatedAt: "replacement", preferSavedKey: true });
+    expect(credentialStatus(config)).toMatchObject({ keySource: "keychain", ok: true });
+    expect(await resolveApiKey(config)).toBe("new-saved-key");
+    expect(await resolveApiKey({ ...config, preferSavedKey: false })).toBe("old-shell-key");
+  });
+
   it("reports a model waiting for the remote-model opt-in as not ready, even with its key present", () => {
     vi.stubEnv("TEST_OPENROUTER_KEY", "from-env");
     expect(credentialStatus(openrouter({ requiresConsent: true }))).toEqual({

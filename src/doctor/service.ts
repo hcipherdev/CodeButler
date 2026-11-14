@@ -5,13 +5,13 @@ import { credentialStatus, REMOTE_MODEL_CONSENT } from "../ai/credentials.js";
 import { jobModel } from "../ai/models.js";
 import { DatabaseSync } from "node:sqlite";
 
-import { analyzeSharedConfigPortability, globalConfigDir, loadExistingProjectConfig } from "../config.js";
+import { analyzeSharedConfigPortability, DEFAULT_LOG_RETENTION, globalConfigDir, loadExistingProjectConfig } from "../config.js";
 import { getProjectSummaryStatus } from "../project-summary/service.js";
 import { inspectProjectSetupArtifacts } from "../project-setup.js";
 import { getClaudeSourceStatus, getCodexSourceStatus, type ConversationSourceStatus } from "../sources/codex.js";
 import { getMigrationStatus } from "../storage/migrations.js";
 import { isLoopbackEmbeddingEndpoint } from "../embeddings/provider.js";
-import { inspectArtifactMaintenance } from "../maintenance/artifacts.js";
+import { GLOBAL_WATCH_LOG_NAMES, inspectArtifactMaintenance, runLogDirectoryMaintenance } from "../maintenance/artifacts.js";
 import { createEmbeddingContentHash, createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey } from "../embeddings/fingerprint.js";
 import { openMemoryStore, type MemoryStore } from "../storage/store.js";
 import { summarizeMemoryHealth } from "../memory/quality.js";
@@ -121,6 +121,23 @@ export function runDoctor(rootDir: string, options: DoctorRunOptions = {}): Doct
         detail: "Configuration loaded without writing defaults."
       });
       addConfigPortabilityCheck(projectRoot, addCheck, addAction);
+      const ignored = config.trust?.status === "untrusted" ? config.trust.ignored : [];
+      addCheck({
+        id: "config:trust",
+        category: "project",
+        status: ignored.length ? "warning" : "ok",
+        title: ignored.length ? "Project settings await approval on this device" : "Project settings are approved",
+        detail: ignored.length
+          ? `Ignored until approved: ${ignored.join(", ")}. Anyone who can commit to this repository can write .code-butler/.`
+          : "Nothing in .code-butler/ changes destinations, keys or programs without approval."
+      });
+      if (ignored.length) {
+        addAction({
+          priority: "high",
+          command: "code-butler config trust status",
+          reason: "Review the repository's own provider, source, privacy and rules settings, then approve them with code-butler config trust approve."
+        });
+      }
     } catch (error) {
       addCheck({
         id: "config:load",
@@ -480,6 +497,11 @@ function addArtifactMaintenanceCheck(
   addAction: (action: DoctorNextAction) => void
 ): void {
   const result = inspectArtifactMaintenance(rootDir, config.retention!.artifacts, { now });
+  // The global watcher's logs belong to no project; the watcher rotates them hourly, and this shows what it will do.
+  const global = runLogDirectoryMaintenance(join(globalConfigDir(), "watch", "logs"), GLOBAL_WATCH_LOG_NAMES, DEFAULT_LOG_RETENTION, { apply: false });
+  result.scanned += global.scanned;
+  result.items.push(...global.items);
+  result.warnings.push(...global.warnings);
   const status: DoctorStatus = result.items.length > 0 || result.warnings.length > 0 ? "warning" : "ok";
   addCheck({
     id: "maintenance:artifacts",

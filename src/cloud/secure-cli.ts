@@ -11,7 +11,7 @@ import { restoreRecovery, rotateVault } from "./vault-client.js";
 import { reviewProjectConflict, resolveProjectConflict } from "./project-review.js";
 import { setEncryptedCloudSyncEnabled } from "./sync-toggle.js";
 import { cloudProjectList, makeProjectPortable, separateProjectIdentity, inspectProjectConnection } from "./project-connections.js";
-import { atomicJson, binding, readJson, serverUrl, UUID } from "./state.js";
+import { atomicJson, binding, defaultCloudServer, readJson, serverUrl, UUID } from "./state.js";
 import { migrateCheckout } from "./checkout-repair.js";
 import { LinkReviewRequiredError, reviewProjectLink } from "./project-link-review.js";
 
@@ -51,7 +51,9 @@ export async function runSecureCloudCommand(args:string[],root:string,output:(li
     output("Cloud sync disabled; local memories retained.");return 0;
   }
   const saved=readJson<{server:string}>(selectionPath());
-  const server=serverUrl(flags.get("--server") ?? saved?.server ?? (()=>{throw new EncryptionError("authentication-required");})());
+  // Only sign-in may fall back to the hosted service; other commands need the server their session was created on.
+  const fallback=["register","login"].includes(action) ? defaultCloudServer : ()=>{throw new EncryptionError("authentication-required");};
+  const server=serverUrl(flags.get("--server") ?? saved?.server ?? fallback());
   const client=new AccountClient(server);
   if(action==="register") {
     const challenge=await client.challenge(required("--email"),"register");

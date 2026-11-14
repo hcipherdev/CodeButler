@@ -1,5 +1,7 @@
 import https from "node:https";
 
+import { readEnv } from "../project-env.js";
+
 export interface AnthropicAwsMessageRequest {
   model: string;
   maxTokens: number;
@@ -17,6 +19,8 @@ export interface AnthropicAwsMessageRequest {
   apiKey?: string | undefined;
   workspaceId?: string | undefined;
   region?: string | undefined;
+  /** The project whose own .env is read before process.env; see src/project-env.ts. */
+  envRoot?: string | undefined;
 }
 
 export interface AnthropicAwsMessageResponse {
@@ -52,9 +56,9 @@ export async function runAnthropicAwsMessage(
   httpClient: AnthropicAwsHttpClient = nodeHttpsRequest
 ): Promise<AnthropicAwsMessageResponse> {
   const direct = request.kind === "anthropic";
-  const apiKey = request.apiKey ?? readRequiredEnv(request.apiKeyEnv, direct ? "Anthropic API key" : "Anthropic AWS API key");
-  const workspaceId = direct ? undefined : request.workspaceId ?? readRequiredEnv(request.workspaceIdEnv, "Anthropic AWS workspace ID");
-  const region = direct ? undefined : request.region ?? readRequiredEnv(request.regionEnv, "AWS region");
+  const apiKey = request.apiKey ?? readRequiredEnv(request.apiKeyEnv, direct ? "Anthropic API key" : "Anthropic AWS API key", request.envRoot);
+  const workspaceId = direct ? undefined : request.workspaceId ?? readRequiredEnv(request.workspaceIdEnv, "Anthropic AWS workspace ID", request.envRoot);
+  const region = direct ? undefined : request.region ?? readRequiredEnv(request.regionEnv, "AWS region", request.envRoot);
   const baseUrl = direct
     ? request.baseUrl?.trim() || "https://api.anthropic.com"
     : request.baseUrl?.trim() ||
@@ -175,8 +179,8 @@ export function anthropicAwsRequestConfig(config: {
   };
 }
 
-function readRequiredEnv(envName: string, label: string): string {
-  const value = process.env[envName]?.trim();
+function readRequiredEnv(envName: string, label: string, envRoot: string | undefined): string {
+  const value = readEnv(envName, envRoot);
   if (!value) {
     throw new Error(`${label} is missing; set ${envName}`);
   }

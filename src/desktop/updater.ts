@@ -2,7 +2,7 @@ import { createHash, createPublicKey, verify } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { globalConfigDir } from "../config.js";
-import { buildInfo } from "../runtime.js";
+import { buildInfo, type BuildInfo } from "../runtime.js";
 
 /**
  * Public half of `secrets/updater/code-butler-updater.key` (the base64 `.pub` file that
@@ -24,7 +24,11 @@ export interface UpdateStatus {
   publishedAt?: string | undefined;
   /** True when the newest release has no installer for this computer. */
   unsupported?: boolean | undefined;
+  /** True for a Microsoft Store build: the Store installs updates, so nothing is checked here. */
+  store?: boolean | undefined;
 }
+
+const STORE_MANAGED = "This copy of Code Butler is updated by the Microsoft Store.";
 
 /** The manifest key for this computer, matching what `scripts/build/release-manifest.mjs` writes. */
 export function platformKey(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
@@ -96,7 +100,8 @@ async function fetchManifest(fetchImpl: typeof fetch): Promise<UpdateManifest> {
 }
 
 /** Whether a newer release than this build exists for this computer. Never downloads anything. */
-export async function checkForUpdate(fetchImpl: typeof fetch = fetch, current: string = buildInfo.version): Promise<UpdateStatus> {
+export async function checkForUpdate(fetchImpl: typeof fetch = fetch, current: string = buildInfo.version, distribution: BuildInfo["distribution"] = buildInfo.distribution): Promise<UpdateStatus> {
+  if (distribution === "store") return { current, available: false, store: true };
   const manifest = await fetchManifest(fetchImpl);
   const newer = compareVersions(manifest.version, current) > 0;
   const supported = Boolean(manifest.platforms[platformKey()]);
@@ -110,7 +115,8 @@ export const updatesDirectory = () => join(globalConfigDir(), "updates");
  * `updates/pending.json` for the desktop shell to launch. The URL always comes from a fresh copy
  * of the manifest, never from the page, and only GitHub release hosts are accepted.
  */
-export async function downloadUpdate(version: string, fetchImpl: typeof fetch = fetch, current: string = buildInfo.version, publicKey: string = UPDATE_PUBLIC_KEY): Promise<{ version: string; file: string }> {
+export async function downloadUpdate(version: string, fetchImpl: typeof fetch = fetch, current: string = buildInfo.version, publicKey: string = UPDATE_PUBLIC_KEY, distribution: BuildInfo["distribution"] = buildInfo.distribution): Promise<{ version: string; file: string }> {
+  if (distribution === "store") throw new Error(STORE_MANAGED);
   const manifest = await fetchManifest(fetchImpl);
   if (manifest.version !== version) throw new Error("A newer release appeared meanwhile. Check for updates again.");
   if (compareVersions(version, current) <= 0) throw new Error("This version is already installed.");

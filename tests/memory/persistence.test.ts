@@ -93,7 +93,7 @@ describe("schema-24 persistence", () => {
         exportMemoryHandbook(a.store);
         close(a.store);
         const capture = await captureSnapshot(a.root, randomUUID(), 0, randomUUID());
-        expect(capture.snapshot.schemaVersion).toBe(24);
+        expect(capture.snapshot.schemaVersion).toBe(26);
         expect(capture.snapshot.segments.some(s => s.id.includes("handbook"))).toBe(false);
         vi.stubEnv("CODE_BUTLER_HOME", join(directory, "home-b"));
         const b = fixture();

@@ -94,11 +94,39 @@ An equivalent `core` fact is converged on instead of duplicated, and a contradic
 defers the candidate as `needs_review`. Confidence is the extractor's own rating, so the
 bars are coarse cuts rather than probabilities.
 
+A candidate that stays unpromoted and unused for `promotion.automatic.candidateExpiryDays`
+(30) active days is discarded by a system review, so the candidate queue drains without a
+person. The clock starts at the later of the candidate's last change and its last use:
+an agent was handed it by `find_memories` or `search_project_memory`, a person opened it in
+the desktop app, or an AI review proposed a correction to it. Usage is noted in the
+checkout's `memory-usage.jsonl` by the read and moved into the synced `memory_usage` table
+at the next sync, so use on any device counts.
+
+Active days, not calendar days, are counted, so time away does not count:
+
+| Candidate | Active day |
+|---|---|
+| Shared (`core`) | a day any synced device imported commits or conversations |
+| This device's own (`device:` layer) | a day this device imported evidence; an idle device never expires its own |
+
+Branch and other devices' candidates are not expired here. Nothing expires while the
+project has fewer than 10 durable `core` memories, since candidates are then most of what
+it remembers. Candidates a person (desktop, CLI or MCP) has reviewed, those with an undone
+review (so an undone expiry stays undone), and quarantined ones are left alone. Set
+`candidateExpiryDays: 0` to keep candidates indefinitely.
+
+A whole pass is restored in one step, on any device: `code-butler memory promotions
+--undo-expiry` restores the latest (`--at <time>` picks another), undoing every expiry
+discard on its candidates, including one another device wrote before they synced. The
+desktop overview offers **Check** for two weeks after a pass: it lists the discarded
+candidates, each with **Restore**, plus **Restore all**. `promotions --history` shows the
+last pass.
+
 ```json
 {
   "promotion": {
     "confidenceThreshold": 0.85,
-    "automatic": { "enabled": true, "coreCandidates": true, "singleSourceMinConfidence": 0.9 }
+    "automatic": { "enabled": true, "coreCandidates": true, "singleSourceMinConfidence": 0.9, "candidateExpiryDays": 30 }
   }
 }
 ```
@@ -109,6 +137,7 @@ code-butler memory promotions --apply                     # run a pass now inste
 code-butler memory promotions --history                   # decisions already taken on this device
 code-butler memory promotions --undo --since 2026-10-09T00:00:00Z
 code-butler memory promotions --undo --id <candidate-id>
+code-butler memory promotions --undo-expiry               # restore the last expiry pass
 ```
 
 Undo covers core-candidate promotions this device decided. It withdraws (retracts) the
@@ -138,9 +167,15 @@ resolved) requests. A superseded memory is restored with
 
 ## Automatic review
 
-Once a day the watcher starts a background AI review of memories flagged as possibly
-outdated: `needs_review` memories with `stale_related_file_evidence`, `possibly_outdated`,
-`invalidated_by_newer_evidence` or `review_context_changed`. Durable memories go first.
+Once a day the watcher starts a background AI review of flagged memories: `needs_review`
+memories with `stale_related_file_evidence`, `possibly_outdated`,
+`invalidated_by_newer_evidence`, `review_context_changed`, `potential_conflict`,
+`automatic_promotion_conflict`, `cloud_merge_conflict`, `low_confidence` or `missing_claim`.
+Durable memories go first. With core-candidate promotion on, the remaining daily budget asks
+about `active` core candidates still waiting for corroboration whose confidence meets
+`promotion.automatic.singleSourceMinConfidence`, oldest first; a `current` verdict lets the
+next sync promote them. Lower-confidence candidates are not asked about, since that verdict
+could not promote them; they expire instead.
 Each memory is one request to the configured investigator model, which sees the memory, its
 evidence, the current content of its related files and their latest commits (the same
 review as `code-butler memory reconcile`).
@@ -154,10 +189,14 @@ review as `code-butler memory reconcile`).
 ```
 
 A `current` verdict verifies the memory, which clears its flag and can let it promote; an
-`obsolete` verdict discards a candidate or retracts a durable memory. Corrections
-(`changed`) and `low_value` verdicts stay in the review queue for a person. A memory judged
-`uncertain`, or waiting for a person, is not asked again for 14 days. The run needs the
-investigator's API key in the watcher's environment; without it the review is skipped. It
+`obsolete` verdict discards a candidate or retracts a durable memory. A `low_value` verdict
+discards a candidate; on a durable memory it stays in the review queue for a person, as do
+corrections (`changed`). A memory judged `uncertain`, or waiting for a person, is not asked
+again for 14 days; a durable memory judged `uncertain` three times without changing is kept
+by a system verify, which clears its flag until its evidence or related files change. The
+run needs the investigator's API key in the watcher's environment; without it the review is
+skipped. A Claude Code review model runs only when a person starts a review, so the daily
+run is skipped for it. It
 writes no database backup copies, because every applied verdict is reverted with
 `code-butler memory reconcile revert --run <id>`.
 

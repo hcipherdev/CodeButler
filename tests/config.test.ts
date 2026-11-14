@@ -7,8 +7,10 @@ import {
   analyzeSharedConfigPortability,
   ensureProjectConfig,
   loadProjectConfig,
-  migrateSharedConfigToLocal
+  migrateSharedConfigToLocal,
+  trustProjectSettings
 } from "../src/config.js";
+import { readEnv } from "../src/project-env.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
 describe("project config", () => {
@@ -94,9 +96,11 @@ describe("project config", () => {
       provider: "openai-compatible",
       baseUrl: "http://127.0.0.1:11434/v1",
       model: "nomic-embed-text",
-      batchSize: 16
+      batchSize: 16,
+      envRoot: rootDir
     });
     expect(defaults.privacy).toEqual({ allowRemoteEmbeddings: false, allowRemoteModels: false, redactionPatterns: [] });
+    expect(defaults.trust).toEqual({ status: "none-needed", ignored: [] });
     expect(defaults.retention!.migrationBackups).toBe(2);
     expect(defaults.retention!.sources.manual.maxAgeDays).toBeNull();
     expect(defaults.retention!.artifacts.logs.maxBytes).toBe(5 * 1024 * 1024);
@@ -134,6 +138,8 @@ describe("project config", () => {
       )
     );
 
+    // Written by the owner of this device, so approved here; project-trust.test.ts covers the unapproved case.
+    trustProjectSettings(rootDir);
     const overridden = loadProjectConfig(rootDir);
     expect(overridden.sources.git.enabled).toBe(false);
     expect(overridden.sources.git.repoPath).toBe(join(rootDir, "repo"));
@@ -176,6 +182,7 @@ describe("project config", () => {
         embeddings: { enabled: true, model: "local-model" }
       })
     );
+    trustProjectSettings(rootDir);
 
     const config = loadProjectConfig(rootDir);
 
@@ -353,6 +360,7 @@ describe("project config", () => {
         }
       })
     );
+    trustProjectSettings(rootDir);
 
     const config = loadProjectConfig(rootDir);
 
@@ -363,7 +371,8 @@ describe("project config", () => {
       baseUrl: "https://embeddings.example/v1/",
       model: "embedding-model",
       apiKeyEnv: "EMBEDDING_API_KEY",
-      batchSize: 8
+      batchSize: 8,
+      envRoot: rootDir
     });
     expect(config.retention?.overrides).toEqual([
       { sourceId: "temporary-conversation", maxAgeDays: 7 }
@@ -395,7 +404,8 @@ describe("project config", () => {
       provider: "openai-compatible",
       baseUrl: "http://127.0.0.1:11434/v1",
       model: "nomic-embed-text",
-      batchSize: 16
+      batchSize: 16,
+      envRoot: rootDir
     });
     expect(config.privacy).toEqual({ allowRemoteEmbeddings: false, allowRemoteModels: false, redactionPatterns: [] });
     expect(config.retention!.migrationBackups).toBe(2);
@@ -531,35 +541,47 @@ describe("project config", () => {
         2
       )
     );
+    trustProjectSettings(rootDir);
 
     const config = loadProjectConfig(rootDir);
 
     expect(config.sources.codex.roots).toEqual([join(rootDir, "custom-codex")]);
   });
 
-  it("loads missing environment variables from project .code-butler/.env", () => {
+  it("reads a trusted project's .env keys for its own models without writing process.env", () => {
     const rootDir = makeTempDir();
-    tempDirs.push(rootDir);
-    for (const key of envKeys) {
+    const globalHome = makeTempDir();
+    tempDirs.push(rootDir, globalHome);
+    for (const key of [...envKeys, "BUTLER_TEST_FILE_KEY", "BUTLER_TEST_EXISTING_KEY", "BUTLER_TEST_UNUSED_KEY"]) {
       originalEnv.set(key, process.env[key]);
       delete process.env[key];
     }
-    process.env.CODE_BUTLER_TEST_EXISTING_ENV = "from-shell";
+    process.env.CODE_BUTLER_HOME = globalHome;
+    process.env.BUTLER_TEST_EXISTING_KEY = "from-shell";
 
-    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(configPath, JSON.stringify({
+      extractor: { apiKeyEnv: "BUTLER_TEST_FILE_KEY" },
+      investigator: { apiKeyEnv: "BUTLER_TEST_EXISTING_KEY" }
+    }));
     writeFileSync(
       join(rootDir, ".code-butler", ".env"),
       [
         "# Project-local Code Butler credentials",
-        "export CODE_BUTLER_TEST_FILE_ENV=\"from-file\"",
-        "CODE_BUTLER_TEST_EXISTING_ENV=from-file"
+        "export BUTLER_TEST_FILE_KEY=\"from-file\"",
+        "BUTLER_TEST_EXISTING_KEY=from-file",
+        "BUTLER_TEST_UNUSED_KEY=from-file"
       ].join("\n")
     );
+    trustProjectSettings(rootDir);
 
-    loadProjectConfig(rootDir);
+    const config = loadProjectConfig(rootDir);
 
-    expect(process.env.CODE_BUTLER_TEST_FILE_ENV).toBe("from-file");
-    expect(process.env.CODE_BUTLER_TEST_EXISTING_ENV).toBe("from-shell");
+    expect(readEnv("BUTLER_TEST_FILE_KEY", config.extractor.envRoot)).toBe("from-file");
+    expect(readEnv("BUTLER_TEST_EXISTING_KEY", config.investigator.envRoot)).toBe("from-shell");
+    expect(readEnv("BUTLER_TEST_UNUSED_KEY", rootDir)).toBeUndefined();
+    expect(process.env.BUTLER_TEST_FILE_KEY).toBeUndefined();
+    expect(readEnv("BUTLER_TEST_FILE_KEY")).toBeUndefined();
   });
 
   it("loads missing environment variables from global Code Butler .env", () => {
@@ -583,39 +605,45 @@ describe("project config", () => {
     const rootDir = makeTempDir();
     const globalHome = makeTempDir();
     tempDirs.push(rootDir, globalHome);
-    for (const key of ["CODE_BUTLER_HOME", "CODE_BUTLER_TEST_GLOBAL_ENV"]) {
+    for (const key of ["CODE_BUTLER_HOME", "BUTLER_TEST_SHARED_KEY"]) {
       originalEnv.set(key, process.env[key]);
       delete process.env[key];
     }
     process.env.CODE_BUTLER_HOME = globalHome;
-    process.env.CODE_BUTLER_TEST_GLOBAL_ENV = "from-shell";
+    process.env.BUTLER_TEST_SHARED_KEY = "from-shell";
 
-    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
-    writeFileSync(join(rootDir, ".code-butler", ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-project\n");
-    writeFileSync(join(globalHome, ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-global\n");
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(configPath, JSON.stringify({ extractor: { apiKeyEnv: "BUTLER_TEST_SHARED_KEY" } }));
+    writeFileSync(join(rootDir, ".code-butler", ".env"), "BUTLER_TEST_SHARED_KEY=from-project\n");
+    writeFileSync(join(globalHome, ".env"), "BUTLER_TEST_SHARED_KEY=from-global\n");
+    trustProjectSettings(rootDir);
 
-    loadProjectConfig(rootDir);
+    const config = loadProjectConfig(rootDir);
 
-    expect(process.env.CODE_BUTLER_TEST_GLOBAL_ENV).toBe("from-shell");
+    expect(readEnv("BUTLER_TEST_SHARED_KEY", config.extractor.envRoot)).toBe("from-shell");
   });
 
   it("keeps project env values over global env values", () => {
     const rootDir = makeTempDir();
     const globalHome = makeTempDir();
     tempDirs.push(rootDir, globalHome);
-    for (const key of ["CODE_BUTLER_HOME", "CODE_BUTLER_TEST_GLOBAL_ENV"]) {
+    for (const key of ["CODE_BUTLER_HOME", "BUTLER_TEST_SHARED_KEY"]) {
       originalEnv.set(key, process.env[key]);
       delete process.env[key];
     }
     process.env.CODE_BUTLER_HOME = globalHome;
 
-    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
-    writeFileSync(join(rootDir, ".code-butler", ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-project\n");
-    writeFileSync(join(globalHome, ".env"), "CODE_BUTLER_TEST_GLOBAL_ENV=from-global\n");
+    const configPath = ensureProjectConfig(rootDir);
+    writeFileSync(configPath, JSON.stringify({ extractor: { apiKeyEnv: "BUTLER_TEST_SHARED_KEY" } }));
+    writeFileSync(join(rootDir, ".code-butler", ".env"), "BUTLER_TEST_SHARED_KEY=from-project\n");
+    writeFileSync(join(globalHome, ".env"), "BUTLER_TEST_SHARED_KEY=from-global\n");
+    trustProjectSettings(rootDir);
 
-    loadProjectConfig(rootDir);
+    const config = loadProjectConfig(rootDir);
 
-    expect(process.env.CODE_BUTLER_TEST_GLOBAL_ENV).toBe("from-project");
+    expect(process.env.BUTLER_TEST_SHARED_KEY).toBe("from-global");
+    expect(readEnv("BUTLER_TEST_SHARED_KEY", config.extractor.envRoot)).toBe("from-project");
+    expect(readEnv("BUTLER_TEST_SHARED_KEY")).toBe("from-global");
   });
 
   it("resolves global default profiles into concrete provider config", () => {
@@ -768,6 +796,7 @@ describe("project config", () => {
         2
       )
     );
+    trustProjectSettings(rootDir);
 
     const config = loadProjectConfig(rootDir);
 

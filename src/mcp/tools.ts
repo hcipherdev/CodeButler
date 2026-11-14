@@ -35,9 +35,10 @@ import { execFileSync } from "node:child_process";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-import { loadProjectConfig } from "../config.js";
+import { loadProjectConfig, readProjectTrust } from "../config.js";
 import { join } from "node:path";
 import { readProjectSetupStatus, type ProjectSetupStatus } from "../project-setup.js";
+import type { UnboundProjectInfo } from "./project-binding.js";
 import { findDecisions } from "../decisions/store.js";
 import { runDoctor } from "../doctor/service.js";
 import { buildTrustSummary, resolveEvidenceCitations } from "../evidence/citations.js";
@@ -55,6 +56,7 @@ import {
   type ProjectSummaryOperationOptions,
   type ProjectSummaryRefreshResult
 } from "../project-summary/service.js";
+import { noteMemoryUsage } from "../memory/usage.js";
 import type { MemoryStore, ProjectSummary } from "../storage/store.js";
 import { importNewGitCommits, syncProjectMemory } from "../sync/service.js";
 import type {
@@ -158,19 +160,38 @@ export interface CurrentProjectInfo {
   configCreated: boolean;
   databaseCreated: boolean;
   setup: ProjectSetupStatus;
+  trust?: ProjectTrustInfo;
+}
+
+/** What an agent should tell the person when the repo's own settings wait for approval on this device. */
+export interface ProjectTrustInfo { status: "none-needed" | "trusted" | "untrusted"; ignored: string[]; command?: string }
+
+export function projectTrustInfo(rootDir: string): ProjectTrustInfo | undefined {
+  try {
+    const trust = readProjectTrust(rootDir);
+    return trust.status === "untrusted"
+      ? { status: trust.status, ignored: trust.paths, command: "code-butler config trust status" }
+      : { status: trust.status, ignored: [] };
+  } catch { return undefined; }
 }
 
 /** File-only identity/status reads must not queue behind ingestion or cloud work. */
 export function readCurrentProjectInfo(rootDir: string, startup: ProjectStartupMetadata = { configCreated: false, databaseCreated: false }): CurrentProjectInfo {
   const dataDir = join(rootDir, ".code-butler");
   return { rootDir, dataDir, configPath: join(dataDir, "config.json"), databasePath: join(dataDir, "memory.sqlite"),
-    ...startup, setup: readProjectSetupStatus(rootDir) };
+    ...startup, setup: readProjectSetupStatus(rootDir), ...optionalTrust(rootDir) };
+}
+
+function optionalTrust(rootDir: string): { trust?: ProjectTrustInfo } {
+  const trust = projectTrustInfo(rootDir);
+  return trust ? { trust } : {};
 }
 
 export interface ProjectMemoryToolHandlers {
   get_applicable_rules(input: import("../rules/match.js").RuleQuery): import("../rules/match.js").RulePage;
   record_rule_attestation(input: RecordAttestationInput): ReturnType<typeof recordAttestation>;
-  current_project(): CurrentProjectInfo;
+  /** A project session ignores projectRoot; the stdio router uses it to bind a project. */
+  current_project(input?: { projectRoot?: string }): CurrentProjectInfo | UnboundProjectInfo | Promise<CurrentProjectInfo | UnboundProjectInfo>;
   search_project_memory(input: {
     targetEnvironment?: TargetEnvironment;
     query: string;
@@ -292,7 +313,7 @@ export interface ProjectMemoryToolHandlers {
   summarize_project_state(): ProjectSummary;
   summarize_memory_health(): ReturnType<typeof summarizeMemoryHealth>;
   run_doctor(): DoctorReport;
-  summarize_project_brief(): ProjectBrief & ReturnType<typeof readAgentContext> & { globalRules?: ReturnType<typeof buildRulesCatalog> };
+  summarize_project_brief(): ProjectBrief & ReturnType<typeof readAgentContext> & { globalRules?: ReturnType<typeof buildRulesCatalog>; trust?: ProjectTrustInfo };
   refresh_project_summary(input: { force?: boolean }): Promise<ProjectSummaryRefreshResult>;
 }
 
@@ -339,6 +360,7 @@ export function createProjectMemoryToolHandlers(
     async search_project_memory(input) {
       // Agents phrase queries as loose keywords, so memory matching is by term, not exact phrase.
       const result = withApplicability(await searchProjectMemory(store, config, { ...normalizeSearchInput(input), match: "terms" }, options.searchService), input.targetEnvironment);
+      noteCandidatesUsed(store, result.memories);
       return {
         memories: result.memories,
         results: result.results.map((item) => decorateSearchResult(store, item))
@@ -359,6 +381,7 @@ export function createProjectMemoryToolHandlers(
       // The layer filter now travels into storage retrieval, so the result limit
       // applies to matching rows instead of hiding them behind newer core memories.
       const found = await findProjectMemories(store, config, { ...normalizeMemorySearchInput(input), match: "terms" }, options.searchService);
+      noteCandidatesUsed(store, found);
       return { results: withApplicability(found, input.targetEnvironment) };
     },
     update_memory_scope(input) { return updateMemoryScope(store, input, "mcp"); },
@@ -502,7 +525,7 @@ export function createProjectMemoryToolHandlers(
       return runDoctor(rootDir, options.now === undefined ? {} : { now: options.now });
     },
     summarize_project_brief() {
-      return { ...readProjectBrief(rootDir), ...readAgentContext(rootDir,store), setup: readProjectSetupStatus(rootDir), globalRules: buildRulesCatalog(rootDir) };
+      return { ...readProjectBrief(rootDir), ...readAgentContext(rootDir,store), setup: readProjectSetupStatus(rootDir), globalRules: buildRulesCatalog(rootDir), ...optionalTrust(rootDir) };
     },
     refresh_project_summary(input) {
       const refreshOptions: ProjectSummaryOperationOptions = {};
@@ -1189,4 +1212,10 @@ function asJsonContent(value: unknown): { content: Array<{ type: "text"; text: s
       }
     ]
   };
+}
+
+/** Candidates an agent was handed count as used, which keeps them from expiring (src/memory/usage.ts). */
+function noteCandidatesUsed(store: MemoryStore, memories: ReadonlyArray<{ kind: string; id: string; layer?: string | undefined }>): void {
+  noteMemoryUsage(store.paths.rootDir, memories.flatMap((memory) =>
+    memory.kind === "candidate" ? [{ category: "candidate" as const, id: memory.id, layer: memory.layer ?? "core" }] : []));
 }

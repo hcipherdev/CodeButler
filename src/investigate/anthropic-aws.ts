@@ -4,6 +4,7 @@ import {
   investigationSynthesisSchema
 } from "./actions.js";
 import { chatCompletion } from "../ai/chat.js";
+import { parseFencedJson } from "../json.js";
 import { anthropicAwsRequestConfig, type AnthropicAwsHttpClient } from "../providers/anthropic-aws.js";
 import type {
   InvestigationPlannerState,
@@ -45,7 +46,7 @@ export function createAnthropicAwsInvestigator(
         retryReason: options?.retryReason,
         state: summarizePlannerState(state)
       });
-      const parsed = investigationPlanDecisionSchema.parse(JSON.parse(content));
+      const parsed = investigationPlanDecisionSchema.parse(parseFencedJson(content));
       return parsed;
     },
     async synthesizeAnswer(state) {
@@ -53,7 +54,7 @@ export function createAnthropicAwsInvestigator(
         kind: "synthesize_answer",
         state: summarizePlannerState(state)
       });
-      const parsed = investigationSynthesisSchema.parse(JSON.parse(content));
+      const parsed = investigationSynthesisSchema.parse(parseFencedJson(content));
       return parsed;
     }
   };

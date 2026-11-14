@@ -1,3 +1,4 @@
+import { latestCandidateExpiry, type CandidateExpiryPass } from "../memory/automatic-promotion.js";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, watch, type FSWatcher } from "node:fs";
 import { DatabaseSync, type StatementSync, type SQLInputValue } from "node:sqlite";
@@ -51,6 +52,8 @@ export interface Publication {
     summary: unknown;
     summaryStatus?: ProjectSummaryStatus;
     summaryCommits?: ReturnType<MemoryStore["findCommits"]>;
+    /** The last candidate expiry pass, so the overview can offer a restore on any device. */
+    lastExpiry?: CandidateExpiryPass;
 }
 function isGeneratedOnlyCommit(store: MemoryStore, hash: string): boolean {
     const row = store.db.prepare("select changed_files_json from commits where hash=?").get(hash) as {
@@ -424,7 +427,8 @@ export function publishRetrieval(store: MemoryStore, root: string, identity: str
         const summaryCommits = store.findCommits({ limit: 100 });
         const knowledgeMemories=(db.prepare("select payload from records where category in ('candidate','promoted') order by id").all() as Array<{payload:string}>).map(row=>JSON.parse(row.payload) as MemorySearchResult);
         db.prepare("insert or replace into memory_knowledge values(1,?)").run(JSON.stringify(readMemoryKnowledge(store,knowledgeMemories)));
-        const publication: Publication = { format: 3, identity, sequence, epoch, policy, privacyPolicy: retrievalPrivacyPolicy(root), indexedAt: new Date().toISOString(), revision, health: auditHealth, summary, summaryCommits, summaryStatus: publishedSummaryStatus(root, db, summary, summaryCommits) };
+        const lastExpiry = latestCandidateExpiry(store);
+        const publication: Publication = { format: 3, identity, sequence, epoch, policy, privacyPolicy: retrievalPrivacyPolicy(root), indexedAt: new Date().toISOString(), revision, health: auditHealth, summary, summaryCommits, summaryStatus: publishedSummaryStatus(root, db, summary, summaryCommits), ...(lastExpiry ? { lastExpiry } : {}) };
         db.prepare("insert or replace into publication values(1,?)").run(JSON.stringify(publication));
         db.exec("commit");
         if (full) {
@@ -725,7 +729,7 @@ export function readPublishedDetail(root: string, id: string): MemorySearchResul
         payload: string;
     } | undefined; return row ? refreshFileCitations(root, JSON.parse(row.payload) as MemorySearchResult) : undefined; });
 }
-export function readPublishedSummary(root: string) { return withPublishedIndex(root, (_db, p) => ({ summary: p.summary as ReturnType<MemoryStore["getProjectSummary"]>, status: p.summaryStatus, freshness: freshness(root, p) })); }
+export function readPublishedSummary(root: string) { return withPublishedIndex(root, (_db, p) => ({ summary: p.summary as ReturnType<MemoryStore["getProjectSummary"]>, status: p.summaryStatus, freshness: freshness(root, p), lastExpiry: p.lastExpiry })); }
 export function readPublishedHealth(root: string) { return withPublishedIndex(root, (_db, p) => p.health); }
 /** Filesystem-only maintenance never needs a canonical snapshot or quality pass. */
 export function refreshPublishedFiles(root: string): void {

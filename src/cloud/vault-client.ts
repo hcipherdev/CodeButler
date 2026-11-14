@@ -9,7 +9,7 @@ import type { ProjectTrust } from "./encrypted-snapshot.js";
 import { documentHash, verifyDocument, type SignedDocument, type SignedVaultRecord } from "./identity-protocol.js";
 import type { SecurityStatus } from "./native-security.js";
 import { atomicJson, readJson, sha256 } from "./state.js";
-import type { VaultState } from "./protocol-types.js";
+import type { RecoveryKit, VaultState } from "./protocol-types.js";
 import { classifyAccountResource, secretsParentProjectId } from "./resource-identity.js";
 import { SecretTransport } from "../secrets/transport.js";
 
@@ -117,10 +117,32 @@ export async function rotateVault(client: AccountClient, removeDeviceId?: string
   await upload(0);
   await client.security.invoke("stage-commit",{commitment:hash});
 }
+export class CloudRecoveryError extends Error {}
+
 export async function restoreRecovery(client: AccountClient, kitPath: string, code: string, label: string): Promise<void> {
+  await restoreRecoveryKit(client, JSON.parse(readFileSync(kitPath, "utf8")), code, label, false);
+}
+export async function restoreCloudRecovery(client: AccountClient, code: string, label: string): Promise<void> {
+  let kit: RecoveryKit | null;
+  try {
+    ({ recoveryKit: kit } = await client.request<{ recoveryKit: RecoveryKit | null }>("/v2/vault/recovery-kit", "GET", undefined, false));
+  } catch {
+    throw new CloudRecoveryError("The cloud recovery backup is unavailable. Check your connection and try again.");
+  }
+  if (!kit) throw new CloudRecoveryError("This account has no cloud recovery backup. Use your recovery file if you have one.");
+  await restoreRecoveryKit(client, kit, code.trim(), label, true);
+}
+async function restoreRecoveryKit(client: AccountClient, kit: unknown, code: string, label: string, cloud: boolean): Promise<void> {
   if (!label.trim() || label.length > 100) throw new Error("Device labels must contain 1–100 characters");
   const tokens = await client.tokens();
   const state = await client.request<VaultState>("/v2/vault/state","GET",undefined,false);
-  await client.security.invoke("recovery-load",{kit:JSON.parse(readFileSync(kitPath,"utf8")),code,accountId:tokens.accountId,records:state.records,deviceId:randomUUID(),installationId:installationDeviceId(),label});
+  try {
+    await client.security.invoke("recovery-load",{kit,code,accountId:tokens.accountId,records:state.records,deviceId:randomUUID(),installationId:installationDeviceId(),label});
+  } catch (error) {
+    if (cloud && error instanceof EncryptionError && ["verification-failed", "incompatible-format"].includes(error.state)) {
+      throw new CloudRecoveryError("Could not unlock the cloud recovery backup. Check your recovery code and try again.");
+    }
+    throw error;
+  }
   await rotateVault(client,undefined,true);
 }

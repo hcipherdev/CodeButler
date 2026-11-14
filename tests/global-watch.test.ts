@@ -1,3 +1,4 @@
+// Tests the global watcher in src/global-watch.ts: project registration, job scheduling, the offline pause, log rotation, quiet secrets checks and its service installers.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -5,7 +6,10 @@ import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { registerWatchedProject, listWatchedProjects, globalWatchStatus, runGlobalWatch, unregisterWatchedProject, requestGlobalWatchStop, recordCloudRunSuccess } from "../src/global-watch.js";
+import { registerWatchedProject, listWatchedProjects, globalWatchStatus, runGlobalWatch, unregisterWatchedProject, requestGlobalWatchStop, recordCloudRunSuccess, nextQuietDelay, secretsChangedLocally, cloudActivityMarker } from "../src/global-watch.js";
+import { randomUUID } from "node:crypto";
+import { stateDirectory } from "../src/cloud/state.js";
+import { secretFolderStamp } from "../src/secrets/files.js";
 import { requestAutomaticSync } from "../src/cloud/sync-owner.js";
 import { saveBinding } from "../src/cloud/state.js";
 import { gitExecutable } from "../src/git-executable.js";
@@ -233,6 +237,123 @@ describe("global watcher", () => {
     expect(runs[1]! - runs[0]!).toBeLessThan(5000);
     expect(globalWatchStatus().projects.find(item => item.root === target)!.lastCloudRun).toMatchObject({ ok: true, outcome: "success" });
   }, 20000);
+
+  it("pauses cloud jobs for every project while the network is down, and resumes once it is back", async () => {
+    const roots = ["a", "b"].map(name => realpathSync(project(name)));
+    for (const root of roots) {
+      registerWatchedProject(root);
+      saveBinding(root, { server: "http://127.0.0.1", projectId: "test", vaultId: "test", enabled: true, revision: 0, fingerprint: "", status: "synced" });
+      requestAutomaticSync(root);
+    }
+    const jobs: string[] = [], lines: string[] = [];
+    let networkUp = false, probes = 0;
+    const controller = new AbortController();
+    const guard = setTimeout(() => controller.abort(), 15000);
+    await runGlobalWatch({ cliPath: "unused", intervalSeconds: 60, signal: controller.signal, offlineProbeMs: 300, log: line => lines.push(line),
+      probeNetwork: async () => { probes += 1; if (probes === 2) networkUp = true; return networkUp; },
+      runProject: async (root, kind) => {
+        // A real job is a child process; yielding to timers keeps this fake from starving them.
+        await new Promise(resolve => setTimeout(resolve, 10));
+        jobs.push(`${kind}:${roots.indexOf(root)}:${networkUp ? "up" : "down"}`);
+        if (kind !== "cloud") return;
+        if (!networkUp) return { outcome: "failed", stage: "cloud", reason: "fetch failed", network: true };
+        controller.abort();
+      } });
+    clearTimeout(guard);
+    const cloud = jobs.filter(job => job.startsWith("cloud:"));
+    // One failure pauses both projects: no other cloud job starts until the second check finds the network.
+    expect(cloud.filter(job => job.endsWith(":down"))).toHaveLength(1);
+    expect(cloud.filter(job => job.endsWith(":up"))).toHaveLength(1);
+    expect(probes).toBe(2);
+    // Local ingestion keeps running while offline.
+    expect(jobs.some(job => job.startsWith("full:") && job.endsWith(":down"))).toBe(true);
+    expect(lines.filter(line => line.includes("Network unavailable"))).toHaveLength(1);
+    expect(lines.filter(line => line.includes("Network back after"))).toHaveLength(1);
+    expect(lines.some(line => line.includes("(cloud): fetch failed"))).toBe(false);
+  }, 20000);
+
+  it("checks secrets and remote memory less often while nothing changes, and again within a minute after a change", () => {
+    const minute = 60_000;
+    const delays: number[] = [];
+    let delay: number | undefined;
+    for (let check = 0; check < 5; check += 1) delays.push(delay = nextQuietDelay(delay, true));
+    expect(delays).toEqual([2 * minute, 4 * minute, 5 * minute, 5 * minute, 5 * minute]);
+    expect(nextQuietDelay(delay, false)).toBe(minute);
+  });
+
+  it("spaces out memory passes that find nothing new, up to five minutes, and resets after activity", () => {
+    const second = 1000, minute = 60_000, cap = 5 * minute;
+    const delays: number[] = [];
+    let delay: number | undefined;
+    for (let pass = 0; pass < 6; pass += 1) delays.push(delay = nextQuietDelay(delay, true, 30 * second, cap));
+    expect(delays).toEqual([minute, 2 * minute, 4 * minute, cap, cap, cap]);
+    expect(nextQuietDelay(delay, false, 30 * second, cap)).toBe(30 * second);
+    // A watch interval longer than the cap is never shortened by going quiet.
+    expect(nextQuietDelay(undefined, true, 10 * minute, cap)).toBe(10 * minute);
+  });
+
+  it("logs a memory pass that found nothing new as unchanged", async () => {
+    const quiet = project("quiet");
+    const busy = project("busy");
+    registerWatchedProject(quiet);
+    registerWatchedProject(busy);
+    const lines: string[] = [];
+    await runGlobalWatch({ cliPath: "unused", once: true, log: line => lines.push(line),
+      runProject: async root => ({ outcome: "success", stage: "watcher", ...(root === quiet ? { ingestionIdle: true as const } : {}) }) });
+    expect(lines.some(line => line.endsWith(`${quiet} (full): unchanged`))).toBe(true);
+    expect(lines.some(line => line.endsWith(`${busy} (full): updated`))).toBe(true);
+  });
+
+  it("tells an idle remote check from one that pulled or published", () => {
+    const root = project("remote");
+    expect(cloudActivityMarker(root)).toBeUndefined();
+    const synced = { server: "http://127.0.0.1", projectId: "test", vaultId: "test", enabled: true, revision: 4, fingerprint: "", status: "synced" as const };
+    saveBinding(root, synced);
+    const idle = cloudActivityMarker(root);
+    expect(cloudActivityMarker(root)).toBe(idle);
+    saveBinding(root, { ...synced, revision: 5 });
+    const pulled = cloudActivityMarker(root);
+    expect(pulled).not.toBe(idle);
+    saveBinding(root, { ...synced, revision: 5, lastPublishedAt: "2026-11-04T21:00:00.000Z" });
+    expect(cloudActivityMarker(root)).not.toBe(pulled);
+  });
+
+  it("notices a local edit to secrets/ since the last full sync", () => {
+    const root = project("secrets");
+    mkdirSync(join(root, "secrets"), { recursive: true });
+    writeFileSync(join(root, "secrets", "a.env"), "A=1");
+    const binding = { version: 1, server: "http://127.0.0.1", vaultId: randomUUID(), checkoutId: randomUUID(), enabled: true, status: "synced", revision: 1,
+      idleCheck: { localStamp: secretFolderStamp(root)!, headPath: "/v2/secrets/projects/x", revision: 1, commitment: "a".repeat(64) } };
+    mkdirSync(stateDirectory(root), { recursive: true });
+    writeFileSync(join(stateDirectory(root), "secrets-binding.json"), JSON.stringify(binding));
+    expect(secretsChangedLocally(root)).toBe(false);
+    writeFileSync(join(root, "secrets", "a.env"), "A=22");
+    expect(secretsChangedLocally(root)).toBe(true);
+  });
+
+  it("logs a repeated failure once but records every pass", async () => {
+    const root = project("repeat"); registerWatchedProject(root);
+    const lines: string[] = [];
+    const failing = async () => ({ outcome: "failed" as const, stage: "ingestion" as const, reason: "git sync failed: bad object" });
+    for (let pass = 0; pass < 3; pass += 1) await runGlobalWatch({ cliPath: "unused", once: true, log: line => lines.push(line), runProject: failing });
+    expect(lines.filter(line => line.endsWith("(full): git sync failed: bad object"))).toHaveLength(1);
+    await runGlobalWatch({ cliPath: "unused", once: true, log: line => lines.push(line), runProject: async () => ({ outcome: "failed", stage: "ingestion", reason: "git sync failed: other" }) });
+    expect(lines.filter(line => line.includes("(full): git sync failed: other"))).toHaveLength(1);
+    expect(globalWatchStatus().projects[0]!.lastRun).toMatchObject({ ok: false, error: "git sync failed: other" });
+  });
+
+  it("rotates the global watcher logs, which belong to no project", async () => {
+    const logs = join(directory, "home", "watch", "logs");
+    mkdirSync(logs, { recursive: true });
+    writeFileSync(join(logs, "watch.out.log"), "x".repeat(5 * 1024 * 1024 + 1));
+    writeFileSync(join(logs, "runtime-install.log"), "small");
+    const lines: string[] = [];
+    await runGlobalWatch({ cliPath: "unused", once: true, log: line => lines.push(line), runProject: async () => {} });
+    expect(readFileSync(join(logs, "watch.out.log"), "utf8")).toBe("");
+    expect(existsSync(join(logs, "watch.out.log.1"))).toBe(true);
+    expect(readFileSync(join(logs, "runtime-install.log"), "utf8")).toBe("small");
+    expect(lines.filter(line => line.includes("Rotated watcher logs (rotated=1, removed=0)"))).toHaveLength(1);
+  });
 
   it("keeps a background slot available when explicit requests remain queued", async () => {
     const roots = ["a", "b", "c"].map(name => project(name));

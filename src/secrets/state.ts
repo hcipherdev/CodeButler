@@ -26,6 +26,8 @@ export interface SecretBinding {
   lastSync?: string;
   error?: string;
   warnings?: string[];
+  /** What the last full sync left behind, so a later run can see nothing changed without the lock or the vault. */
+  idleCheck?: { localStamp: string; headPath: string; revision: number; commitment: string };
 }
 const bindingPath = (root: string) => join(stateDirectory(root), "secrets-binding.json");
 export const legacySecretCacheDirectory = (root: string) => join(stateDirectory(root), "secrets-cache");

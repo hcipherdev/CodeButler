@@ -3,7 +3,7 @@ import { defaultBranchMemoryLayer } from "../../memory/branch.js";
 import { layerLabel, normalizeLayer, normalizeLayerInput } from "../../memory/layer.js";
 import { updateMemoryLayer } from "../../memory/layer-service.js";
 import { suggestMemoryLayerPromotions } from "../../memory/layer-promotion.js";
-import { listPromotionDecisions, planAutomaticPromotions, runAutomaticPromotions, undoAutomaticPromotions } from "../../memory/automatic-promotion.js";
+import { latestCandidateExpiry, listPromotionDecisions, planAutomaticPromotions, restoreCandidateExpiry, runAutomaticPromotions, undoAutomaticPromotions } from "../../memory/automatic-promotion.js";
 import {
   listLayerRetentionDecisions,
   planLayerRetention,
@@ -55,7 +55,7 @@ export async function runMemoryCommand(
     const state = result.state!;
     const counts = state.counts;
     stdout(`Automatic review ${state.outcome}${state.runId ? ` (${state.runId})` : ""}${state.error ? `: ${state.error}` : ""}`);
-    if (counts) stdout(`  checked=${counts.checked} verified=${counts.verified} retired=${counts.retired} left-for-review=${counts.leftForReview} uncertain=${counts.uncertain} failed=${counts.failed}`);
+    if (counts) stdout(`  checked=${counts.checked} verified=${counts.verified} retired=${counts.retired} left-for-review=${counts.leftForReview} uncertain=${counts.uncertain} kept=${counts.kept ?? 0} failed=${counts.failed}`);
     if (state.runId) stdout(`  Revert with: code-butler memory reconcile revert --run ${state.runId}`);
     return state.outcome === "failed" ? 1 : 0;
   }
@@ -163,17 +163,18 @@ export async function runMemoryCommand(
     } finally { store.close(); }
   }
   if (subcommand === "promotions") {
-    const allowed = new Set(["--layer", "--min-score", "--min-confidence", "--limit", "--id", "--since"]);
-    const booleanFlags = new Set(["--json", "--promoted-only", "--apply", "--history", "--plan", "--undo"]);
+    const allowed = new Set(["--layer", "--min-score", "--min-confidence", "--limit", "--id", "--since", "--at"]);
+    const booleanFlags = new Set(["--json", "--promoted-only", "--apply", "--history", "--plan", "--undo", "--undo-expiry"]);
     const unknownFlag = rest.find(arg => arg.startsWith("--") && !allowed.has(arg) && !booleanFlags.has(arg));
     if (unknownFlag) throw new Error(`Unknown memory promotions option: ${unknownFlag}`);
     validateFlagArguments(rest, { command: "memory promotions", valueFlags: allowed, booleanFlags });
-    const modes = ["--apply", "--history", "--plan", "--undo"].filter(flag => rest.includes(flag));
+    const modes = ["--apply", "--history", "--plan", "--undo", "--undo-expiry"].filter(flag => rest.includes(flag));
     if (modes.length > 1) throw new Error(`Use only one of ${modes.join(", ")}`);
     if (rest.includes("--history")) return promotionHistory(cwd, rest, stdout);
     if (rest.includes("--apply")) return applyPromotions(cwd, rest, stdout, options);
     if (rest.includes("--plan")) return planPromotions(cwd, rest, stdout, options);
     if (rest.includes("--undo")) return undoPromotions(cwd, rest, stdout, options);
+    if (rest.includes("--undo-expiry")) return undoCandidateExpiry(cwd, rest, stdout, options);
     const layer = parseLayerFilterFlag(rest, "--layer");
     const minScore = parseUnitIntervalFlag(rest, "--min-score");
     const minConfidence = parseUnitIntervalFlag(rest, "--min-confidence");
@@ -566,7 +567,7 @@ function applyPromotions(
       stdout("Automatic Memory Promotion");
       stdout(
         `scanned=${summary.scanned} promoted=${summary.promoted} converged=${summary.converged} ` +
-        `deferred=${summary.deferred} skipped=${summary.skipped}`
+        `deferred=${summary.deferred} skipped=${summary.skipped} expired=${summary.expired}`
       );
       for (const warning of summary.warnings) stdout(`  warning: ${warning}`);
     }
@@ -634,6 +635,27 @@ function undoPromotions(
   } finally { store.close(); }
 }
 
+/** Restores one expiry pass (the latest, or the one at --at) in a single step. */
+function undoCandidateExpiry(
+  cwd: string,
+  rest: string[],
+  stdout: (line: string) => void,
+  options: { now?: (() => Date) | undefined }
+): number {
+  const at = parseStringFlag(rest, "--at");
+  const store = openConfiguredMemoryStore(cwd); store.init();
+  try {
+    const result = restoreCandidateExpiry(store, {
+      ...(at === undefined ? {} : { at }),
+      ...(options.now === undefined ? {} : { now: options.now().toISOString() })
+    }, "cli");
+    if (rest.includes("--json")) stdout(JSON.stringify(result, null, 2));
+    else if (result.at === undefined) stdout("No unconfirmed-candidate expiry to restore");
+    else stdout(`Restored ${result.restored} ${result.restored === 1 ? "candidate" : "candidates"} discarded as unconfirmed at ${result.at}`);
+    return 0;
+  } finally { store.close(); }
+}
+
 function promotionHistory(cwd: string, rest: string[], stdout: (line: string) => void): number {
   const store = openConfiguredMemoryStore(cwd); store.init();
   try {
@@ -646,6 +668,8 @@ function promotionHistory(cwd: string, rest: string[], stdout: (line: string) =>
     if (rest.includes("--json")) stdout(JSON.stringify(history, null, 2));
     else {
       stdout("Automatic Memory Promotion History");
+      const expiry = latestCandidateExpiry(store);
+      if (expiry) stdout(`last expiry ${expiry.at}: discarded=${expiry.count} restorable=${expiry.restorable} (restore with --undo-expiry)`);
       stdout(`decisions=${history.length}`);
       for (const record of history) {
         stdout(`${record.decidedAt} ${record.decision} ${record.category} ${record.memoryId}`);

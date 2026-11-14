@@ -13,3 +13,10 @@ function extractJsonContent(content: string): string {
   }
   return trimmed;
 }
+
+/** A reply that is JSON, or JSON wrapped whole in one Markdown code fence; never JSON picked out of prose. */
+export function parseFencedJson(content: string): unknown {
+  const trimmed = content.trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
+  return JSON.parse(fenced?.[1] ?? trimmed);
+}

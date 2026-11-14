@@ -12,7 +12,7 @@ export const DEFAULT_JOB_TIER: Record<AiJob, "fast" | "smart"> = {
 export const MODEL_FIELDS = [
   "provider", "baseUrl", "model", "apiKeyEnv", "workspaceIdEnv", "regionEnv", "maxTokens",
   "connectionId", "connectionLabel", "connectionKind", "keyUpdatedAt", "workspaceId", "region", "dataCollection",
-  "requiresConsent"
+  "cliPath", "requiresConsent", "envRoot", "preferSavedKey", "keySavedToEnv", "preferSavedAwsSettings"
 ] as const;
 
 export function modelFields(model: ExtractorConfig | InvestigatorConfig): ExtractorConfig {
@@ -36,9 +36,13 @@ export function connectionModel(id: string, connection: AiConnectionConfig, choi
     connectionLabel: connection.label?.trim() || preset.label,
     connectionKind: connection.kind,
     keyUpdatedAt: connection.keyUpdatedAt,
+    keySavedToEnv: connection.keySavedToEnv,
+    preferSavedKey: connection.preferSavedKey,
+    preferSavedAwsSettings: connection.preferSavedAwsSettings,
     workspaceId: connection.workspaceId,
     region: connection.region,
-    dataCollection: connection.kind === "openrouter" ? connection.dataCollection ?? "deny" : undefined
+    dataCollection: connection.kind === "openrouter" ? connection.dataCollection ?? "deny" : undefined,
+    cliPath: connection.kind === "claude-code" ? connection.cliPath : undefined
   };
   for (const key of Object.keys(values)) if (values[key] === undefined) delete values[key];
   return values as unknown as ExtractorConfig;

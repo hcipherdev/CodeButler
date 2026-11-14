@@ -1,3 +1,4 @@
+// Tests CLI commands, project selection, explicit initialization, and MCP startup options.
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { isCliEntrypoint, runCli } from "../src/cli.js";
 import { withProjectGate } from "../src/cloud/gate.js";
 import { pendingAutomaticConnection } from "../src/cloud/auto-connect.js";
 import { ensureProjectIdentity } from "../src/cloud/project-identity.js";
-import { loadProjectConfig } from "../src/config.js";
+import { loadProjectConfig, trustProjectSettings } from "../src/config.js";
 import { createEmbeddingEndpointHash, createProviderFingerprint, createProviderKey } from "../src/embeddings/fingerprint.js";
 import type { ProjectSummaryGenerator } from "../src/project-summary/service.js";
 import type { EmbeddingProvider } from "../src/types.js";
@@ -38,12 +39,17 @@ describe("CLI", () => {
 
     expect(lines.join("\n").split("\n").filter((line) => line.startsWith("  code-butler "))).toEqual([
       "  code-butler rules path|list|show <id>|match|conflicts|resolve <id>|attestations|attest <id>|revoke <id>|sync status|enable|disable|now",
+      "  code-butler ai chatgpt login|logout|status [--connection <id>] [--no-browser]",
+      "  code-butler clients status [--json]                 # Claude Code and Codex connections, with a real MCP start check",
+      "  code-butler clients connect <claude|codex>          # register the installed code-butler command globally",
+      "  code-butler clients connect --auto [--json]         # connect each installed client once; never overrides custom entries",
       "  code-butler init [--allow-remote-models]",
       "  code-butler config init",
       "  code-butler config global init",
       "  code-butler config migrate-local <--dry-run|--apply> [--json]",
       "  code-butler config remote-models <on|off|status>",
-      "  code-butler cloud <register|login> --server <https-origin> --email <email>",
+      "  code-butler config trust <status|approve>",
+      "  code-butler cloud <register|login> --email <email> [--server <https-origin>]",
       "  code-butler cloud logout",
       "  code-butler cloud init --recovery-file <path> [--label <name>] [--recovery-code-file <path>]",
       "  code-butler cloud device request [--label <name>]",
@@ -83,6 +89,7 @@ describe("CLI", () => {
       "  code-butler memory promotions --apply [--min-score <0..1>] [--json]",
       "  code-butler memory promotions --history [--id <id>] [--limit <n>] [--json]",
       "  code-butler memory promotions --undo (--since <ISO time> | --id <candidate-id>) [--json]",
+      "  code-butler memory promotions --undo-expiry [--at <ISO time>] [--json]",
       "  code-butler memory retention [--apply] [--history] [--id <id>] [--limit <n>] [--json]",
       "  code-butler memory branch-triage [--branch <name>] [--include-active] [--stale-days <n>] [--include-reviewed] [--limit <n>] [--json]",
       "  code-butler memory branch-resolve --id <id> --category <candidate|promoted> --action <promote_to_core|discard|retain_branch> --reason <text> [--supersedes <memory-id>] [--json]",
@@ -210,6 +217,8 @@ describe("CLI", () => {
         2
       )
     );
+    // Fixtures stand for settings this device's owner wrote.
+    trustProjectSettings(rootDir);
     return { rootDir, claudeDir };
   }
 
@@ -257,6 +266,7 @@ describe("CLI", () => {
         2
       )
     );
+    trustProjectSettings(rootDir);
   }
 
   function writeDoctorSummary(rootDir: string): void {
@@ -335,6 +345,29 @@ describe("CLI", () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+
+  it("tells the person during init when a cloned repository brings settings that need approval", async () => {
+    const rootDir = makeTempDir();
+    const globalHome = makeTempDir();
+    const launchdHomeDir = makeTempDir();
+    tempDirs.push(rootDir, globalHome, launchdHomeDir);
+    process.env.CODE_BUTLER_HOME = globalHome;
+    mkdirSync(join(rootDir, ".code-butler"), { recursive: true });
+    writeFileSync(join(rootDir, ".code-butler", "config.json"), JSON.stringify({ extractor: { baseUrl: "https://collector.example/v1" } }));
+    const output: string[] = [];
+
+    await expect(runCli(["init"], {
+      cwd: rootDir,
+      stdout: (line) => output.push(line),
+      projectSummaryGenerator: unavailableSummaryGenerator,
+      watchServiceHomeDir: launchdHomeDir,
+      watchServicePlatform: "darwin",
+      watchServiceCommandRunner: recordCommands().runner
+    })).resolves.toBe(0);
+
+    expect(output).toContain("This repository's .code-butler/ folder sets things that only apply once you approve them on this device:");
+    expect(output).toContain('  extractor.baseUrl = "https://collector.example/v1"');
   });
 
   it("initializes local storage and imports a conversation", async () => {
@@ -685,7 +718,8 @@ describe("CLI", () => {
     await expect(runCli(["maintenance", "prune", "--apply", "--json"], { cwd: rootDir, stdout: (line) => applyOutput.push(line), now: () => now })).resolves.toBe(0);
     const applied = JSON.parse(applyOutput.join("\n"));
     expect(applied.rotated).toBe(1);
-    expect(existsSync(join(dataDir, "logs", "watch.out.log"))).toBe(false);
+    // Emptied in place, not renamed: the watcher's service manager keeps the file open.
+    expect(readFileSync(join(dataDir, "logs", "watch.out.log"), "utf8")).toBe("");
     expect(readdirSync(join(dataDir, "backups", "project-summary")).filter((name) => name.endsWith(".md"))).toHaveLength(5);
     // The default keeps the newest two recovery backups older than two days.
     expect(readdirSync(dataDir).filter((name) => name.startsWith("memory.sqlite.recovery-"))).toHaveLength(2);
@@ -1373,6 +1407,7 @@ describe("CLI", () => {
     config.embeddings = { enabled: true, provider: "openai-compatible", baseUrl: "https://embedding.example/v1", model: "embed-test", batchSize: 16 };
     config.privacy = { allowRemoteEmbeddings: false };
     writeFileSync(path, JSON.stringify(config));
+    trustProjectSettings(rootDir);
     const store = openMemoryStore(rootDir);
     store.init();
     store.close();
@@ -1476,9 +1511,8 @@ describe("CLI", () => {
 
     expect(starts).toHaveLength(1);
     expect(starts[0]?.rootDir).toBe(workspace);
-    expect(existsSync(join(workspace, ".code-butler", "config.json"))).toBe(true);
-    expect(existsSync(join(workspace, ".code-butler", "memory.sqlite"))).toBe(true);
-    expect(existsSync(join(workspace, ".code-butler", ".gitignore"))).toBe(true);
+    // The real MCP server checks the device preference before creating any project files.
+    expect(existsSync(join(workspace, ".code-butler"))).toBe(false);
     expect(errors.join("\n")).toContain("Starting Code Butler MCP for project");
   });
 
@@ -1499,21 +1533,24 @@ describe("CLI", () => {
     expect(starts).toEqual([{ rootDir }]);
   });
 
-  it("requires --init-here for mcp outside a git repository", async () => {
+  it("starts mcp without a project outside a git repository", async () => {
     const rootDir = makeTempDir();
     tempDirs.push(rootDir);
     const errors: string[] = [];
+    const starts: Array<{ rootDir?: string; autoInit?: boolean }> = [];
 
     await expect(
       runCli(["mcp"], {
         cwd: rootDir,
         env: {},
         stderr: (line) => errors.push(line),
-        startServer: async () => {}
+        startServer: async (options) => { starts.push(options); }
       })
-    ).resolves.toBe(1);
+    ).resolves.toBe(0);
 
-    expect(errors.join("\n")).toContain("No Git repository found");
+    expect(starts).toEqual([{}]);
+    expect(existsSync(join(rootDir, ".code-butler"))).toBe(false);
+    expect(errors.join("\n")).toContain("Starting Code Butler MCP without a project");
   });
 
   it("passes the MCP automatic-setup opt-out to the server", async () => {
@@ -1542,7 +1579,7 @@ describe("CLI", () => {
     ).resolves.toBe(0);
 
     expect(starts[0]?.rootDir).toBe(rootDir);
-    expect(existsSync(join(rootDir, ".code-butler", "memory.sqlite"))).toBe(true);
+    expect(existsSync(join(rootDir, ".code-butler"))).toBe(false);
     expect(errors.join("\n")).toContain("Starting Code Butler MCP for project");
   });
 

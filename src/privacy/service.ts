@@ -555,7 +555,7 @@ function clearImportTables(store: MemoryStore, preserveOperationId: string): voi
 
 function importOrder(): readonly string[] {
   return [
-    "memory_events", "memory_topics", "memory_topic_links",
+    "memory_events", "memory_topics", "memory_topic_links", "memory_usage",
     "operation_log",
     "private_identity_mappings",
     "sources",
@@ -588,6 +588,7 @@ const PRIVACY_EXPORT_COLUMNS: Readonly<Record<string, readonly string[]>> = {
   memory_events:["id","event_key","kind","memory_id","category","layer","related_memory_id","related_category","related_layer","from_value","to_value","reason","actor","occurred_at","recorded"],
   memory_topics:["id","topic_id","layer","name","introduction","prefixes_json","parents_json","deleted","created_at"],
   memory_topic_links:["id","topic_id","memory_id","category","layer","mode","created_at"],
+  memory_usage:["id","memory_id","category","layer","kind","day","device_id"],
   sources: ["id", "type", "title", "origin", "raw_content", "metadata_json", "created_at"],
   chunks: ["id", "source_id", "chunk_index", "text", "metadata_json"],
   commits: ["hash", "author_name", "author_email", "authored_at", "message", "changed_files_json", "diff_summary"],
@@ -664,7 +665,7 @@ const RESTORE_COLUMNS: Readonly<Record<string, readonly string[]>> = {
 };
 
 const RESTORE_TABLE_ORDER = [
-  "memory_events", "memory_topics", "memory_topic_links",
+  "memory_events", "memory_topics", "memory_topic_links", "memory_usage",
   "schema_migrations",
   "operation_log",
   "private_identity_mappings",
@@ -1119,6 +1120,7 @@ function deleteSourceData(
   );
   for (const candidate of affectedCandidates) {
     store.db.prepare("delete from memory_events where (memory_id=? and category='candidate') or (related_memory_id=? and related_category='candidate')").run(candidate.id,candidate.id);
+    store.db.prepare("delete from memory_usage where memory_id=? and category='candidate'").run(candidate.id);
     store.db.prepare("delete from memory_links where owner_kind = 'candidate' and owner_id = ?")
       .run(candidate.id);
     deletedCandidates += Number(
@@ -1151,6 +1153,7 @@ function deleteSourceData(
   for (const memory of affectedMemories) {
     store.db.prepare("delete from memory_events where memory_id=? or related_memory_id=?").run(memory.id,memory.id);
     store.db.prepare("delete from memory_topic_links where memory_id=?").run(memory.id);
+    store.db.prepare("delete from memory_usage where memory_id=? and category='promoted'").run(memory.id);
     const remaining = memory.evidence.filter((evidence) =>
       !evidenceMatchesSource(evidence, input.sourceType, input.sourceId)
     );

@@ -1,6 +1,6 @@
 import { awaitsRemoteModelConsent } from "../../ai/consent.js";
 import { credentialStatus, REMOTE_MODEL_CONSENT } from "../../ai/credentials.js";
-import { loadProjectConfig, readRemoteModelConsent, setRemoteModelConsent } from "../../config.js";
+import { loadProjectConfig, readProjectTrust, readRemoteModelConsent, setRemoteModelConsent } from "../../config.js";
 import { validateProjectSetupPaths } from "../../project-setup.js";
 import type { ExtractorConfig, InvestigatorConfig } from "../../types.js";
 
@@ -21,6 +21,9 @@ export function runRemoteModelsCommand(args: string[], cwd: string, stdout: (lin
   stdout(choice === "on"
     ? `Remote AI models allowed for this project on this device (${path})`
     : `Remote AI models off for the built-in default model on this device (${path})`);
+  if (choice === "on" && readProjectTrust(cwd).status === "untrusted") {
+    stdout("This project has settings awaiting approval, so the choice applies once they are approved: code-butler config trust status");
+  }
   return 0;
 }
 

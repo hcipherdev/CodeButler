@@ -149,11 +149,18 @@ ciphertext caches. The last applied snapshot remains the offline merge ancestor.
 Pending uploads retain their exact bytes across retries. Existing project gates,
 SQLite validation, local layers and restore recovery mechanisms remain in use.
 
-An offline recovery kit contains the recovery authority and initial trust checkpoint,
-encrypted under a generated 256-bit code. Later signed vault records encrypt all
-project keys to the recovery public key, so the original kit stays useful. Normal
-devices erase recovery private keys after verified export. The server can withhold
-updates; neither a new device nor recovery can prove universal global freshness.
+A recovery kit contains the recovery authority and initial trust checkpoint,
+encrypted under a generated 256-bit code. New desktop vaults on supporting servers
+store the encrypted kit in the cloud database in the same transaction as vault
+initialization. The kit is immutable and included in SQLite backups. The signed-in
+account can retrieve it before device enrollment. The app unlocks it locally and
+sends only the existing signed recovery requests. File-based vaults retain their
+original recovery files and codes.
+
+Later signed vault records encrypt all project keys to the recovery public key, so
+the original kit stays useful. Normal devices erase recovery private keys after
+setup. The server can withhold updates. Neither a new device nor recovery can prove
+universal global freshness.
 
 Local SQLite and raw-evidence selection are unchanged. Encryption does not remove
 previous plaintext cloud backups, encrypt local memory databases, or retroactively

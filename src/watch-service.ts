@@ -1,11 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import type { SyncSourceName } from "./types.js";
 import { globalConfigDir } from "./config.js";
+import { atomicJson } from "./cloud/state.js";
 import { requestGlobalWatchStop } from "./global-watch.js";
 
 export type WatchSource = SyncSourceName | "all";
@@ -22,6 +23,7 @@ export interface WatchServiceOptions {
   nodePath?: string | undefined;
   commandRunner?: WatchServiceCommandRunner | undefined;
   runCommands?: boolean | undefined;
+  requireUnloaded?: boolean | undefined;
 }
 
 export interface WatchServiceResult {
@@ -48,6 +50,7 @@ interface ResolvedWatchService {
   logsDir: string;
   runner: WatchServiceCommandRunner;
   runCommands: boolean;
+  requireUnloaded: boolean;
 }
 
 export function installWatchService(options: WatchServiceOptions): WatchServiceResult {
@@ -72,18 +75,81 @@ export function uninstallWatchService(options: WatchServiceOptions): WatchServic
 }
 
 /** Prevent a scheduled restart, then ask the running global watcher to drain. */
-export function pauseGlobalWatchService(options: WatchServiceOptions): void {
+export function pauseGlobalWatchService(options: WatchServiceOptions, approvedToken?: string | null): void {
   const service = resolveWatchService({ ...options, global: true });
   if (service.platform === "win32") {
     if (service.runCommands) for (const name of scheduledTaskNames(service))
       runIgnoringFailure(service, "schtasks.exe", ["/Change", "/TN", name, "/DISABLE"]);
   }
-  requestGlobalWatchStop();
+  if (approvedToken) atomicJson(join(service.cwd, "watch", "stop.json"), { token: approvedToken });
+  else if (approvedToken === undefined) requestGlobalWatchStop();
 }
 export function resumeGlobalWatchService(options: WatchServiceOptions): void {
   const service = resolveWatchService({ ...options, global: true });
   if (service.platform === "win32" && service.runCommands) for (const name of scheduledTaskNames(service))
     runIgnoringFailure(service, "schtasks.exe", ["/Change", "/TN", name, "/ENABLE"]);
+}
+
+export interface GlobalWatchRegistration {
+  files: Array<{ path: string; content: string }>;
+  tasks: Array<{ name: string; xml: string; enabled: boolean }>;
+  loaded: boolean;
+}
+
+/** Capture the actual registration, including legacy task names and disabled tasks. */
+export function readGlobalWatchRegistration(options: WatchServiceOptions): GlobalWatchRegistration {
+  const service = resolveWatchService({ ...options, global: true });
+  const result: GlobalWatchRegistration = { files: [], tasks: [], loaded: false };
+  const remember = (path: string) => {
+    if (existsSync(path)) result.files.push({ path, content: readFileSync(path).toString("base64") });
+  };
+  if (service.platform === "darwin") {
+    remember(launchdPlistPath(service));
+    result.loaded = service.runCommands && commandSucceeds(service, "launchctl", ["print", `${launchdDomain()}/${service.label}`]);
+  } else if (service.platform === "win32") {
+    remember(windowsLauncherPath(service));
+    remember(windowsStartupPath(service));
+    if (service.runCommands) for (const name of scheduledTaskNames(service)) {
+      if (!commandSucceeds(service, "schtasks.exe", ["/Query", "/TN", name])) continue;
+      const raw = execFileSync("schtasks.exe", ["/Query", "/TN", name, "/XML"], {
+        windowsHide: true, timeout: 5000
+      });
+      const xml = raw.includes(0) ? raw.toString("utf16le") : raw.toString("utf8");
+      result.tasks.push({ name, xml: xml.replace(/^\uFEFF/, ""), enabled: !/<Enabled>\s*false\s*<\/Enabled>/i.test(xml) });
+    }
+  }
+  return result;
+}
+
+export function restoreGlobalWatchRegistration(options: WatchServiceOptions, registration: GlobalWatchRegistration): void {
+  const service = resolveWatchService({ ...options, global: true });
+  const locations = service.platform === "darwin" ? [launchdPlistPath(service)] : [windowsLauncherPath(service), windowsStartupPath(service)];
+  for (const file of registration.files) {
+    if (!locations.includes(file.path)) throw new Error("The saved watcher registration has an unexpected path.");
+    mkdirSync(dirname(file.path), { recursive: true });
+    writeFileSync(file.path, Buffer.from(file.content, "base64"));
+  }
+  if (!service.runCommands) return;
+  if (service.platform === "darwin" && registration.loaded) {
+    const label = `${launchdDomain()}/${service.label}`;
+    if (!commandSucceeds(service, "launchctl", ["print", label])) {
+      run(service, "launchctl", ["bootstrap", launchdDomain(), launchdPlistPath(service)]);
+    }
+    runIgnoringFailure(service, "launchctl", ["kickstart", label]);
+  } else if (service.platform === "win32") {
+    const xmlFile = join(service.cwd, "watch", "restore-task.xml");
+    for (const task of registration.tasks) {
+      if (!scheduledTaskNames(service).includes(task.name)) throw new Error("The saved watcher task has an unexpected name.");
+      mkdirSync(dirname(xmlFile), { recursive: true });
+      try {
+        writeFileSync(xmlFile, Buffer.from(`\uFEFF${task.xml.replace(/encoding="[^"]+"/i, 'encoding="UTF-16"')}`, "utf16le"));
+        run(service, "schtasks.exe", ["/Create", "/TN", task.name, "/XML", xmlFile, "/F"]);
+      } finally { rmSync(xmlFile, { force: true }); }
+      if (task.enabled) runIgnoringFailure(service, "schtasks.exe", ["/Run", "/TN", task.name]);
+    }
+    const startup = windowsStartupPath(service);
+    if (existsSync(startup)) run(service, "wscript.exe", ["//B", startup]);
+  }
 }
 
 export function getWatchServiceStatus(options: WatchServiceOptions): WatchServiceResult {
@@ -134,7 +200,8 @@ function resolveWatchService(options: WatchServiceOptions): ResolvedWatchService
   const runner = options.commandRunner ?? defaultCommandRunner;
   const runCommands = options.runCommands ?? true;
 
-  return { global: options.global ?? false, cwd, homeDir, platform, intervalSeconds, source, cliPath, nodePath, hash, label, logsDir, runner, runCommands };
+  return { global: options.global ?? false, cwd, homeDir, platform, intervalSeconds, source, cliPath, nodePath, hash, label, logsDir, runner, runCommands,
+    requireUnloaded: options.requireUnloaded ?? false };
 }
 
 function installLaunchdService(service: ResolvedWatchService): WatchServiceResult {
@@ -156,7 +223,12 @@ function installLaunchdService(service: ResolvedWatchService): WatchServiceResul
 
 function uninstallLaunchdService(service: ResolvedWatchService): WatchServiceResult {
   const servicePath = launchdPlistPath(service);
-  if (service.runCommands) runIgnoringFailure(service, "launchctl", ["bootout", launchdDomain(), servicePath]);
+  if (service.runCommands) {
+    runIgnoringFailure(service, "launchctl", ["bootout", launchdDomain(), servicePath]);
+    if (service.requireUnloaded && commandSucceeds(service, "launchctl", ["print", `${launchdDomain()}/${service.label}`])) {
+      throw new Error("The Code Butler watcher is still loaded in launchd.");
+    }
+  }
   rmSync(servicePath, { force: true });
   return { platform: service.platform, label: service.label, servicePath, logsDir: service.logsDir, installed: false };
 }
@@ -223,6 +295,9 @@ function uninstallScheduledTask(service: ResolvedWatchService): WatchServiceResu
     for (const name of scheduledTaskNames(service)) {
       runIgnoringFailure(service, "schtasks.exe", ["/End", "/TN", name]);
       runIgnoringFailure(service, "schtasks.exe", ["/Delete", "/TN", name, "/F"]);
+      if (service.requireUnloaded && commandSucceeds(service, "schtasks.exe", ["/Query", "/TN", name])) {
+        throw new Error(`The Code Butler watcher task ${name} is still registered.`);
+      }
     }
   }
   rmSync(windowsLauncherPath(service), { force: true });

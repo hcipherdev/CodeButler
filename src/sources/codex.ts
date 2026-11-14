@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, extname, join, resolve, sep } from "node:path";
 
@@ -16,6 +17,8 @@ export interface ConversationFileScan {
   signature?: string;
   result?: ConversationParseResult;
   deferred?: boolean;
+  /** A recorded verdict says this log belongs to another project; it was not parsed. */
+  foreign?: boolean;
 }
 
 const MAX_SCANNED_CONVERSATIONS_PER_PASS = 100;
@@ -24,21 +27,69 @@ export function discoverConversationFiles(config: ConversationLogSourceConfig): 
   return config.roots.flatMap(root => findJsonlFiles(root));
 }
 
-export function scanCodexFiles(files: string[], cursors: ReadonlyMap<string, string>): ConversationFileScan[] {
-  return scanConversationFiles(files, cursors, parseCodexFile);
+/** Whether a file already judged to belong to another project can be skipped without parsing it. */
+export type ForeignVerdict = (filePath: string, signature: string) => boolean;
+
+export function scanCodexFiles(files: string[], cursors: ReadonlyMap<string, string>, foreign?: ForeignVerdict): ConversationFileScan[] {
+  return scanConversationFiles(files, cursors, parseCodexFile, foreign);
 }
 
-export function scanClaudeFiles(files: string[], cursors: ReadonlyMap<string, string>): ConversationFileScan[] {
-  return scanConversationFiles(files, cursors, parseClaudeFile);
+export function scanClaudeFiles(files: string[], cursors: ReadonlyMap<string, string>, foreign?: ForeignVerdict): ConversationFileScan[] {
+  return scanConversationFiles(files, cursors, parseClaudeFile, foreign);
 }
 
-function scanConversationFiles(files: string[], cursors: ReadonlyMap<string, string>, parser: (path: string) => ConversationParseResult): ConversationFileScan[] {
+const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+/**
+ * Where a "belongs to another project" verdict is kept. Every project lists every transcript,
+ * so without it each pass parsed other projects' logs again. The path is hashed so this
+ * project's database never holds another project's transcript paths; `sync_cursors` is local
+ * bookkeeping, so recording a verdict is never a change a cloud sync needs to carry.
+ */
+export function foreignCursorKey(filePath: string): string {
+  return `foreign:${digest(normalizePath(filePath))}`;
+}
+
+function foreignCursorValue(projectRoot: string, signature: string): string {
+  return `${digest(normalizePath(projectRoot))}|${signature}`;
+}
+
+/**
+ * Whether a recorded foreign verdict still holds. It is tied to the project root, so a moved
+ * project checks again. A Claude log is matched by its path and its first `cwd`, which appending
+ * cannot change, so the verdict holds while the file only grows; an active session in another
+ * project is then never parsed here. A Codex log takes its latest `cwd`, so any change re-checks.
+ */
+export function foreignVerdictHolds(
+  sourceName: "codex" | "claude",
+  stored: string | undefined,
+  projectRoot: string,
+  signature: string
+): boolean {
+  if (!stored) return false;
+  const separator = stored.indexOf("|");
+  if (separator < 0 || stored.slice(0, separator) !== digest(normalizePath(projectRoot))) return false;
+  const recorded = stored.slice(separator + 1);
+  if (sourceName === "codex") return recorded === signature;
+  const recordedSize = Number(recorded.slice(recorded.lastIndexOf(":") + 1));
+  const size = Number(signature.slice(signature.lastIndexOf(":") + 1));
+  return Number.isFinite(recordedSize) && Number.isFinite(size) && size >= recordedSize;
+}
+
+function scanConversationFiles(
+  files: string[],
+  cursors: ReadonlyMap<string, string>,
+  parser: (path: string) => ConversationParseResult,
+  foreign?: ForeignVerdict
+): ConversationFileScan[] {
   let parsed = 0;
   return files.map(filePath => {
     try {
       const signature = fileSignature(filePath);
       const scannedCursor = cursors.get(filePath);
       if (scannedCursor === signature) return { filePath, scannedCursor, signature };
+      // Before the per-pass parse budget: another project's log must not use it up every pass.
+      if (foreign?.(filePath, signature)) return { filePath, scannedCursor, signature, foreign: true };
       if (parsed >= MAX_SCANNED_CONVERSATIONS_PER_PASS) return { filePath, scannedCursor, signature, deferred: true };
       parsed += 1;
       return { filePath, scannedCursor, signature, result: parser(filePath) };
@@ -141,7 +192,9 @@ function syncConversationLogSource(
         store.resolveSourceFailures(sourceName, filePath);
         continue;
       }
-      if (entry.deferred) continue;
+      if (entry.deferred || entry.foreign) continue;
+      const foreignKey = config.projectOnly ? foreignCursorKey(filePath) : undefined;
+      if (foreignKey && foreignVerdictHolds(sourceName, store.getSyncCursor(sourceName, foreignKey)?.cursorValue, projectRoot, signature)) continue;
       // The watcher records a file it has never imported with an empty cursor.
       if (scan && (cursor ?? "") !== (entry.scannedCursor ?? "")) continue;
       if (entry.result && fileSignature(filePath) !== signature) continue;
@@ -162,7 +215,10 @@ function syncConversationLogSource(
       }
       store.resolveSourceFailures(sourceName, filePath);
       const parsed = result.value;
-      if (!shouldIncludeConversation(parsed, filePath, projectRoot, config.projectOnly)) continue;
+      if (!shouldIncludeConversation(parsed, filePath, projectRoot, config.projectOnly)) {
+        if (foreignKey) store.setSyncCursor(sourceName, foreignKey, foreignCursorValue(projectRoot, signature));
+        continue;
+      }
       if (parsed.source.id && store.findSourceTombstone("conversation", parsed.source.id)) {
         store.setSyncCursor(sourceName, filePath, signature);
         continue;

@@ -83,8 +83,10 @@ export async function runRulesCommand(args: string[], cwd: string, output: (text
     else if (operation === "enable" || operation === "disable") emit(await setGlobalRulesSyncEnabled(operation === "enable"));
     else if (operation === "now") {
       try {
-        const result = await syncGlobalRules({ background: Boolean(process.env.CODE_BUTLER_WATCH_TOKEN) });
-        emit(result);
+        const watcherPass = Boolean(process.env.CODE_BUTLER_WATCH_TOKEN);
+        const result = await syncGlobalRules({ background: watcherPass });
+        // The watcher logs its own line for the pass; the full status on every pass filled its log.
+        if (!watcherPass) emit(result);
         const outcome = result.outcome === "failed" ? "failed" : "queued" in result && result.queued ? "deferred" : "success";
         process.send?.({ type: "watch-result", stage: "cloud", outcome, ...(result.binding?.syncError ? { reason: result.binding.syncError } : {}) });
         return outcome === "failed" ? 1 : outcome === "deferred" ? 75 : 0;

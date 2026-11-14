@@ -525,10 +525,10 @@ export interface CodexLogSourceConfig extends ConversationLogSourceConfig {
   includeDefaultRoots: boolean;
 }
 
-export type LlmProviderName = "openai-compatible" | "anthropic-aws" | "anthropic";
+export type LlmProviderName = "openai-compatible" | "anthropic-aws" | "anthropic" | "openai-responses" | "claude-cli";
 
 /** A named provider account in the global `ai.connections` settings. */
-export type AiConnectionKind = "openrouter" | "anthropic" | "anthropic-aws" | "openai" | "gemini" | "qwen" | "ollama" | "lmstudio" | "openai-compatible";
+export type AiConnectionKind = "openrouter" | "anthropic" | "anthropic-aws" | "openai" | "gemini" | "qwen" | "ollama" | "lmstudio" | "openai-compatible" | "chatgpt" | "claude-code";
 /** Every purpose Code Butler calls a model for; each resolves to one connection and model. */
 export type AiJob = "extraction" | "review" | "wording" | "summary" | "investigator" | "rules" | "consolidation";
 export const AI_JOBS: readonly AiJob[] = ["extraction", "review", "wording", "summary", "investigator", "rules", "consolidation"];
@@ -540,15 +540,22 @@ export interface AiConnectionConfig {
   apiKeyEnv?: string | undefined;
   workspaceIdEnv?: string | undefined;
   regionEnv?: string | undefined;
-  /** Not secret, so stored in config; the matching *Env variable wins when set. */
+  /** Not secret; environment defaults win unless the person explicitly edits the saved settings. */
   workspaceId?: string | undefined;
   region?: string | undefined;
+  /** Explicit edits in the provider form take priority over environment defaults. */
+  preferSavedAwsSettings?: boolean | undefined;
+  preferSavedKey?: boolean | undefined;
   /** Set when a key was saved to the OS keychain; changing it invalidates cached keys. */
   keyUpdatedAt?: string | undefined;
   /** Set when the app wrote this connection's key to the global .env under apiKeyEnv. */
   keySavedToEnv?: true | undefined;
   /** OpenRouter only: refuse upstream providers that retain or train on prompts. Default deny. */
   dataCollection?: "allow" | "deny" | undefined;
+  /** ChatGPT only: the signed-in account's email, for display. */
+  accountLabel?: string | undefined;
+  /** Claude Code only: the CLI to run when it is not found in the usual places. */
+  cliPath?: string | undefined;
 }
 
 export interface AiModelChoice { connection: string; model: string; maxTokens?: number | undefined }
@@ -574,11 +581,18 @@ export interface ExtractorConfig {
   connectionLabel?: string | undefined;
   connectionKind?: AiConnectionKind | undefined;
   keyUpdatedAt?: string | undefined;
+  keySavedToEnv?: true | undefined;
   workspaceId?: string | undefined;
   region?: string | undefined;
+  /** Explicit edits in the provider form take priority over environment defaults. */
+  preferSavedAwsSettings?: boolean | undefined;
+  preferSavedKey?: boolean | undefined;
   dataCollection?: "allow" | "deny" | undefined;
+  cliPath?: string | undefined;
   /** The built-in default would send project content to a remote model the person never chose. */
   requiresConsent?: boolean | undefined;
+  /** The project whose own .env supplies this model's keys; see src/project-env.ts. */
+  envRoot?: string | undefined;
 }
 
 /** One job's model after tiers, job overrides and project overrides are applied. */
@@ -603,6 +617,8 @@ export interface AutomaticPromotionConfig {
   coreCandidates: boolean;
   /** Confidence bar for a core candidate whose only corroboration is an AI "current" verdict. */
   singleSourceMinConfidence: number;
+  /** Days without activity after which an uncorroborated core candidate is discarded; 0 never expires. */
+  candidateExpiryDays?: number | undefined;
 }
 
 export interface PromotionConfig {
@@ -643,6 +659,8 @@ export interface EmbeddingConfig {
   model: string;
   apiKeyEnv?: string | undefined;
   batchSize: number;
+  /** The project whose own .env supplies the key; see src/project-env.ts. */
+  envRoot?: string | undefined;
 }
 
 export interface PrivacyConfig {
@@ -803,10 +821,16 @@ export interface InvestigatorConfig {
   connectionLabel?: string | undefined;
   connectionKind?: AiConnectionKind | undefined;
   keyUpdatedAt?: string | undefined;
+  keySavedToEnv?: true | undefined;
   workspaceId?: string | undefined;
   region?: string | undefined;
+  /** Explicit edits in the provider form take priority over environment defaults. */
+  preferSavedAwsSettings?: boolean | undefined;
+  preferSavedKey?: boolean | undefined;
   dataCollection?: "allow" | "deny" | undefined;
+  cliPath?: string | undefined;
   requiresConsent?: boolean | undefined;
+  envRoot?: string | undefined;
   maxDepth: number;
   maxSteps: number;
   maxBranching: number;
@@ -869,6 +893,8 @@ export interface ProjectConfig {
   models?: Record<AiJob, ResolvedModel>;
   /** Daily token cap for background AI work; null means no cap. */
   aiBudget?: { backgroundDailyTokens: number | null };
+  /** Whether the repo's own sensitive settings are approved on this device; see src/project-trust.ts. */
+  trust?: { status: "none-needed" | "trusted" | "untrusted"; ignored: string[] };
 }
 
 export interface InvestigationEntityRef {

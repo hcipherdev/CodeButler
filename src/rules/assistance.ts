@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { AiConnectionError } from "../ai/errors.js";
+import { AiPausedError } from "../ai/usage.js";
 import { loadGlobalReviewerConfig } from "../config.js";
 import { assertReconciliationProviderConfigured, createMemoryReconciliationProvider, type MemoryReconciliationProvider } from "../memory/reconciliation-provider.js";
 import { redactSensitiveText } from "../privacy/redaction.js";
@@ -40,8 +42,11 @@ export async function draftGlobalRule(description: string, dependencies: RuleAss
       provider.request({ system: RULE_DRAFT_PROMPT, payload: { description: source }, maxTokens: 4096, signal: controller.signal }),
       new Promise<never>((_, reject) => controller.signal.addEventListener("abort", () => reject(new Error("timeout")), { once: true }))
     ]);
-  } catch {
-    throw new Error(controller.signal.aborted ? "AI drafting timed out. Your description is preserved; retry or enter the rule manually." : "AI drafting failed. Check the global reviewer settings and retry, or enter the rule manually.");
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error("AI drafting timed out. Your description is preserved; retry or enter the rule manually.");
+    // Connection problems the person can fix, such as a signed-out plan, say what to do.
+    if (error instanceof AiConnectionError || error instanceof AiPausedError) throw new Error(`AI drafting failed: ${error.message}`);
+    throw new Error("AI drafting failed. Check the global reviewer settings and retry, or enter the rule manually.");
   } finally { clearTimeout(timer); }
   if (Buffer.byteLength(response.content) > 64 * 1024 || redactSensitiveText(response.content).redactions.length) throw new Error("The AI draft is too large or contains a recognized secret. Revise the description and retry.");
   let invalidReason = "The response is not valid JSON.";

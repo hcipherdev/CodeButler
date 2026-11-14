@@ -857,6 +857,41 @@ export const SCHEMA_MIGRATIONS: readonly SchemaMigration[] = [
         }
       }
     }
+  },
+  {
+    version: 25,
+    name: "add memory usage",
+    up(db: DatabaseSync) {
+      // One row per memory, kind, day and device (the id hashes all four), so it stays small.
+      // No retrieval triggers: usage changes nothing a search returns.
+      db.exec(`
+        create table if not exists memory_usage (
+          id text primary key,
+          memory_id text not null,
+          category text not null check (category in ('candidate', 'promoted')),
+          layer text not null,
+          kind text not null check (kind in ('used', 'correction_proposed')),
+          day text not null,
+          device_id text not null
+        );
+        create index if not exists memory_usage_memory on memory_usage(memory_id, category, day);
+      `);
+    }
+  },
+  {
+    version: 26,
+    name: "count shared writes for cloud change detection",
+    up(db: DatabaseSync) {
+      // Local-only: snapshots strip it. Triggers on every shared table are kept current by
+      // ensureSharedChangeTriggers at each store init, so tables added later are covered too.
+      db.exec(`
+        create table if not exists cloud_change_counter (
+          id integer primary key check (id = 1),
+          shared_writes integer not null default 0
+        );
+        insert or ignore into cloud_change_counter (id, shared_writes) values (1, 0);
+      `);
+    }
   }
 ] as const;
 

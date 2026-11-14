@@ -15,7 +15,7 @@ export interface PrivacyExportDocument {
 }
 
 export const PRIVACY_EXPORT_TABLES = [
-  "memory_events", "memory_topics", "memory_topic_links",
+  "memory_events", "memory_topics", "memory_topic_links", "memory_usage",
   "sources",
   "chunks",
   "commits",

@@ -3,6 +3,10 @@ import { redactSensitiveText } from "../privacy/redaction.js";
 
 export const RULE_BODY_BYTES = 4 * 1024;
 export const RULE_FILE_BYTES = 16 * 1024;
+export function isRulesMetadataName(name: string): boolean {
+  // Finder and Explorer metadata, including AppleDouble sidecars for copied files.
+  return /^(?:\.ds_store|thumbs\.db|desktop\.ini)$/i.test(name) || name.startsWith("._");
+}
 export const ruleActions = ["write_file", "create_doc", "commit", "read_secrets", "run_tests", "add_dependency"] as const;
 export const ruleIdSchema = z.string().max(96).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).refine(id => !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/.test(id), "Reserved filename");
 const strings = z.array(z.string().min(1).max(240)).max(32);

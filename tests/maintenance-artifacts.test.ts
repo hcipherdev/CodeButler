@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+// Tests inspectArtifactMaintenance(), runArtifactMaintenance() and runLogDirectoryMaintenance() in src/maintenance/artifacts.ts: log rotation, backup pruning and cloud handle reaping.
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, utimesSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { inspectArtifactMaintenance, runArtifactMaintenance } from "../src/maintenance/artifacts.js";
+import { inspectArtifactMaintenance, runArtifactMaintenance, runLogDirectoryMaintenance } from "../src/maintenance/artifacts.js";
 import type { ArtifactRetentionConfig } from "../src/types.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 
@@ -47,13 +48,63 @@ describe("artifact maintenance", () => {
     const result = runArtifactMaintenance(rootDir, config, { apply: true });
 
     expect(result.rotated).toBe(1);
-    expect(existsSync(active)).toBe(false);
+    expect(readFileSync(active, "utf8")).toBe("");
     const rotated = readdirSync(logsDir).filter((name) => name.startsWith("watch.out.log."));
     expect(rotated).toHaveLength(3);
     expect(rotated).toContain("watch.out.log.5");
     expect(readFileSync(join(logsDir, "watch.out.log.5"), "utf8")).toHaveLength(2048);
     expect(rotated).not.toContain("watch.out.log.1");
     expect(result.warnings).toEqual([]);
+  });
+
+  it("keeps a writer that holds the log open appending to the live file after rotation", () => {
+    const { rootDir, dataDir } = createProject();
+    const logsDir = join(dataDir, "logs");
+    mkdirSync(logsDir, { recursive: true });
+    const active = join(logsDir, "watch.out.log");
+    // Opened like launchd's StandardOutPath: append mode, held across the rotation.
+    const fd = openSync(active, "a");
+    try {
+      writeSync(fd, "x".repeat(2048));
+      runArtifactMaintenance(rootDir, config, { apply: true });
+      writeSync(fd, "after rotation\n");
+    } finally { closeSync(fd); }
+
+    expect(readFileSync(active, "utf8")).toBe("after rotation\n");
+    expect(readFileSync(`${active}.1`, "utf8")).toBe("x".repeat(2048));
+  });
+
+  it("rotates the global watcher's logs in a folder outside any project", () => {
+    const dir = makeTempDir();
+    tempDirs.push(dir);
+    for (const name of ["watch.out.log", "watch.err.log", "runtime-install.log"]) writeFileSync(join(dir, name), "y".repeat(2048));
+    appendFileSync(join(dir, "other.log"), "z".repeat(2048));
+
+    const planned = runLogDirectoryMaintenance(dir, ["watch.out.log", "watch.err.log", "runtime-install.log"], config.logs, { apply: false });
+    expect(planned.items.map(item => item.action)).toEqual(["rotate", "rotate", "rotate"]);
+    expect(readdirSync(dir)).toHaveLength(4);
+
+    const applied = runLogDirectoryMaintenance(dir, ["watch.out.log", "watch.err.log", "runtime-install.log"], config.logs, { apply: true });
+    expect(applied).toMatchObject({ rotated: 3, warnings: [] });
+    for (const name of ["watch.out.log", "watch.err.log", "runtime-install.log"]) {
+      expect(readFileSync(join(dir, name), "utf8")).toBe("");
+      expect(readFileSync(join(dir, `${name}.1`), "utf8")).toHaveLength(2048);
+    }
+    expect(readFileSync(join(dir, "other.log"), "utf8")).toHaveLength(2048);
+  });
+
+  it("warns instead of throwing when a log cannot be rotated, and leaves no partial copy", () => {
+    const dir = makeTempDir();
+    tempDirs.push(dir);
+    // A directory with the log's name cannot be copied or truncated.
+    mkdirSync(join(dir, "watch.out.log"));
+    writeFileSync(join(dir, "watch.out.log", "inner"), "q".repeat(2048));
+
+    const result = runLogDirectoryMaintenance(dir, ["watch.out.log"], { maxBytes: 0, maxFiles: 3 }, { apply: true });
+
+    expect(result.rotated).toBe(0);
+    expect(result.warnings).toEqual([expect.stringContaining("Could not rotate")]);
+    expect(readdirSync(dir)).toEqual(["watch.out.log"]);
   });
 
   it("leaves an in-limit watcher log and its rotated copies untouched", () => {

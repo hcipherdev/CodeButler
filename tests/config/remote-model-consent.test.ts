@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { awaitsRemoteModelConsent, migrateRemoteModelConsent } from "../../src/ai/consent.js";
 import { credentialStatus, REMOTE_MODEL_CONSENT } from "../../src/ai/credentials.js";
-import { ensureGlobalConfig, ensureProjectConfig, loadProjectConfig, readRemoteModelConsent, setRemoteModelConsent } from "../../src/config.js";
+import { ensureGlobalConfig, ensureProjectConfig, loadProjectConfig, readRemoteModelConsent, setRemoteModelConsent, trustProjectSettings } from "../../src/config.js";
 import { buildConfiguredExtractor } from "../../src/sync/service.js";
 import { cleanupTempDir, makeTempDir } from "../helpers/temp.js";
 
@@ -53,12 +53,15 @@ describe("remote model consent", () => {
     expect(loadProjectConfig(root).extractor.requiresConsent).toBe(true);
   });
 
-  it("treats a provider written in config, including a local server, or a key in Butler's .env as chosen", () => {
+  it("treats an approved provider in config, including a local server, or a key in Butler's .env as chosen", () => {
+    // The repo's author picked this model, not the person on this device.
     writeProjectConfig({ extractor: { model: "gpt-5" } });
-    expect(loadProjectConfig(root).extractor.requiresConsent).toBeUndefined();
+    expect(loadProjectConfig(root).extractor.requiresConsent).toBe(true);
 
     writeProjectConfig({});
     writeProjectConfig({ extractor: { baseUrl: "http://127.0.0.1:11434/v1", apiKeyEnv: "" } }, "config.local.json");
+    expect(loadProjectConfig(root).extractor.requiresConsent).toBe(true);
+    trustProjectSettings(root);
     expect(loadProjectConfig(root).extractor.requiresConsent).toBeUndefined();
 
     writeProjectConfig({}, "config.local.json");
