@@ -111,13 +111,16 @@ Memory can come from:
 
 ## Quick Start
 
-> **Install from source.** This repository is Code Butler 2.0. The npm registry
-> still has the retired 1.x release, so do not use `npx code-butler` or
-> `npm install -g code-butler` until 2.0 is published there.
+Install the standalone CLI from npm:
 
-Install from source on macOS, Windows, or Linux. Local project memory works on
-all three. Encrypted cloud sync needs the native crypto helper, which builds on
-macOS and Windows only.
+```bash
+npm install -g code-butler@2.0.2
+code-butler --version
+```
+
+Use the instructions below to build from source. Local project memory works on
+macOS, Windows, and Linux. Encrypted cloud sync uses the native crypto helper on
+macOS and Windows.
 
 ### macOS
 
@@ -138,7 +141,7 @@ cd CodeButler
 npm ci
 npm run package:crypto   # only for encrypted cloud sync; needs Rust
 npm pack
-npm install -g ./code-butler-2.0.0.tgz
+npm install -g ./code-butler-2.0.2.tgz
 code-butler --version
 ```
 
@@ -165,7 +168,7 @@ cd CodeButler
 npm ci
 npm run package:crypto   # only for encrypted cloud sync; needs Rust
 npm pack
-npm install -g .\code-butler-2.0.0.tgz
+npm install -g .\code-butler-2.0.2.tgz
 code-butler --version
 ```
 
@@ -196,7 +199,7 @@ git pull
 npm ci
 npm run package:crypto   # only if you use encrypted cloud sync
 npm pack
-npm install -g ./code-butler-2.0.0.tgz   # use the file name npm pack prints
+npm install -g ./code-butler-2.0.2.tgz   # use the file name npm pack prints
 ```
 
 ### Set up a project
@@ -484,7 +487,7 @@ npm ci
 .\node_modules\.bin\tsc.cmd -p tsconfig.build.json
 npm run package:crypto   # optional: needs Rust; required for encrypted cloud sync
 npm pack --ignore-scripts
-npm install -g .\code-butler-2.0.0.tgz
+npm install -g .\code-butler-2.0.2.tgz
 
 code-butler --help
 ```
@@ -500,7 +503,7 @@ $env:PATH = "$nodePrefix;$env:PATH"
 & ".\node_modules\.bin\tsc.cmd" -p tsconfig.build.json
 & "$nodePrefix\npm.cmd" run package:crypto
 & "$nodePrefix\npm.cmd" pack --ignore-scripts
-& "$nodePrefix\npm.cmd" install -g --prefix $nodePrefix .\code-butler-2.0.0.tgz
+& "$nodePrefix\npm.cmd" install -g --prefix $nodePrefix .\code-butler-2.0.2.tgz
 ```
 
 Then configure Codex globally:

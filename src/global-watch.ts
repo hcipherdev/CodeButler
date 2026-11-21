@@ -202,6 +202,7 @@ export interface GlobalWatchOptions {
   once?: boolean;
   signal?: AbortSignal;
   log?: (line: string) => void;
+  onReady?: (runner: RuntimeRecord) => void;
   runProject?: (root: string, kind: WatchJobKind) => Promise<void | WatchPassResult>;
   /** Whether `host` resolves again after a pass found no network; a DNS lookup by default. */
   probeNetwork?: (host: string) => Promise<boolean>;
@@ -271,6 +272,7 @@ export async function runGlobalWatch(options: GlobalWatchOptions): Promise<void>
         await delay(250);
       }
       if (signal.aborted) return;
+      options.onReady?.(runtime);
       migrateRegisteredCheckouts();
       for (const project of listWatchedProjects()) if (existsSync(join(project.root, ".code-butler", "config.json")) && !checkoutNeedsRepair(project.root)) registerWatchedProject(project.root);
       const launch = (root: string, kind: WatchJobKind): void => {

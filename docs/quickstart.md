@@ -7,8 +7,14 @@
 
 ## Install
 
-Code Butler 2.0 is not on npm yet; the npm registry still serves 1.x, whose cloud
-sync has been retired. Build and install the current version from source:
+Install the standalone CLI from npm:
+
+```bash
+npm install -g code-butler@2.0.2
+code-butler --version
+```
+
+To build from source:
 
 ```bash
 git clone https://github.com/hcipherdev/CodeButler.git
@@ -16,7 +22,7 @@ cd CodeButler
 npm ci
 npm run package:crypto   # optional: macOS or Windows with Rust, needed for encrypted cloud sync
 npm pack
-npm install -g ./code-butler-2.0.0.tgz
+npm install -g ./code-butler-2.0.2.tgz
 ```
 
 `npm pack` builds the package first. Skip `npm run package:crypto` if you only need

@@ -23,10 +23,15 @@ export interface LocalMemoryQualityRow {
 export function openLocalMemoryDatabase(path: string): DatabaseSync {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(path);
-  db.exec("PRAGMA busy_timeout = 5000");
-  db.exec("PRAGMA journal_mode = WAL");
-  initializeLocalMemorySchema(db);
-  return db;
+  try {
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.exec("PRAGMA journal_mode = WAL");
+    initializeLocalMemorySchema(db);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
 }
 
 export function initializeLocalMemorySchema(db: DatabaseSync): void {

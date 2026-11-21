@@ -16,6 +16,7 @@ import { readCanonicalTierPage } from "../src/retrieval/tiers.js";
 import { planMemoryReconciliation, previewDesktopMemoryReconciliation } from "../src/memory/reconciliation.js";
 import { initializeSchema, SCHEMA_MIGRATIONS } from "../src/storage/migrations.js";
 import { openConfiguredMemoryStore } from "../src/storage/open-configured-store.js";
+import { deviceLocalMemoryDatabasePath } from "../src/storage/store.js";
 import { cleanupTempDir, makeTempDir } from "./helpers/temp.js";
 import { saveBinding, binding, stateDirectory } from "../src/cloud/state.js";
 import { syncProgressWriter } from "../src/cloud/sync-progress.js";
@@ -270,6 +271,17 @@ describe("desktop engine contract", () => {
     expect(status).toMatchObject({ run: { id: run.id } });
     expect(results).toMatchObject({ run: { id: run.id } });
   });
+
+  it("reports a real SQLite lock as retryable for saved Wording polish status", async () => {
+    await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);
+    const status = () => handleDesktopRequest({ version: 1, action: "memory.ai.status", mode: "wording", root });
+    const writer = new DatabaseSync(deviceLocalMemoryDatabasePath(root));
+    try {
+      writer.exec("PRAGMA journal_mode = DELETE; BEGIN EXCLUSIVE");
+      await expect(status()).rejects.toMatchObject({ code: "busy", message: expect.stringContaining("Wording polish status") });
+    } finally { writer.close(); }
+    await expect(status()).resolves.toEqual({});
+  }, 15_000);
 
   it("returns saved AI review results while another operation holds the project lock", async () => {
     await handleDesktopRequest({ version: 1, action: "projects.add", root }, addOptions);

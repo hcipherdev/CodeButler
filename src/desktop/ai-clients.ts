@@ -7,6 +7,7 @@ import { globalConfigDir, loadGlobalAiSettings } from "../config.js";
 import { probeMcpLauncher, type McpProbeResult } from "./mcp-probe.js";
 import { missingCodexConfig, parseCodexConfig, writeCodexConfig } from "./codex-config.js";
 import { backupClientConfig, readClientConfig, writeClientConfig } from "./client-config-write.js";
+import { storeLauncher } from "../store-runtime.js";
 
 export type { AiClient };
 /** `failing` means registered, but the installed code-butler command does not start as an MCP server. */
@@ -76,12 +77,18 @@ function dataRoot(ctx: Context): string {
 /** The stable command the installer keeps current across releases. Windows uses Node directly: a .cmd needs a shell. */
 export function stableLauncher(options: AiClientOptions = {}): Launcher {
   const ctx = context(options), path = pathFor(ctx), legacy = path.join(dataRoot(ctx), "CodeButler", "node24");
+  const store = storeLauncher(ctx.platform, ctx.env);
+  if (store) return { command: store, args: ["mcp"] };
   if (ctx.platform === "win32") return { command: path.join(legacy, "node.exe"), args: [path.join(legacy, "node_modules", "code-butler", "dist", "cli.js"), "mcp"] };
   if (ctx.platform === "darwin" && ctx.exists("/usr/local/bin/code-butler")) return { command: "/usr/local/bin/code-butler", args: ["mcp"] };
   return { command: path.join(legacy, "code-butler"), args: ["mcp"] };
 }
 
 function launcherInstalled(ctx: Context, launcher: Launcher): boolean {
+  // The native Store entry point confirms package identity. Its execution alias
+  // can run even when Node cannot stat the AppExecLink (EACCES); MCP probing
+  // below still checks whether the registered command actually starts.
+  if (launcher.command === storeLauncher(ctx.platform, ctx.env)) return true;
   return ctx.exists(launcher.command) && launcher.args.slice(0, -1).every(arg => ctx.exists(arg));
 }
 
@@ -89,6 +96,7 @@ function launcherInstalled(ctx: Context, launcher: Launcher): boolean {
 function isStableEntry(entry: Entry, launcher: Launcher): boolean {
   const command = entry.command ?? "", args = entry.args ?? [];
   if (command === launcher.command && JSON.stringify(args) === JSON.stringify(launcher.args)) return true;
+  if (/[\\/]Microsoft[\\/]WindowsApps[\\/]code-butler\.exe$/i.test(launcher.command)) return false;
   if (JSON.stringify(args) !== '["mcp"]') return false;
   return command === "/usr/local/bin/code-butler" || /[\\/]CodeButler[\\/]node24[\\/]code-butler(\.cmd)?$/i.test(command);
 }

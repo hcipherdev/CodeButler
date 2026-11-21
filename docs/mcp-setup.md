@@ -1,8 +1,7 @@
 # MCP Setup
 
-Install the `code-butler` command first: build from source as described in the
-[Quick Start](./quickstart.md), or use the desktop app where it is available (it is
-not publicly released yet). The Windows desktop app installs and updates the
+Install the `code-butler` command from npm or from source as described in the
+[Quick Start](./quickstart.md). The Windows desktop app installs and updates the
 matching per-user `code-butler` CLI/MCP runtime. Configure MCP clients to use that
 stable command once, globally, with no project argument:
 
@@ -18,11 +17,6 @@ automatically.
 The desktop installer preserves this command across upgrades, refreshes older explicit
 CLI compatibility paths, and stops stale managed MCP processes so clients can reconnect
 to the new build. No separate npm upgrade is required.
-
-Without the desktop app, install the CLI from source (see the
-[quickstart](quickstart.md)) and point the MCP client at it. The npm registry
-still has the retired 1.x release, so do not use `npx code-butler` or
-`npm install -g code-butler` until 2.0 is published there.
 
 ### How a connection chooses its project
 

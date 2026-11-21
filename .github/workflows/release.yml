@@ -2,8 +2,8 @@ name: Release
 
 # Builds the native crypto helper on each supported platform, publishes the npm
 # package with every platform's verified helper, and opens a draft GitHub
-# release. Desktop installers are attached to the draft by hand, then the draft
-# is published.
+# release. When publishing the draft, use --latest=false to keep the macOS
+# desktop updater pointed at its own release.
 
 on:
   push:
@@ -111,6 +111,6 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create draft GitHub release
-        run: gh release create "${GITHUB_REF_NAME}" --draft --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+        run: gh release create "${GITHUB_REF_NAME}" --draft --latest=false --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
         env:
           GH_TOKEN: ${{ github.token }}

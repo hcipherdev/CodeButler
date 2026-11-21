@@ -65,6 +65,18 @@ describe("update helpers", () => {
 });
 
 describe("checking and downloading updates", () => {
+  it("uses the installed desktop version independently of the engine version", async () => {
+    vi.stubEnv("CODE_BUTLER_INSTALLED_APP_VERSION", "4.3.2");
+    const fetchImpl = server({ version: "2.1.0", platforms: { [platformKey()]: { url: installerUrl, signature: "x" } } }, Buffer.alloc(0));
+    await expect(checkForUpdate(fetchImpl)).resolves.toMatchObject({ current: "4.3.2", available: false });
+    if (process.platform === "win32") {
+      expect(fetchImpl).not.toHaveBeenCalled();
+      await expect(downloadUpdate("2.1.0", fetchImpl)).rejects.toThrow("manually");
+    } else {
+      await expect(downloadUpdate("2.1.0", fetchImpl)).rejects.toThrow("already installed");
+    }
+  });
+
   it("reports a newer release only when it has an installer for this computer", async () => {
     const manifest = { version: "2.1.0", notes: "Faster startup.", pub_date: "2026-11-01T00:00:00Z", platforms: { [platformKey()]: { url: installerUrl, signature: "x" } } };
     await expect(checkForUpdate(server(manifest, Buffer.alloc(0)), "2.0.0")).resolves.toEqual({ current: "2.0.0", available: true, version: "2.1.0", notes: "Faster startup.", publishedAt: "2026-11-01T00:00:00Z" });

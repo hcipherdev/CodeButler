@@ -82,6 +82,7 @@ import {
 } from "../memory/reconciliation.js";
 import type { ProjectSummaryOperationOptions } from "../project-summary/service.js";
 import { initializeProjectMemory } from "../project-initialization.js";
+import { storeLauncher, storeWatcherStatus } from "../store-runtime.js";
 import { openConfiguredMemoryStore } from "../storage/open-configured-store.js";
 import { getWatchServiceStatus, installWatchService } from "../watch-service.js";
 import {
@@ -601,8 +602,8 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
         if (request.intentId) releaseForegroundIntent(root, request.intentId);
         return preview;
       } catch (error) {
-        if (!(error instanceof OperationDeferredError) && request.intentId) releaseForegroundIntent(root, request.intentId);
-        throw desktopAiError(error, "Could not prepare AI review");
+        if (!isDesktopAiBusy(error) && request.intentId) releaseForegroundIntent(root, request.intentId);
+        throw desktopAiError(error, request.mode === "wording" ? "Could not prepare Wording polish" : "Could not prepare AI review");
       }
     }
     case "memory.ai.status": {
@@ -610,16 +611,16 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
         const root = requireRegisteredProject(request.root).root;
         const run = request.mode==="wording" ? readMemoryWording(root,request.runId) : readDesktopMemoryReconciliationStatus(root, request.runId);
         return run ? { run } : {};
-      } catch (error) { throw desktopAiError(error, "Could not load saved AI review status"); }
+      } catch (error) { throw desktopAiError(error, request.mode === "wording" ? "Could not load saved Wording polish status" : "Could not load saved AI review status"); }
     }
     case "memory.ai.results": {
       try {
         const root = requireRegisteredProject(request.root).root;
-        if (request.mode === "wording") return await projectOperation(root, () => {
+        if (request.mode === "wording") {
           const run = readMemoryWording(root, request.runId);
           if (!run) throw new Error("Unknown wording run");
           return { run, citations: {}, memories: {} };
-        });
+        }
         const { run, citations } = readDesktopMemoryReconciliationResults(root, request.runId);
         let memories: Record<string, { title: string; summary: string }> | undefined;
         try {
@@ -632,23 +633,23 @@ export async function handleDesktopRequest(input: unknown, options: DesktopServi
               return Object.fromEntries(found.map((memory) => [memory.id, { title: memory.title, summary: memory.summary }]));
             } finally { store.close(); }
           }, { waitMs: 0, name: "Load AI review titles" });
-        } catch (error) { if (!(error instanceof OperationDeferredError)) throw error; }
+        } catch (error) { if (!isDesktopAiBusy(error)) throw error; }
         return { run, citations, memories: memories ?? {}, ...(memories ? {} : { memoriesPending: true }) };
-      } catch (error) { throw desktopAiError(error, "Could not load AI review results"); }
+      } catch (error) { throw desktopAiError(error, request.mode === "wording" ? "Could not load Wording polish results" : "Could not load AI review results"); }
     }
     case "memory.ai.apply": {
       const root = requireRegisteredProject(request.root).root;
       const intent = beginForegroundIntent(root);
       try {
         return request.mode==="wording" ? await applyMemoryWording(root,request.runId,request.itemIds) : await applyMemoryReconciliation(root, { runId: request.runId, itemIds: request.itemIds, applyCorrections: request.applyCorrections, forceOffline: request.forceOffline });
-      } catch (error) { throw desktopAiError(error); }
+      } catch (error) { throw desktopAiError(error, request.mode === "wording" ? "Could not apply wording proposals" : undefined); }
       finally { intent.release(); }
     }
     case "memory.ai.revert": {
       const root = requireRegisteredProject(request.root).root;
       const intent = beginForegroundIntent(root);
       try { if(request.mode==="wording"){const run=readMemoryWording(root,request.runId);if(!run)throw new Error("Unknown wording run");return await applyMemoryWording(root,run.id,run.items.filter(i=>i.state==="applied").map(i=>i.itemId),true);}return await revertMemoryReconciliation(root, { runId: request.runId, forceOffline: request.forceOffline }); }
-      catch (error) { throw desktopAiError(error); }
+      catch (error) { throw desktopAiError(error, request.mode === "wording" ? "Could not undo wording approvals" : undefined); }
       finally { intent.release(); }
     }
     case "cloud.projects.list": return cloudProjectList(request.refresh);
@@ -832,7 +833,7 @@ async function waitForReviewAccess<T>(
     if (shouldStop()) throw new ReviewStartCancelledError();
     try { return await work(); }
     catch (error) {
-      if (!(error instanceof OperationDeferredError)) throw error;
+      if (!isDesktopAiBusy(error)) throw error;
       const operation = readProjectOperationStatus(root);
       onWaiting?.({ ...(operation ? { operation } : {}), elapsedMs: Date.now() - started });
       await delay(750);
@@ -840,9 +841,17 @@ async function waitForReviewAccess<T>(
   }
 }
 
+function isDesktopAiBusy(error: unknown): boolean {
+  if (error instanceof OperationDeferredError) return true;
+  if (!(error instanceof Error)) return false;
+  const { code, errcode } = error as Error & { code?: string; errcode?: number };
+  // Node reports the extended SQLite result code. The low byte identifies SQLITE_BUSY (5).
+  return code === "ERR_SQLITE_ERROR" && typeof errcode === "number" && (errcode & 0xff) === 5;
+}
+
 function desktopAiError(error: unknown, context = "AI review could not be completed"): DesktopServiceError {
   if (error instanceof DesktopServiceError) return error;
-  if (error instanceof OperationDeferredError) return new DesktopServiceError("busy", `${context}: another local Code Butler operation is still active. Retry when it finishes.`);
+  if (isDesktopAiBusy(error)) return new DesktopServiceError("busy", `${context}: another local Code Butler operation is still active. Retry when it finishes.`);
   const diagnosticId = recordUnexpectedDesktopError(error, context);
   return new DesktopServiceError("invalid-request", `${context}: ${error instanceof Error ? error.message : "unexpected error"}${diagnosticId ? ` (diagnostic ${diagnosticId})` : ""}`);
 }
@@ -927,7 +936,7 @@ async function bootstrapDesktopAccount(options: DesktopServiceOptions, force = f
 function ensureDesktopGlobalWatcher(): void {
   // Packaged apps use the runtime installer so a desktop request cannot
   // register a competing watcher while the shared runtime is switching.
-  if (process.env.CODE_BUTLER_MANAGED_DESKTOP_RUNTIME === "1") return;
+  if (process.env.CODE_BUTLER_MANAGED_DESKTOP_RUNTIME === "1" || storeLauncher()) return;
   const cwd = globalConfigDir();
   const watchOptions = {
     cwd,
@@ -955,6 +964,7 @@ function watcherServiceStatus(running: boolean, pid?: number, runnerBuild?: type
     platform: service.platform,
     label: service.label,
     logsDir: service.logsDir,
+    ...storeWatcherStatus(service.platform),
     ...(pid === undefined ? {} : { pid })
   };
 }

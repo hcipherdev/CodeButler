@@ -10,7 +10,7 @@ import { createEmbeddingEndpointHash, createProviderKey } from "../embeddings/fi
 import { parseFencedJson } from "../json.js";
 import { openConfiguredMemoryStore } from "../storage/open-configured-store.js";
 import { openLocalMemoryDatabase } from "../storage/local-memory.js";
-import type { MemoryStore } from "../storage/store.js";
+import { deviceLocalMemoryDatabasePath, type MemoryStore } from "../storage/store.js";
 import { withTransaction } from "../storage/transactions.js";
 import type { MemoryStatement } from "../types.js";
 import { assessClaim, createStatement, resolveStatement } from "./statement.js";
@@ -84,16 +84,15 @@ function save(db: DatabaseSync, run: WordingRun) {
     db.prepare("insert into memory_wording_runs values(?,?,?) on conflict(id) do update set data_json=excluded.data_json,updated_at=excluded.updated_at").run(run.id, JSON.stringify(run), run.updatedAt);
 }
 export function readMemoryWording(root: string, id?: string): WordingRun | undefined {
-    const store = openConfiguredMemoryStore(root);
-    store.init();
+    const db = openLocalMemoryDatabase(deviceLocalMemoryDatabasePath(root));
     try {
-        const row = (id ? store.localDb.prepare("select data_json from memory_wording_runs where id=?").get(id) : store.localDb.prepare("select data_json from memory_wording_runs order by updated_at desc limit 1").get()) as {
+        const row = (id ? db.prepare("select data_json from memory_wording_runs where id=?").get(id) : db.prepare("select data_json from memory_wording_runs order by updated_at desc limit 1").get()) as {
             data_json: string;
         } | undefined;
         return row ? JSON.parse(row.data_json) as WordingRun : undefined;
     }
     finally {
-        store.close();
+        db.close();
     }
 }
 export function validateWordingProposal(before: MemoryStatement, raw: unknown, type: import("../types.js").MemoryType): MemoryStatement {

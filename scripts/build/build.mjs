@@ -47,8 +47,8 @@ function fingerprint(path) {
   }
 }
 // Desktop sources exist only in the private repository.
-for (const path of ["src", "desktop/src", "src-tauri/src", "scripts"]) if (existsSync(join(root, path))) fingerprint(path);
-for (const name of ["package.json", "package-lock.json", "src-tauri/Cargo.toml", "src-tauri/tauri.conf.json"]) if (existsSync(join(root, name))) sourceHash.update(name).update(readFileSync(join(root, name)));
+for (const path of ["src", "desktop/src", "src-tauri/src", "src-tauri/windows", "scripts"]) if (existsSync(join(root, path))) fingerprint(path);
+for (const name of ["package.json", "package-lock.json", "src-tauri/Cargo.toml", "src-tauri/tauri.conf.json", "src-tauri/windows/AppxManifest.store.xml.in"]) if (existsSync(join(root, name))) sourceHash.update(name).update(readFileSync(join(root, name)));
 // CODE_BUTLER_DISTRIBUTION=store (set by scripts/winos/build-signed-installer.ps1) marks a Microsoft Store build,
 // which turns off the in-app GitHub updater.
 const distribution = process.env.CODE_BUTLER_DISTRIBUTION?.trim() || undefined;

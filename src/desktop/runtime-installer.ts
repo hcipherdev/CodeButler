@@ -14,7 +14,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, normalize, resolve, sep } from "node:path";
+import { basename, dirname, join, normalize, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { globalConfigDir } from "../config.js";
@@ -24,6 +24,7 @@ import { atomicJson, readJson } from "../cloud/state.js";
 import { OperationDeferredError } from "../cloud/outcome.js";
 import { processStartIdentity, readRuntimeRecords, type BuildInfo, type RuntimeRecord } from "../runtime.js";
 import { probeMcpLauncher } from "./mcp-probe.js";
+import { storeWatcherJournalPath, storeWatcherTransitionDirectory } from "../store-runtime.js";
 import { getWatchServiceStatus, installWatchService, pauseGlobalWatchService, readGlobalWatchRegistration, restoreGlobalWatchRegistration, uninstallWatchService, type GlobalWatchRegistration } from "../watch-service.js";
 
 interface DesktopEngineManifest {
@@ -184,7 +185,14 @@ export function installDesktopRuntime(options: DesktopRuntimeInstallOptions = {}
   const paths = runtimePaths(options);
   const { managedRoot } = paths;
   mkdirSync(managedRoot, { recursive: true });
-  return withProjectGateSync(managedRoot, () => activateDesktopRuntime(paths, options), "Update Code Butler runtime");
+  const install = () => withProjectGateSync(managedRoot, () => activateDesktopRuntime(paths, options), "Update Code Butler runtime");
+  if (process.platform !== "win32" || paths.config !== globalConfigDir() || options.manageWatcher === false) return install();
+  const transition = storeWatcherTransitionDirectory();
+  mkdirSync(transition, { recursive: true });
+  return withProjectGateSync(transition, () => {
+    if (existsSync(storeWatcherJournalPath())) throw new ManagedRuntimeBlockerError("A Code Butler watcher handoff is awaiting recovery.");
+    return install();
+  }, "Update Code Butler watcher startup");
 }
 
 function activateDesktopRuntime(paths: ReturnType<typeof runtimePaths>, options: DesktopRuntimeInstallOptions): DesktopRuntimeInstallResult {
@@ -544,6 +552,16 @@ export function managedWatcherState(runner: RuntimeRecord, roots: string[]): "st
   catch { return "unverified"; }
 }
 
+export function verifyStandaloneWindowsWatcher(node: string, cli: string): string[] {
+  const root = join(defaultLocalAppData(), "CodeButler");
+  const roots = [join(root, "runtime"), join(root, "node24")];
+  if (!roots.some(directory => containedBy(node, directory) && containedBy(cli, directory) &&
+      containedBy(realpathSync(node), realpathSync(directory)) && containedBy(realpathSync(cli), realpathSync(directory)))) {
+    throw new ManagedRuntimeBlockerError("The watcher launcher points outside the standalone runtime.");
+  }
+  return roots;
+}
+
 function matchesRecord(process: ManagedProcess, record: RuntimeRecord): boolean {
   return sameProcessBirth(process.processStart, record.processStart) &&
     process.executable.toLowerCase() === record.executable?.toLowerCase() &&
@@ -785,13 +803,20 @@ function shellLiteral(value: string): string { return value.replaceAll("'", `'"'
 function sleep(milliseconds: number): void { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds); }
 
 export function isDesktopRuntimeInstallerEntrypoint(importMetaUrl: string, argvPath: string | undefined): boolean {
-  if (!argvPath) return false;
+  // The MSIX watcher also bundles this module for standalone process verification.
+  // In that bundle import.meta.url points to watch.mjs, which must not process installer modes.
+  if (!argvPath || !["install.mjs", "runtime-installer.ts", "runtime-installer.js"].includes(basename(argvPath))) return false;
   try { return realpathSync(fileURLToPath(importMetaUrl)) === realpathSync(argvPath); }
   catch { return false; }
 }
 
 async function runInstaller(args: string[]): Promise<void> {
   const [mode, argument, buildId] = args;
+  if (mode === "--recover-store-watcher" && args.length === 1) {
+    const { recoverStoreWatcher } = await import("./store-watcher.js");
+    await recoverStoreWatcher();
+    return;
+  }
   if (mode === "--probe" && argument && buildId && args.length === 3) {
     const launcher = process.platform === "win32"
       ? { command: join(argument, "node.exe"), args: [join(argument, "node_modules", "code-butler", "dist", "cli.js")] }

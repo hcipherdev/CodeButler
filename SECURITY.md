@@ -48,9 +48,7 @@ compromised. Reports showing that the service, or anyone without an approved
 device or the recovery kit, can read memory or secrets content are especially
 welcome.
 
-Code Butler 2.0 is not yet published to npm; the 1.x package there predates
-encrypted sync. Once 2.0 is released, its npm packages will include prebuilt
-`butler-crypto` binaries under `dist/native/<platform>/`, each with a
-`manifest.json` recording its SHA-256 and the `Cargo.lock` it was built from,
-built from this repository by the public release workflow. Until then, build
-the helper from source with `npm run package:crypto`.
+The public release workflow packages prebuilt `butler-crypto` binaries for
+macOS and Windows under `dist/native/<platform>/`. Each has a `manifest.json`
+recording its SHA-256 and the `Cargo.lock` it was built from. For a source build,
+build the helper with `npm run package:crypto`.

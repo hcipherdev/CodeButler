@@ -142,6 +142,8 @@ export interface DesktopProject extends WatchedProject {
 
 export interface DesktopWatcherStatus {
   build?: BuildInfo;
+  expectedBuild?: BuildInfo;
+  handoff?: import("../store-runtime.js").StoreWatcherHandoff;
   processes?: RuntimeRecord[];
   installed: boolean;
   running: boolean;

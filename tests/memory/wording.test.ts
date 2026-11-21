@@ -1,6 +1,7 @@
 // Tests selected AI wording drafts, strict fields, individual approval, stale versions, cancellation, and undo.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { openMemoryStore } from "../../src/storage/store.js";
 import { rememberProjectMemory } from "../../src/memory/remember.js";
 import { resolveMemoryReview } from "../../src/memory/review.js";
@@ -31,6 +32,12 @@ finally {
     store.close();
 } }
 describe("wording-only AI mode", () => {
+    it("reads empty wording status without opening or creating the shared database", () => {
+        const root = makeTempDir(); roots.push(root);
+        expect(readMemoryWording(root)).toBeUndefined();
+        expect(existsSync(join(root, ".code-butler", "memory.sqlite"))).toBe(false);
+    });
+
     it("rejects new, missing, empty and metadata fields", () => {
         const before = createStatement("Use SQLite.", "decision", "human", { choice: "Use SQLite.", rationale: "Support offline work." });
         expect(() => validateWordingProposal(before, { text: "Choose SQLite.", fields: { choice: "Choose SQLite." } }, "decision")).toThrow("exactly");

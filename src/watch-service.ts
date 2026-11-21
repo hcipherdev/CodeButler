@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -8,6 +8,7 @@ import type { SyncSourceName } from "./types.js";
 import { globalConfigDir } from "./config.js";
 import { atomicJson } from "./cloud/state.js";
 import { requestGlobalWatchStop } from "./global-watch.js";
+import { storeLauncher, storeStartup } from "./store-runtime.js";
 
 export type WatchSource = SyncSourceName | "all";
 export type WatchServiceCommandRunner = (command: string, args: string[]) => void;
@@ -57,6 +58,11 @@ export function installWatchService(options: WatchServiceOptions): WatchServiceR
   const service = resolveWatchService(options);
   mkdirSync(service.logsDir, { recursive: true });
 
+  if (service.global && storeLauncher(service.platform)) {
+    const status = storeStartup("enable");
+    return { platform: service.platform, label: service.label, taskName: "CodeButlerWatcher", logsDir: service.logsDir, installed: status.installed };
+  }
+
   if (service.platform === "darwin") return installLaunchdService(service);
   if (service.platform === "linux") return installSystemdService(service);
   if (service.platform === "win32") return installScheduledTask(service);
@@ -66,6 +72,12 @@ export function installWatchService(options: WatchServiceOptions): WatchServiceR
 
 export function uninstallWatchService(options: WatchServiceOptions): WatchServiceResult {
   const service = resolveWatchService(options);
+
+  if (service.global && storeLauncher(service.platform)) {
+    storeStartup("disable");
+    requestGlobalWatchStop();
+    return { platform: service.platform, label: service.label, taskName: "CodeButlerWatcher", logsDir: service.logsDir, installed: false };
+  }
 
   if (service.platform === "darwin") return uninstallLaunchdService(service);
   if (service.platform === "linux") return uninstallSystemdService(service);
@@ -94,6 +106,189 @@ export interface GlobalWatchRegistration {
   files: Array<{ path: string; content: string }>;
   tasks: Array<{ name: string; xml: string; enabled: boolean }>;
   loaded: boolean;
+}
+
+interface WindowsWatcherTask {
+  name: string;
+  enabled: boolean;
+  sameUser: boolean;
+  actions: { execute?: string; arguments?: string; workingDirectory?: string }[];
+}
+
+export interface WindowsWatcherRegistration {
+  tasks: { name: string; enabled: boolean }[];
+  startup?: string;
+  launcher: string;
+  launcherInactive?: boolean;
+  nodePath: string;
+  cliPath: string;
+}
+
+const startupFirstLine = 'Set shell = CreateObject("WScript.Shell")';
+const startupExit = "WScript.Quit 0";
+const launcherExit = "exit 0";
+const windowsGlobalOptions = () => resolveWatchService({ cwd: globalConfigDir(), global: true });
+
+function windowsGlobalTasks(service: ResolvedWatchService): WindowsWatcherTask[] {
+  const script = String.raw`$ErrorActionPreference='Stop'
+    [Console]::OutputEncoding=[Text.Encoding]::UTF8
+    $current=[Security.Principal.WindowsIdentity]::GetCurrent()
+    $tasks=@(Get-ScheduledTask | Where-Object {
+      ($_.TaskPath + $_.TaskName) -in @('\CodeButler-watch-global','\CodeButler\watch-global')
+    } | ForEach-Object {
+      $user=$_.Principal.UserId
+      $sameUser=$user -eq $current.Name -or $user -eq $current.User.Value
+      if ($user -and !$sameUser) {
+        try { $sameUser=([Security.Principal.NTAccount]$user).Translate([Security.Principal.SecurityIdentifier]).Value -eq $current.User.Value } catch {}
+      }
+      @{name=$_.TaskPath + $_.TaskName;enabled=$_.Settings.Enabled;sameUser=$sameUser;actions=@($_.Actions | ForEach-Object {
+        @{execute=$_.Execute;arguments=$_.Arguments;workingDirectory=$_.WorkingDirectory}
+      })}
+    })
+    ConvertTo-Json -InputObject $tasks -Depth 5 -Compress`;
+  const tasks = JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8", windowsHide: true, timeout: 10_000
+  })) as WindowsWatcherTask[];
+  const argumentsExpected = windowsTaskCommand(service).slice("powershell.exe ".length);
+  return tasks.map(task => {
+    const name = task.name.toLowerCase();
+    const action = task.actions[0];
+    if (!scheduledTaskNames(service).some(expected => expected.toLowerCase() === name || `\\${expected.toLowerCase()}` === name) ||
+        !task.sameUser || task.actions.length !== 1 || action?.execute?.toLowerCase() !== "powershell.exe" ||
+        action.arguments?.toLowerCase() !== argumentsExpected.toLowerCase() || action.workingDirectory ||
+        typeof task.enabled !== "boolean") throw new Error("The existing Windows watcher task could not be verified.");
+    return { ...task, name };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function readStartupFile(path: string): string | undefined {
+  try {
+    if (!lstatSync(path).isFile()) throw new Error("The Windows watcher startup file is not a regular file.");
+    return readFileSync(path).toString("base64");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return undefined;
+  }
+}
+
+function windowsGlobalStartupScript(service: ResolvedWatchService): string {
+  return `${startupFirstLine}\r\nshell.Run "${windowsTaskCommand(service).replaceAll('"', '""')}", 0, False\r\n`;
+}
+
+function matchesWindowsScript(script: string, expected: string, firstLine: string, exit: string): boolean {
+  const actual = Buffer.from(script);
+  const original = Buffer.from(expected);
+  const headerLength = Buffer.byteLength(firstLine);
+  const parked = Buffer.from(exit.padEnd(headerLength));
+  // A crash during the fixed-width write can leave some of the original bytes.
+  return actual.subarray(headerLength).equals(original.subarray(headerLength)) &&
+    actual.subarray(0, headerLength).every((value, index) => value === original[index] || value === parked[index]);
+}
+
+function setWindowsScriptParked(path: string, original: string, firstLine: string, exit: string, parked: boolean): void {
+  const before = readStartupFile(path);
+  if (before === undefined || !matchesWindowsScript(Buffer.from(before, "base64").toString("utf8"), original, firstLine, exit)) {
+    throw new Error("The standalone watcher startup script changed during the handoff.");
+  }
+  // Preserve the original byte count, including paths that contain non-ASCII characters.
+  const firstLineBytes = Buffer.byteLength(firstLine);
+  const after = Buffer.from(parked ? exit.padEnd(firstLineBytes) : firstLine);
+  if (!Buffer.from(before, "base64").subarray(0, after.length).equals(after)) {
+    // Opening the existing file avoids redirecting a new file into the MSIX's AppData.
+    const fd = openSync(path, "r+");
+    try {
+      if (!fstatSync(fd).isFile() || readFileSync(fd).toString("base64") !== before) throw new Error("The startup script changed during the handoff.");
+      if (writeSync(fd, after, 0, after.length, 0) !== after.length) throw new Error("Could not write the complete startup script.");
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+  }
+  const expected = Buffer.concat([after, Buffer.from(original.slice(firstLine.length))]).toString("base64");
+  if (readStartupFile(path) !== expected) throw new Error("Could not verify the new state of the startup script.");
+}
+
+export function readWindowsWatcherRegistration(): WindowsWatcherRegistration | undefined {
+  const service = windowsGlobalOptions();
+  const tasks = windowsGlobalTasks(service).map(({ name, enabled }) => ({ name, enabled }));
+  const startup = readStartupFile(windowsStartupPath(service));
+  const startupText = startup === undefined ? undefined : Buffer.from(startup, "base64").toString("utf8");
+  const expected = windowsGlobalStartupScript(service);
+  if (startupText !== undefined && !matchesWindowsScript(startupText, expected, startupFirstLine, startupExit)) {
+    throw new Error("The existing Windows watcher Startup-folder entry could not be verified.");
+  }
+  if (!tasks.length && startupText !== expected) return undefined;
+  const launcher = readStartupFile(windowsLauncherPath(service));
+  if (!launcher) throw new Error("The standalone watcher launcher is missing.");
+  const actualLauncher = Buffer.from(launcher, "base64").toString("utf8");
+  const firstLine = windowsLauncherHeader(service);
+  const firstLineEnd = actualLauncher.indexOf("\r\n");
+  const launcherText = firstLine + actualLauncher.slice(firstLineEnd);
+  if (firstLineEnd < 0 || !matchesWindowsScript(actualLauncher, launcherText, firstLine, launcherExit)) {
+    throw new Error("The standalone watcher launcher could not be verified.");
+  }
+  const command = /^& '((?:[^']|'')+)' '((?:[^']|'')+)' 'watch' '--global' '--interval' '([0-9.e+-]+)' '--source' '([a-z-]+)' >> /m.exec(launcherText);
+  if (!command) throw new Error("The standalone watcher launcher could not be verified.");
+  const [, node, cli, interval, source] = command;
+  const nodePath = node!.replaceAll("''", "'");
+  const cliPath = cli!.replaceAll("''", "'");
+  if (launcherText !== windowsLauncher({ ...service, nodePath, cliPath, intervalSeconds: Number(interval), source: source as WatchSource })) {
+    throw new Error("The standalone watcher launcher contains unexpected commands.");
+  }
+  return {
+    tasks, ...(startupText === expected && startup !== undefined ? { startup } : {}),
+    launcher: Buffer.from(launcherText).toString("base64"), launcherInactive: actualLauncher !== launcherText, nodePath, cliPath
+  };
+}
+
+export function changeWindowsWatcherRegistration(registration: WindowsWatcherRegistration, enable: boolean): void {
+  const service = windowsGlobalOptions();
+  const current = readWindowsWatcherRegistration();
+  if (!current || registration.launcher !== current.launcher ||
+      JSON.stringify(registration.tasks.map(task => task.name)) !== JSON.stringify(current.tasks.map(task => task.name))) {
+    // A Startup-only registration intentionally has no active entry while it is paused.
+    const parked = !registration.tasks.length && !current &&
+      readStartupFile(windowsLauncherPath(service)) === registration.launcher;
+    if (!parked) throw new Error("The standalone watcher registration changed during the handoff.");
+  }
+  if (current?.startup && current.startup !== registration.startup) {
+    throw new Error("The Startup-folder entry changed during the handoff.");
+  }
+  let parkLauncher = false;
+  for (const task of registration.tasks) {
+    const before = current?.tasks.find(candidate => candidate.name === task.name)?.enabled;
+    const after = enable && task.enabled;
+    if (before === after) continue;
+    try { run(service, "schtasks.exe", ["/Change", "/TN", task.name, after ? "/ENABLE" : "/DISABLE"]); }
+    catch (error) {
+      if (enable) throw error;
+      // An elevated standalone installation can leave its verified task read-only.
+      // Both startup paths use the same per-user launcher, so retire that launcher.
+      parkLauncher = true;
+    }
+  }
+  if (parkLauncher || current?.launcherInactive) {
+    setWindowsScriptParked(windowsLauncherPath(service), Buffer.from(registration.launcher, "base64").toString("utf8"),
+      windowsLauncherHeader(service), launcherExit, parkLauncher);
+  }
+  if (registration.startup && !parkLauncher) {
+    const original = Buffer.from(registration.startup, "base64").toString("utf8");
+    if (original !== windowsGlobalStartupScript(service)) throw new Error("Invalid saved Startup-folder entry.");
+    setWindowsScriptParked(windowsStartupPath(service), original, startupFirstLine, startupExit, !enable);
+  }
+  const after = readWindowsWatcherRegistration();
+  const tasksMatch = parkLauncher
+    ? JSON.stringify(after?.tasks.map(task => task.name)) === JSON.stringify(registration.tasks.map(task => task.name))
+    : JSON.stringify(after?.tasks ?? []) === JSON.stringify(registration.tasks.map(task => ({ ...task, enabled: enable && task.enabled })));
+  if (!tasksMatch || Boolean(after?.launcherInactive) !== parkLauncher ||
+      after?.startup !== (enable || parkLauncher ? registration.startup : undefined)) {
+    throw new Error("Could not verify the new state of the standalone watcher startup entries.");
+  }
+}
+
+export function restartWindowsWatcherRegistration(registration: WindowsWatcherRegistration): void {
+  const service = windowsGlobalOptions();
+  const task = registration.tasks.find(task => task.enabled);
+  if (task) run(service, "schtasks.exe", ["/Run", "/TN", task.name]);
+  else if (registration.startup) run(service, "wscript.exe", ["//B", windowsStartupPath(service)]);
 }
 
 /** Capture the actual registration, including legacy task names and disabled tasks. */
@@ -154,6 +349,10 @@ export function restoreGlobalWatchRegistration(options: WatchServiceOptions, reg
 
 export function getWatchServiceStatus(options: WatchServiceOptions): WatchServiceResult {
   const service = resolveWatchService(options);
+  if (service.global && storeLauncher(service.platform)) {
+    const status = storeStartup("status");
+    return { platform: service.platform, label: service.label, taskName: "CodeButlerWatcher", logsDir: service.logsDir, installed: status.installed };
+  }
 
   if (service.platform === "darwin") {
     const servicePath = launchdPlistPath(service);
@@ -276,7 +475,7 @@ function installScheduledTask(service: ResolvedWatchService): WatchServiceResult
       runIgnoringFailure(service, "schtasks.exe", ["/Delete", "/TN", taskName, "/F"]);
       const startupPath = windowsStartupPath(service);
       mkdirSync(dirname(startupPath), { recursive: true });
-      writeFileSync(startupPath, `Set shell = CreateObject("WScript.Shell")\r\nshell.Run "${taskCommand.replaceAll('"', '""')}", 0, False\r\n`);
+      writeFileSync(startupPath, windowsGlobalStartupScript(service));
       run(service, "wscript.exe", ["//B", startupPath]);
       return { platform: service.platform, label: service.label, servicePath: startupPath, logsDir: service.logsDir, installed: true };
     }
@@ -403,7 +602,7 @@ function windowsLauncher(service: ResolvedWatchService): string {
   if (service.global) {
     const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
     return [
-      `$env:CODE_BUTLER_HOME = ${quote(service.cwd)}`,
+      windowsLauncherHeader(service),
       `Set-Location -LiteralPath ${quote(service.cwd)}`,
       `& ${watchArgs(service).map(quote).join(" ")} >> ${quote(outLog)} 2>> ${quote(errLog)}`,
       "exit $LASTEXITCODE"
@@ -415,6 +614,10 @@ function windowsLauncher(service: ResolvedWatchService): string {
     "if errorlevel 1 exit /b %errorlevel%",
     `${watchArgs(service).map(windowsCmdArg).join(" ")} >> ${windowsCmdArg(outLog)} 2>> ${windowsCmdArg(errLog)}`
   ].join("\r\n") + "\r\n";
+}
+
+function windowsLauncherHeader(service: ResolvedWatchService): string {
+  return `$env:CODE_BUTLER_HOME = '${service.cwd.replaceAll("'", "''")}'`;
 }
 
 function watchArgs(service: ResolvedWatchService): string[] {

@@ -46,6 +46,7 @@ import { initializeProjectMemory } from "./project-initialization.js";
 import { validateProjectSetupPaths } from "./project-setup.js";
 import { tryResolveProjectRoot } from "./project-root.js";
 import { globalWatchStatus, registerWatchedProject, runGlobalWatch, unregisterWatchedProject } from "./global-watch.js";
+import { storeLauncher, storeWatcherStatus } from "./store-runtime.js";
 import { startServer as startProjectMemoryServer, type ProjectMemoryServerOptions } from "./server.js";
 import { openConfiguredMemoryStore } from "./storage/open-configured-store.js";
 import type { MemoryStore } from "./storage/store.js";
@@ -773,7 +774,7 @@ async function runGlobalWatchCommand(args: string[], cwd: string, stdout: (line:
   }
   if (command === "status") {
     const service = getWatchServiceStatus(serviceOptions);
-    stdout(JSON.stringify({ ...service, ...globalWatchStatus() }, null, 2));
+    stdout(JSON.stringify({ ...service, ...globalWatchStatus(), ...storeWatcherStatus(service.platform) }, null, 2));
     return 0;
   }
   if (command && !command.startsWith("--")) throw new Error(`Unknown global watch command: ${command}`);
@@ -781,8 +782,12 @@ async function runGlobalWatchCommand(args: string[], cwd: string, stdout: (line:
   const stop = () => controller.abort();
   if (!options.signal) { process.once("SIGINT", stop); process.once("SIGTERM", stop); }
   try {
-    await runGlobalWatch({ cliPath: options.cliPath ?? fileURLToPath(import.meta.url), intervalSeconds, source,
-      once: args.includes("--once"), signal: options.signal ?? controller.signal, log: stdout });
+    const watchOptions = { cliPath: options.cliPath ?? fileURLToPath(import.meta.url), intervalSeconds, source,
+      once: args.includes("--once"), signal: options.signal ?? controller.signal, log: stdout };
+    if (!watchOptions.once && buildInfo.distribution === "store" && storeLauncher() && process.env.CODE_BUTLER_STORE_STARTUP_WATCHER === "1") {
+      const { runStoreWatcher } = await import("./desktop/store-watcher.js");
+      await runStoreWatcher(watchOptions);
+    } else await runGlobalWatch(watchOptions);
   } finally {
     if (!options.signal) { process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); }
   }

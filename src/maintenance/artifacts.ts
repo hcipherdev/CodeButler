@@ -67,7 +67,7 @@ export function runArtifactMaintenance(
 }
 
 /** What the global watcher and its runtime installer write under `<CODE_BUTLER_HOME>/watch/logs`. */
-export const GLOBAL_WATCH_LOG_NAMES = ["watch.out.log", "watch.err.log", "runtime-install.log"] as const;
+export const GLOBAL_WATCH_LOG_NAMES = ["watch.out.log", "watch.err.log", "store-watch.out.log", "store-watch.err.log", "runtime-install.log"] as const;
 
 /** Rotates and prunes the named logs in one folder, such as the global watcher's, outside any project. */
 export function runLogDirectoryMaintenance(
