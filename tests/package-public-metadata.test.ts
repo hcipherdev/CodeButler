@@ -1,3 +1,4 @@
+// Tests npm package metadata and consistency between the manifest and root lockfile entries.
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -20,7 +21,9 @@ describe("public package metadata", () => {
 
   it("publishes discoverable metadata for the public npm package", () => {
     expect(packageJson.name).toBe("code-butler");
-    expect(packageJson.version).toBe("2.0.1");
+    expect(packageJson.version).toMatch(/^\d+\.\d+\.\d+$/);
+    const lockfile = JSON.parse(readFileSync(join(process.cwd(), "package-lock.json"), "utf8"));
+    expect(lockfile).toMatchObject({ version: packageJson.version, packages: { "": { version: packageJson.version } } });
     expect(packageJson.engines?.node).toBe(">=24.0.0");
     expect(packageJson.license).toBe("Apache-2.0");
     expect(packageJson.repository).toEqual({
