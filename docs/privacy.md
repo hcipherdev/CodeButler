@@ -47,7 +47,7 @@ Deterministic directives, manual decisions, Git and log import, and search work 
 
 ## Repository settings need approval
 
-Anyone who can commit to a repository can also commit its `.code-butler/` folder, including `config.local.json` and `.env`. Code Butler sets itself up in any repository an agent opens, so it treats these settings as the repository author's rather than yours until you approve them on this device:
+Anyone who can commit to a repository can also commit its `.code-butler/` folder, including `config.local.json` and `.env`. When Code Butler opens a project, the following settings from the repository require your approval on this device:
 
 - `extractor` and `investigator` connection fields (`provider`, `baseUrl`, `apiKeyEnv`, `workspaceIdEnv`, `regionEnv`, `cliPath`, and the other connection fields). Choosing a `profile` or `model` needs no approval.
 - `embeddings.provider`, `embeddings.baseUrl` and `embeddings.apiKeyEnv`;

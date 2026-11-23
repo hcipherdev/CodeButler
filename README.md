@@ -1,5 +1,7 @@
 # Code Butler
 
+Visit [codebutler.dev](https://codebutler.dev/) to download the desktop app.
+
 Code Butler gives coding agents an evidence-backed memory of your project.
 
 It is a local-first Project Memory MCP server for Codex, Claude Code, and other
@@ -23,9 +25,8 @@ your computers.
 
 > **Requires Node.js 24 or newer and Git** on macOS, Windows, or Linux. Install
 > from source for now (see [Quick Start](#quick-start)); the npm package is
-> still the retired 1.x release. The [desktop app](https://codebutler.dev/) for
-> macOS (Apple silicon) and Windows 10/11 installs the CLI, MCP server and
-> background watcher for you.
+> still the retired 1.x release. The desktop app for macOS (Apple silicon) and
+> Windows 10/11 installs the CLI, MCP server and background watcher for you.
 
 ## Why Use It
 
@@ -206,21 +207,20 @@ npm install -g ./code-butler-2.0.2.tgz   # use the file name npm pack prints
 
 ### Set up a project
 
-Recommended: initialize Code Butler in each project where you want agents to
-use the full memory workflow:
+Initialize each project where you want agents to use Code Butler memory.
+Choose **Add project** in the desktop app, or run this command in the repository:
 
 ```bash
 code-butler init
 ```
 
-`init` is the explicit opt-in setup step and the best default for real
-projects. It creates project-local memory and config files, including the
-ignored `.code-butler/config.local.json` prefilled with this machine's source
-paths. It also writes `.code-butler/project-summary.md` and backs up existing
-`AGENTS.md` / `CLAUDE.md` beside the originals as
-`*.code-butler-backup-<timestamp>` before replacing them with short Butler
-bootstrap instructions. It also installs and starts the per-project background
-watcher so local memory and the project summary stay fresh after setup.
+`init` creates project-local memory and a minimal `.code-butler/config.json`.
+Code Butler stores the default Codex and Claude source paths in the user-level config
+at `~/.config/code-butler/config.json` by default. The command also writes
+`.code-butler/project-summary.md` and adds Code Butler instructions to
+`AGENTS.md` and `CLAUDE.md`. If it changes an existing instruction file, it
+saves a backup as `*.code-butler-backup-<timestamp>` beside the original.
+`init` also tries to install and start the per-project background watcher.
 
 If the background watcher cannot be installed, `init` still leaves the project
 ready for manual and MCP use. Run `code-butler watch install` again after
@@ -233,21 +233,11 @@ Those bootstrap files are what make future Codex or Claude sessions naturally
 use Code Butler before editing. The project summary gives agents a fast
 starting brief, while the MCP tools provide the detailed evidence behind it.
 
-Without `init`, Code Butler can still run as a lighter indexing and search
-layer through MCP tools, but it is not operating at full potential: there is no
-project summary, no agent bootstrap instructions, and
-`summarize_project_brief` reports that no summary exists.
+Setup creates the first project summary. Use `project-summary refresh` and
+`project-summary status` to manage it manually.
 
-There is no separate `project-summary install` step for normal use. `init`
-creates the first summary, bootstrap files, and background updater;
-`project-summary refresh` and `project-summary status` remain available for
-manual checks.
-
-If no API key is available, Code Butler creates a limited fallback summary,
-records it as a fallback in summary metadata, and tells you how to regenerate a
-richer one later.
-Opening a folder, starting MCP, running `sync`, or asking an agent for the
-project brief does not rewrite visible project files before `init`.
+If a model provider is unavailable during `init`, Code Butler creates a local
+fallback summary and records it as a fallback in the summary metadata.
 
 Run an incremental sync:
 
@@ -272,7 +262,7 @@ code-butler project-summary refresh
 code-butler project-summary status
 ```
 
-If `init` created a fallback summary, add the configured API key and run:
+If `init` created a fallback summary, configure a model provider and run:
 
 ```bash
 code-butler project-summary refresh --force
@@ -304,11 +294,17 @@ code-butler mcp --project-root /absolute/path/to/project
 ```
 
 If your MCP client launches servers from inside the active project directory,
-you can omit `--project-root`; `code-butler mcp` will resolve the current Git
-repository. In either mode, Code Butler creates project-local internal memory
-storage on first launch. It does not create `AGENTS.md`, `CLAUDE.md`, or
-`.code-butler/project-summary.md`; run `code-butler init` when you are ready
-for that explicit setup.
+you can omit `--project-root`. `code-butler mcp` can resolve the current Git
+repository.
+
+Automatic initialization is off by default. A connection to a new project
+leaves its files untouched, and `current_project` explains how to set it up.
+To let MCP initialize new projects on this computer, enable **Settings →
+General → Automatically initialize new projects** in the desktop app. After
+connecting, MCP can create the memory store, project summary, and agent
+instructions. Pass `--no-auto-init` to disable automatic setup for a
+connection. See [MCP setup](docs/mcp-setup.md) for how a connection chooses its
+project.
 
 ### Add to Codex
 
@@ -541,10 +537,9 @@ code-butler watch status
 
 When watcher installation succeeds, the watcher installed by
 `code-butler init` runs the same watch loop automatically. It syncs local
-sources and refreshes `.code-butler/project-summary.md` when the daily gated
-fingerprint check says the summary is due. It does not rewrite `AGENTS.md` or
-`CLAUDE.md`; those bootstrap files are installed only by explicit
-`code-butler init`.
+sources and checks daily whether changes warrant refreshing
+`.code-butler/project-summary.md`. The watcher leaves `AGENTS.md` and
+`CLAUDE.md` to project setup.
 
 Use `watch status` to confirm whether the per-project background watcher is
 installed. Code Butler does not silently install a daemon when MCP starts or
@@ -612,21 +607,34 @@ welcome through [SECURITY.md](SECURITY.md).
 
 Cloud sync needs the native helper. The desktop app includes it and manages
 accounts, passkeys, and new computers in its Account Center. For a source
-build, run `npm run package:crypto` (see Quick Start). Anyone can register on
-the hosted service with an email address. From the CLI, on your first computer:
+build, run `npm run package:crypto` (see Quick Start).
+
+To create an account on the hosted service, open **Account Center** in the
+desktop app and choose **Register**. Complete the browser verification step,
+then enter the email code and choose a password in the app.
+
+To set up your first vault from the CLI, run these commands from the project
+you want to sync:
 
 ```bash
-code-butler cloud register --email you@example.com
+code-butler cloud login --email you@example.com
 code-butler cloud init --recovery-file ./code-butler-recovery.json
 code-butler cloud enable --new
 code-butler cloud status
 ```
 
-`register` sends an email code, then asks for a new password at a hidden
-prompt. Both commands use the hosted service by default; pass
-`--server https://your-host` to use a self-hosted server. `init` creates your encrypted vault and writes an offline recovery file;
-it prints a separate recovery code. Store both somewhere safe and offline. They
-are the only way back in if you lose every approved computer.
+`cloud login` prompts for your account password. For a self-hosted service,
+pass `--server https://your-host` to `cloud login`. That server is used for
+subsequent commands. CLI registration is available on self-hosted servers
+configured without browser verification.
+
+CLI vault setup writes an encrypted recovery file and prints a separate
+recovery code. Keep both somewhere safe and offline. Older file-based vaults
+continue to use their original file and code. When you set up a new vault in
+the desktop app on a supporting server, the app stores the encrypted recovery
+backup in the cloud. Save the recovery code offline. On a replacement computer,
+sign in and choose **Restore access** in Account Center to unlock the backup
+locally with that code.
 
 To add another computer, sign in there and request approval:
 

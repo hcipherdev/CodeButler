@@ -1,8 +1,8 @@
 # Encrypted Butler sync protocol
 
-> **Status:** experimental and invite-only. This protocol and its implementation
-> have not been independently audited; release qualification is tracked
-> separately.
+> Encrypted cloud sync is optional, and registration for the hosted service is
+> open. This protocol and its implementation have not been independently
+> audited. Release qualification is tracked separately.
 
 User-facing CLI and MCP sync use this protocol for memory bindings marked
 `encryptionVersion: 2`. There is no migration from beta memory cloud storage.

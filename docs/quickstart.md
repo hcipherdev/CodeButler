@@ -28,10 +28,11 @@ npm install -g ./code-butler-2.0.2.tgz
 `npm pack` builds the package first. Skip `npm run package:crypto` if you only need
 local memory.
 
-The Code Butler desktop app is not publicly released yet. Its installer manages the
-desktop, CLI, MCP server, native helper, and global watcher as one compatible
-release. Do not install a second global CLI when using the desktop installer; it
-provides the stable `code-butler` command and keeps existing MCP launch paths current.
+The Code Butler desktop app is available for macOS (Apple silicon) and
+Windows 10 and 11 through the [download page](https://codebutler.dev/#download).
+The desktop installation includes the CLI, MCP server, native helper, and
+global watcher. Use its `code-butler` command for the matching CLI and MCP
+runtime.
 
 ## Connect Claude Code And Codex
 

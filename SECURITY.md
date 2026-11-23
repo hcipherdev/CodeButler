@@ -35,9 +35,9 @@ output that is presented as instructions, are in scope.
 
 ## Encrypted cloud sync
 
-Encrypted cloud sync is experimental and invite-only. Its cryptography and
-protocol have not been independently audited, and its release qualification is
-still in progress.
+Encrypted cloud sync is optional, and registration for the hosted service is
+open. Its cryptography and protocol have not been independently audited, and
+release qualification is still in progress.
 
 Reports about encrypted cloud sync are in scope: the TypeScript client under
 `src/cloud/` and `src/secrets/`, the native helper under `native/`, and the
