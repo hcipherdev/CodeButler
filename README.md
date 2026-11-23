@@ -17,13 +17,15 @@ Ask questions like:
 
 In short: Git tells an agent what changed; Code Butler helps it recover why it
 changed, what was decided, and which constraints still apply. Project memory
-stays local in each repository's `.code-butler/` directory. An experimental,
-invite-only [encrypted cloud sync](#encrypted-cloud-sync-experimental) can carry
-it between your computers.
+stays local in each repository's `.code-butler/` directory. An optional
+[encrypted cloud sync](#encrypted-cloud-sync-optional) can carry it between
+your computers.
 
 > **Requires Node.js 24 or newer and Git** on macOS, Windows, or Linux. Install
 > from source for now (see [Quick Start](#quick-start)); the npm package is
-> still the retired 1.x release.
+> still the retired 1.x release. The [desktop app](https://codebutler.dev/) for
+> macOS (Apple silicon) and Windows 10/11 installs the CLI, MCP server and
+> background watcher for you.
 
 ## Why Use It
 
@@ -41,8 +43,8 @@ Use it to:
 - Keep a generated project narrative summary available for future agents.
 - Search temporary working context separately from durable project memory.
 - Audit memory quality and diagnose setup issues with `code-butler doctor`.
-- Optionally, sync memory across your computers with experimental end-to-end
-  encrypted cloud sync (invite-only, not yet independently audited).
+- Optionally, sync memory across your computers with end-to-end encrypted
+  cloud sync (not yet independently audited).
 
 ## What It Looks Like
 
@@ -578,10 +580,10 @@ For durable instructions, keep `AGENTS.md` and `CLAUDE.md` short. They should
 tell agents how to consult Code Butler, not try to store the project's memory
 themselves.
 
-## Encrypted Cloud Sync (Experimental)
+## Encrypted Cloud Sync (Optional)
 
-> **Experimental and invite-only.** Public registration is closed. The
-> cryptography and protocol have not been independently audited, and release
+> **Optional.** Registration is open. The cryptography and protocol have not
+> been independently audited, and release
 > qualification (clean-device recovery, lost-device revocation, cross-platform
 > pairing, backup restore) is still in progress. Local memory is the supported
 > product; do not rely on cloud sync as your only copy.
@@ -608,11 +610,10 @@ macOS Keychain. Cloud sync currently runs on macOS and Windows. The
 server can and cannot observe and the known limitations; security reports are
 welcome through [SECURITY.md](SECURITY.md).
 
-Cloud sync needs a source build that includes the native helper
-(`npm run package:crypto`, see Quick Start). A desktop app for managing
-accounts, passkeys, and new computers is not publicly released yet. While cloud
-sync is experimental, registration on the hosted service is closed; open an
-issue if you want to take part in testing. From the CLI, on your first computer:
+Cloud sync needs the native helper. The desktop app includes it and manages
+accounts, passkeys, and new computers in its Account Center. For a source
+build, run `npm run package:crypto` (see Quick Start). Anyone can register on
+the hosted service with an email address. From the CLI, on your first computer:
 
 ```bash
 code-butler cloud register --email you@example.com
